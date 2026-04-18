@@ -19,21 +19,26 @@ struct Dependency {
 };
 
 struct Tensor {
+    // Device pointers (GPU memory)
     float_t *data;
     float_t *grad;
+
     int *shape;
     int ndim;
     int requires_grad;
+    int owns_data;
+    int owns_grad;
 
     Dependency *deps;
     int num_deps;
 };
 
 Tensor *tensor_create(int ndim, int *shape, int requires_grad);
-Tensor *tensor_from_data(float *external_data, int ndim, int *shape);
-Tensor *tensor_from_data_2d(float *data, int dim0, int dim1);
-Tensor *tensor_flatten(Tensor *t);
+Tensor *tensor_from_data(float *host_data, int ndim, int *shape);
+Tensor *tensor_from_data_2d(float *host_data, int dim0, int dim1);
+Tensor *tensor_from_device(float *device_data, int ndim, int *shape, int requires_grad);
 int tensor_numel(int ndim, int *shape);
+void tensor_to_host(Tensor *t, float *host_out);
 void tensor_zero_grad(Tensor *t);
 void tensor_add_dependency(Tensor *t, Tensor *dep_tensor, BackwardFn fn);
 void tensor_backward(Tensor *t, Tensor *grad_output);
@@ -41,7 +46,7 @@ void tensor_free(Tensor *t);
 void tensor_print(Tensor *t);
 void tensor_print_grad(Tensor *t);
 void tensor_grad(Tensor *t, Tensor *grad);
-void tensor_update(Tensor *t, float lr) ;
+void tensor_update(Tensor *t, float lr);
 
 #ifdef __cplusplus
 }

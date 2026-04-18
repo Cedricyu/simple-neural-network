@@ -1,20 +1,28 @@
-#pragma once
-#include "tensor.cuh"
-#include <memory>
-#include <string>
-#include <vector>
+#ifndef LINEAR_H
+#define LINEAR_H
 
-class Linear {
-  public:
+#include "tensor.cuh"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct Linear {
     int in_features;
     int out_features;
-    struct Tensor *bias;
-    struct Tensor *weight;
-    Linear(int in_f, int out_f);
-    Tensor *forward(Tensor *input);
-    Tensor *_tensor();
-    void print_weight(const std::string &name = "") const;
-    void print_grad(const std::string &name = "") const;
-    float get_weight(int in_idx, int out_idx) const;
-    ~Linear();
-};
+    Tensor *weight;
+    Tensor *bias;
+} Linear;
+
+Linear *linear_new(int in_f, int out_f);
+void linear_free(Linear *self);
+Tensor *linear_forward(Linear *self, Tensor *input);
+Tensor *linear_tensor(Linear *self);
+void linear_print_weight(Linear *self, const char *name);
+void linear_print_grad(Linear *self, const char *name);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

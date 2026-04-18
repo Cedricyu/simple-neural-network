@@ -1,64 +1,92 @@
 #include <cuda_runtime.h>
+
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <algorithm>
-#include <cmath>
-#include <cstdlib>
-#include <iostream>
-#include <memory>
+
 #include "cudakernels.cuh"
 #include "linear.cuh"
 #include "tensor.cuh"
 #include "tensorops.cuh"
 
-void xavier_init(Tensor *t, int fan_in, int fan_out) {
-    float limit = std::sqrt(6.0f / (fan_in + fan_out));
+#define CUDA_CHECK(call)                                                                          \
+    do {                                                                                          \
+        cudaError_t _err = (call);                                                                \
+        if (_err != cudaSuccess) {                                                                \
+            fprintf(stderr, "[cuda] %s failed at %s:%d: %s\n", #call, __FILE__, __LINE__,      \
+                    cudaGetErrorString(_err));                                                    \
+            exit(1);                                                                              \
+        }                                                                                         \
+    } while (0)
+
+static void xavier_init(Tensor *t, int fan_in, int fan_out) {
+    float limit = sqrtf(6.0f / (fan_in + fan_out));
     int size = tensor_numel(t->ndim, t->shape);
+    float *host = (float *)malloc(sizeof(float) * size);
     for (int i = 0; i < size; ++i) {
-        float r = static_cast<float>(std::rand()) / RAND_MAX;  // [0,1]
-        r = r * 2.0f * limit - limit;  // [-limit, limit]
-        t->data[i] = r;
+        float r = (float)rand() / (float)RAND_MAX;
+        host[i] = r * 2.0f * limit - limit;
     }
+    CUDA_CHECK(cudaMemcpy(t->data, host, sizeof(float) * size, cudaMemcpyHostToDevice));
+    free(host);
 }
 
-Linear::Linear(int in_f, int out_f) {
-    in_features = in_f;
-    out_features = out_f;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-    int w_shape[] = {in_f, out_f};   // (K, N)
-    int b_shape[] = {1, out_f};      // (1, N)
-    weight = tensor_create(2, w_shape, 1);
-    bias   = tensor_create(2, b_shape, 1);
-    xavier_init(weight, in_f, out_f);
+Linear *linear_new(int in_f, int out_f) {
+    Linear *self = (Linear *)malloc(sizeof(Linear));
+    if (!self) return NULL;
+
+    self->in_features = in_f;
+    self->out_features = out_f;
+
+    int w_shape[2] = {in_f, out_f};
+    int b_shape[2] = {1, out_f};
+    self->weight = tensor_create(2, w_shape, 1);
+    self->bias = tensor_create(2, b_shape, 1);
+
+    xavier_init(self->weight, in_f, out_f);
+    return self;
 }
 
-Tensor *Linear::forward(Tensor *input) {
-    Tensor *out = tensor_matmul(input, this->weight);  // z = x × y
-    // out = tensor_add_bias(out, this->bias); // z = x × y + b
+void linear_free(Linear *self) {
+    if (!self) return;
+    tensor_free(self->weight);
+    tensor_free(self->bias);
+    free(self);
+}
+
+Tensor *linear_forward(Linear *self, Tensor *input) {
+    Tensor *out = tensor_matmul(input, self->weight);
+
+    int m = out->shape[0];
+    int n = out->shape[1];
+    dim3 block(16, 16);
+    dim3 grid((n + 15) / 16, (m + 15) / 16);
+    addBiasKernel<<<grid, block>>>(out->data, self->bias->data, m, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    if (self->bias->requires_grad) {
+        tensor_add_dependency(out, self->bias, tensor_add_bias_backward_bias);
+    }
+
     return out;
 }
 
-Tensor *Linear::_tensor() { return this->weight; }
+Tensor *linear_tensor(Linear *self) { return self->weight; }
 
-Linear::~Linear() {
-    tensor_free(this->weight);
-    tensor_free(this->bias);
+void linear_print_weight(Linear *self, const char *name) {
+    if (name && name[0]) printf("%s:\n", name);
+    tensor_print(self->weight);
 }
 
-void Linear::print_weight(const std::string &name) const {
-    if (name.empty()) {
-        std::cout << "Weight: " << std::endl;
-    } else {
-        std::cout << name << ": " << std::endl;
-    }
-    tensor_print(this->weight);
+void linear_print_grad(Linear *self, const char *name) {
+    if (name && name[0]) printf("%s:\n", name);
+    tensor_print_grad(self->weight);
 }
 
-void Linear::print_grad(const std::string &name) const {
-    if (name.empty()) {
-        std::cout << "Grad: " << std::endl;
-    } else {
-        std::cout << name << ": " << std::endl;
-    }
-    tensor_print_grad(this->weight);
+#ifdef __cplusplus
 }
+#endif

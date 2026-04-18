@@ -63,3 +63,13 @@ __global__ void matrixTransposeKernel(float *input, float *output, int rows, int
         output[output_idx] = input[input_idx];
     }
 }
+
+__global__ void matrixCopyKernel(float *input, float *output, int rows, int cols) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < cols && y < rows) {
+        int idx = y * cols + x;
+        output[idx] = input[idx];
+    }
+}
