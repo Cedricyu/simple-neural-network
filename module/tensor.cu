@@ -46,6 +46,7 @@ Tensor *tensor_create(int ndim, int *shape, int requires_grad) {
     t->owns_grad = requires_grad ? 1 : 0;
     t->deps = NULL;
     t->num_deps = 0;
+    t->meta = NULL;
 
     t->shape = (int *)malloc(sizeof(int) * ndim);
     memcpy(t->shape, shape, sizeof(int) * ndim);
@@ -87,6 +88,7 @@ Tensor *tensor_from_device(float *device_data, int ndim, int *shape, int require
     t->owns_grad = requires_grad ? 1 : 0;
     t->deps = NULL;
     t->num_deps = 0;
+    t->meta = NULL;
 
     t->shape = (int *)malloc(sizeof(int) * ndim);
     memcpy(t->shape, shape, sizeof(int) * ndim);
@@ -116,6 +118,15 @@ void tensor_zero_grad(Tensor *t) {
 void tensor_add_dependency(Tensor *t, Tensor *dep_tensor, BackwardFn fn) {
     t->deps = (Dependency *)realloc(t->deps, sizeof(Dependency) * (t->num_deps + 1));
     t->deps[t->num_deps].tensor = dep_tensor;
+    t->deps[t->num_deps].ctx = NULL;
+    t->deps[t->num_deps].backward_fn = fn;
+    t->num_deps++;
+}
+
+void tensor_add_dependency_with_ctx(Tensor *t, Tensor *dep_tensor, Tensor *ctx, BackwardFn fn) {
+    t->deps = (Dependency *)realloc(t->deps, sizeof(Dependency) * (t->num_deps + 1));
+    t->deps[t->num_deps].tensor = dep_tensor;
+    t->deps[t->num_deps].ctx = ctx;
     t->deps[t->num_deps].backward_fn = fn;
     t->num_deps++;
 }
@@ -137,56 +148,30 @@ void tensor_grad(Tensor *t, Tensor *grad) {
 void tensor_backward(Tensor *self, Tensor *grad_out) {
     if (!self || !self->requires_grad) return;
 
-    if (self->num_deps == 3) {
-        Dependency *dep0 = &self->deps[0];
-        Dependency *dep1 = &self->deps[1];
-        Dependency *dep2 = &self->deps[2];
+    for (int i = 0; i < self->num_deps; ++i) {
+        Dependency *dep = &self->deps[i];
+        Tensor *ctx = dep->ctx;
+        Tensor *grad = NULL;
 
-        // dep0/dep1: gradients from matmul
-        if (dep0->backward_fn) {
-            Tensor *grad_a = dep0->backward_fn(dep0->tensor, dep1->tensor, grad_out);
-            tensor_grad(dep0->tensor, grad_a);
-            tensor_backward(dep0->tensor, grad_a);
-            tensor_free(grad_a);
-        }
-        if (dep1->backward_fn) {
-            Tensor *grad_b = dep1->backward_fn(dep0->tensor, dep1->tensor, grad_out);
-            tensor_grad(dep1->tensor, grad_b);
-            tensor_backward(dep1->tensor, grad_b);
-            tensor_free(grad_b);
+        if (!dep->backward_fn) continue;
+
+        if (!ctx) {
+            if (self->num_deps == 1) {
+                ctx = NULL;
+            } else if (self->num_deps == 2) {
+                int other = (i == 0) ? 1 : 0;
+                ctx = self->deps[other].tensor;
+            } else {
+                // For complex ops, use output tensor as default context.
+                ctx = self;
+            }
         }
 
-        // dep2: bias gradient (x should be current output tensor shape [batch, out_features])
-        if (dep2->backward_fn) {
-            Tensor *grad_c = dep2->backward_fn(self, dep2->tensor, grad_out);
-            tensor_grad(dep2->tensor, grad_c);
-            tensor_backward(dep2->tensor, grad_c);
-            tensor_free(grad_c);
-        }
-    } else if (self->num_deps == 2) {
-        Dependency *dep0 = &self->deps[0];
-        Dependency *dep1 = &self->deps[1];
-
-        if (dep0->backward_fn) {
-            Tensor *grad_a = dep0->backward_fn(dep0->tensor, dep1->tensor, grad_out);
-            tensor_grad(dep0->tensor, grad_a);
-            tensor_backward(dep0->tensor, grad_a);
-            tensor_free(grad_a);
-        }
-        if (dep1->backward_fn) {
-            Tensor *grad_b = dep1->backward_fn(dep0->tensor, dep1->tensor, grad_out);
-            tensor_grad(dep1->tensor, grad_b);
-            tensor_backward(dep1->tensor, grad_b);
-            tensor_free(grad_b);
-        }
-    } else if (self->num_deps == 1) {
-        Dependency *dep = &self->deps[0];
-        if (dep->backward_fn) {
-            Tensor *grad = dep->backward_fn(dep->tensor, NULL, grad_out);
-            tensor_grad(dep->tensor, grad);
-            tensor_backward(dep->tensor, grad);
-            tensor_free(grad);
-        }
+        grad = dep->backward_fn(dep->tensor, ctx, grad_out);
+        if (!grad) continue;
+        tensor_grad(dep->tensor, grad);
+        tensor_backward(dep->tensor, grad);
+        tensor_free(grad);
     }
 }
 
@@ -205,6 +190,7 @@ void tensor_free(Tensor *t) {
     if (t->owns_data && t->data) CUDA_CHECK(cudaFree(t->data));
     if (t->shape) free(t->shape);
     if (t->deps) free(t->deps);
+    if (t->meta) free(t->meta);
     free(t);
 }
 

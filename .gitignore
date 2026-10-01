@@ -40,6 +40,8 @@
 **/runs/*
 **/logs/*
 **/recordings/*
+graph.dot
+graph.png
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
