@@ -8,5 +8,7 @@ int main(void) {
     printf("Running tests...\n");
 
     test_linear();
+    test_conv2d();
+    test_mnist();
     return 0;
 }

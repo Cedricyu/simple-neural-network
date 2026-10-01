@@ -50,8 +50,8 @@ Tensor *tensor_matmul(Tensor *a, Tensor *b) {
     cudaDeviceSynchronize();
 
     if (a->requires_grad || b->requires_grad) {
-        tensor_add_dependency(out, a, tensor_matmul_backward_a);
-        tensor_add_dependency(out, b, tensor_matmul_backward_b);
+        tensor_add_dependency_with_ctx(out, a, b, tensor_matmul_backward_a);
+        tensor_add_dependency_with_ctx(out, b, a, tensor_matmul_backward_b);
     }
     return out;
 }
@@ -79,10 +79,11 @@ Tensor *tensor_matmul_backward_a(Tensor *a, Tensor *b, Tensor *grad_out) {
 }
 
 Tensor *tensor_matmul_backward_b(Tensor *a, Tensor *b, Tensor *grad_out) {
+    // Here: a = weight tensor (target), b = input tensor (context)
     if (a->ndim != 2 || b->ndim != 2) return NULL;
-    int M = a->shape[0];
-    int K = a->shape[1];
-    int N = b->shape[1];
+    int K = a->shape[0];
+    int N = a->shape[1];
+    int M = b->shape[0];
 
     int shape[2] = {K, N};
     Tensor *grad_b = tensor_create(2, shape, 0);
@@ -91,7 +92,7 @@ Tensor *tensor_matmul_backward_b(Tensor *a, Tensor *b, Tensor *grad_out) {
 
     dim3 block(16, 16);
     dim3 grid_t((K + 15) / 16, (M + 15) / 16);
-    matrixTransposeKernel<<<grid_t, block>>>(a->data, d_a_t, M, K);
+    matrixTransposeKernel<<<grid_t, block>>>(b->data, d_a_t, M, K);
     cudaDeviceSynchronize();
 
     dim3 grid_mm((N + 15) / 16, (K + 15) / 16);
@@ -140,7 +141,9 @@ Tensor *tensor_add_bias_backward_input(Tensor *x, Tensor *bias, Tensor *grad_out
 }
 
 Tensor *tensor_add_bias_backward_bias(Tensor *x, Tensor *bias, Tensor *grad_out) {
-    if (x->ndim != 2 || bias->ndim != 2 || bias->shape[0] != 1 || x->shape[1] != bias->shape[1]) {
+    // In generic autograd: x is the bias tensor, bias is optional context tensor.
+    (void)bias;
+    if (x->ndim != 2 || x->shape[0] != 1 || grad_out->ndim != 2 || grad_out->shape[1] != x->shape[1]) {
         return NULL;
     }
     int N = x->shape[1];
@@ -149,7 +152,7 @@ Tensor *tensor_add_bias_backward_bias(Tensor *x, Tensor *bias, Tensor *grad_out)
 
     int block = 256;
     int grid = (N + block - 1) / block;
-    biasGradientKernel<<<grid, block>>>(grad_out->data, grad_b->data, x->shape[0], N);
+    biasGradientKernel<<<grid, block>>>(grad_out->data, grad_b->data, grad_out->shape[0], N);
     cudaDeviceSynchronize();
     return grad_b;
 }

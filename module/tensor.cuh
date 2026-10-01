@@ -15,6 +15,7 @@ typedef Tensor *(*BackwardFn)(Tensor *a, Tensor *b, Tensor *grad_out);
 
 struct Dependency {
     Tensor *tensor;
+    Tensor *ctx;
     BackwardFn backward_fn;
 };
 
@@ -31,6 +32,11 @@ struct Tensor {
 
     Dependency *deps;
     int num_deps;
+
+    // Optional owner-defined config (e.g. conv stride/padding) that a layer
+    // attaches to its own weight tensor so its backward_fn can read it back
+    // via the `a`/`ctx` tensor it already receives. Freed by tensor_free.
+    void *meta;
 };
 
 Tensor *tensor_create(int ndim, int *shape, int requires_grad);
@@ -41,6 +47,7 @@ int tensor_numel(int ndim, int *shape);
 void tensor_to_host(Tensor *t, float *host_out);
 void tensor_zero_grad(Tensor *t);
 void tensor_add_dependency(Tensor *t, Tensor *dep_tensor, BackwardFn fn);
+void tensor_add_dependency_with_ctx(Tensor *t, Tensor *dep_tensor, Tensor *ctx, BackwardFn fn);
 void tensor_backward(Tensor *t, Tensor *grad_output);
 void tensor_free(Tensor *t);
 void tensor_print(Tensor *t);
