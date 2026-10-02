@@ -20,6 +20,8 @@ Tensor *tensor_add_bias_backward_input(Tensor *x, Tensor *bias, Tensor *grad_out
 Tensor *tensor_add_bias_backward_bias(Tensor *x, Tensor *bias, Tensor *grad_out);
 Tensor *tensor_relu(Tensor *x);
 Tensor *tensor_relu_backward(Tensor *x, Tensor *n, Tensor *grad_out);
+Tensor *tensor_flatten(Tensor *x);
+Tensor *tensor_flatten_backward(Tensor *x, Tensor *ctx, Tensor *grad_out);
 void fill_tensor_with_random(Tensor *t);
 Tensor *tensor_clone(Tensor *t);
 void tensor_print_graph_dot(Tensor *self);
