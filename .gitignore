@@ -48,3 +48,5 @@ graph.png
 
 ./test/test_main.cpp
 test_main
+train_worker
+train_viewer

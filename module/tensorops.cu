@@ -67,12 +67,32 @@ Tensor *tensor_matmul_backward_a(Tensor *a, Tensor *b, Tensor *grad_out) {
 
     float *d_b_t = ensure_workspace(&g_workspace_bt, &g_workspace_bt_elems, (size_t)N * (size_t)K);
 
-    dim3 block(16, 16);
-    dim3 grid_t((K + 15) / 16, (N + 15) / 16);
-    matrixTransposeKernel<<<grid_t, block>>>(b->data, d_b_t, K, N);
+    /* matrixTransposeKernel has no shared-memory tiling, so any block size
+     * works for it; 16x16 is just a reasonable default. It maps thread x to
+     * the column index (range [0,cols)) and y to the row index (range
+     * [0,rows)) - so grid.x must be sized off cols and grid.y off rows. b
+     * here has shape (K,N): rows=K, cols=N. This grid was backwards
+     * ((K+15)/16, (N+15)/16), which silently worked only when K<=16 (every
+     * existing caller's dimensions happened to stay under that); any larger
+     * K left rows beyond 16 never written by the transpose, so the matmul
+     * below read uninitialized workspace memory for them. */
+    dim3 t_block(16, 16);
+    dim3 grid_t((N + 15) / 16, (K + 15) / 16);
+    matrixTransposeKernel<<<grid_t, t_block>>>(b->data, d_b_t, K, N);
     cudaDeviceSynchronize();
 
-    dim3 grid_mm((K + 15) / 16, (M + 15) / 16);
+    /* Unlike the transpose, matrixMultiplyKernel DOES use shared-memory
+     * tiles sized BLOCK_SIZE x BLOCK_SIZE (cudakernels.cuh, currently 32) -
+     * launching it with a block smaller than that (this used to hardcode
+     * 16x16) leaves the rest of each tile never written by any thread, so
+     * the reduction sums in whatever was already sitting in that shared
+     * memory. Both bugs were invisible together: at the small dimensions
+     * every existing caller used, the stale tail of each tile happened to
+     * still be zero this session, so the extra terms added nothing - a
+     * numerical gradient check only caught it once a bigger Linear layer
+     * (1568->128) pushed past that coincidence. */
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid_mm((K + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
     matrixMultiplyKernel<<<grid_mm, block>>>(grad_out->data, d_b_t, grad_a->data, M, N, K);
     cudaDeviceSynchronize();
     return grad_a;
@@ -90,12 +110,15 @@ Tensor *tensor_matmul_backward_b(Tensor *a, Tensor *b, Tensor *grad_out) {
 
     float *d_a_t = ensure_workspace(&g_workspace_at, &g_workspace_at_elems, (size_t)K * (size_t)M);
 
-    dim3 block(16, 16);
+    dim3 t_block(16, 16);
     dim3 grid_t((K + 15) / 16, (M + 15) / 16);
-    matrixTransposeKernel<<<grid_t, block>>>(b->data, d_a_t, M, K);
+    matrixTransposeKernel<<<grid_t, t_block>>>(b->data, d_a_t, M, K);
     cudaDeviceSynchronize();
 
-    dim3 grid_mm((N + 15) / 16, (K + 15) / 16);
+    /* Must match BLOCK_SIZE, not an arbitrary block size - see the comment
+     * in tensor_matmul_backward_a above. */
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid_mm((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (K + BLOCK_SIZE - 1) / BLOCK_SIZE);
     matrixMultiplyKernel<<<grid_mm, block>>>(d_a_t, grad_out->data, grad_b->data, K, M, N);
     cudaDeviceSynchronize();
     return grad_b;
@@ -179,6 +202,30 @@ Tensor *tensor_relu_backward(Tensor *x, Tensor *n, Tensor *grad_out) {
     int grid = (size + block - 1) / block;
     reluBackwardKernel<<<grid, block>>>(x->data, grad_out->data, grad_x->data, size);
     cudaDeviceSynchronize();
+    return grad_x;
+}
+
+/* Collapses any (dim0, dim1, ..., dimN) tensor to 2D (dim0, dim1*...*dimN) -
+ * e.g. a conv output (B, C, H, W) into the (B, C*H*W) a Linear layer expects.
+ * Row-major layout makes this a pure reshape: same bytes, same order, so
+ * forward is a zero-copy view onto x's own device buffer (no kernel, no
+ * allocation) and backward is a single flat memcpy back to x's original
+ * shape - unlike every other op in this file, there's no elementwise or
+ * reduction math to do, just metadata. */
+Tensor *tensor_flatten(Tensor *x) {
+    int batch = x->shape[0];
+    int rest = tensor_numel(x->ndim, x->shape) / batch;
+    int shape[2] = {batch, rest};
+    Tensor *out = tensor_from_device(x->data, 2, shape, x->requires_grad);
+    if (x->requires_grad) tensor_add_dependency(out, x, tensor_flatten_backward);
+    return out;
+}
+
+Tensor *tensor_flatten_backward(Tensor *x, Tensor *ctx, Tensor *grad_out) {
+    (void)ctx;
+    int n = tensor_numel(x->ndim, x->shape);
+    Tensor *grad_x = tensor_create(x->ndim, x->shape, 0);
+    cudaMemcpy(grad_x->data, grad_out->data, sizeof(float) * n, cudaMemcpyDeviceToDevice);
     return grad_x;
 }
 
