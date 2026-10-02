@@ -142,6 +142,27 @@ instead of failing the build.
 
 ### Live training GUI (SDL2)
 
+<video src="docs/demo.mp4" controls width="700"></video>
+
+*Loss curve, live predictions, and per-layer weight visualization (with zoom), recorded during an actual training run.*
+
+![Main training window](docs/gui_main.png)
+
+#### Layer weights viewer
+
+Click "view layer weights" to open a second window with one tab per layer
+(screenshots taken after 3 epochs of training). Conv tabs show each 3x3 filter
+(conv2-4 are averaged over input channels); fc tabs show the weight matrix as a
+heatmap with min/max/mean/rms stats underneath. Scroll to zoom, `0` to reset.
+
+| conv1 | conv2 | conv3 |
+|:---:|:---:|:---:|
+| ![conv1](docs/weights_conv1.png) | ![conv2](docs/weights_conv2.png) | ![conv3](docs/weights_conv3.png) |
+
+| conv4 | fc1 | fc2 |
+|:---:|:---:|:---:|
+| ![conv4](docs/weights_conv4.png) | ![fc1](docs/weights_fc1.png) | ![fc2](docs/weights_fc2.png) |
+
 ```bash
 make train_gui
 ```
