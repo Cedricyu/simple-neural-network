@@ -1,233 +1,158 @@
-## Project Purpose
+# tinyDL
+
+A small deep-learning framework written in plain C + CUDA (no C++/STL in the framework itself):
+reverse-mode autograd, Linear / Conv2D / BatchNorm / pooling / residual add, SGD with momentum,
+and a live SDL2 GUI where you build a model by wiring blocks together, train it, and watch the loss and
+the weights while it runs.
+
+The aim is to see how CUDA kernel design affects neural-network training, on a codebase small
+enough to read in an afternoon.
+
+![Settings screen with the node editor](docs/gui_setup.png)
+
+## Quick start
+
+```bash
+sudo apt install -y libsdl2-dev libsdl2-ttf-dev      # GUI only
+# download a dataset (see "Datasets" below), e.g. Fashion-MNIST, then:
+make train_gui
+```
+
+Requirements: an NVIDIA GPU, the CUDA Toolkit (`nvcc` on `PATH`) and `gcc`. If `nvcc --version` is
+newer than the CUDA version `nvidia-smi` reports (common on WSL2), build with a matching toolkit:
+`make NVCC=/usr/local/cuda-12.9/bin/nvcc`.
+
+## Layout
 
 ```plaintext
-The goal of this project is to explore and analyze how CUDA APIs can optimize and accelerate neural network computation.
-By implementing fundamental neural network components (Tensor autograd, Linear, Conv2D, SGD) directly in CUDA, this project aims to:
-
-Understand how CUDA kernel design and memory access patterns affect performance.
-
-Investigate how GPU parallelism can accelerate both training and inference processes.
-
-Identify bottlenecks across different layers and propose potential optimization strategies.
-
-Build an observable, testable, and extensible CUDA-based neural network framework, serving as a foundation for more complex architectures such as CNNs or Transformers.
+module/   tensor + autograd, ops (matmul, relu, flatten, add), Linear, Conv2D, BatchNorm, pooling, CUDA kernels
+test/     tests, plus the GUI: train_worker.c (CUDA trainer), train_viewer.c (SDL2), train_record.h (shared config)
+tool/     dataset converters (NEU-CLS, CIFAR-10), GPU info
 ```
 
+The SGD step lives inline as `tensor_update_momentum()` in `module/tensor.cu`.
 
-## 🛠️ Build & Run Guide
-
-This project uses a Makefile to compile and run a small CUDA-based neural network framework, written in plain C + CUDA (no C++/STL in the framework itself).
-
-## 📁 Project Structure
-
-```plaintext
-├── Makefile
-├── README.md
-├── module/
-│   ├── tensor.cu(.cuh)             # Tensor struct + reverse-mode autograd engine
-│   ├── tensorops.cu(.cuh)          # matmul / bias-add / relu ops and their backward fns
-│   ├── cudakernels.cu(.cuh)        # tiled matmul, transpose, bias CUDA kernels
-│   ├── activationkernels.cu(.cuh)  # sigmoid/relu/tanh/gelu/... CUDA kernels
-│   ├── linear.cu(.cuh)             # Linear (fully-connected) layer
-│   ├── conv2d.cu(.cuh)             # Conv2D layer (stride, padding, optional bias)
-│   └── convkernels.cu(.cuh)        # conv2d forward/backward CUDA kernels
-├── tool/
-│   └── CudaDeviceInfo.cu(.cuh)     # prints GPU info at startup
-├── test/
-│   ├── test_main.c                 # entry point; runs the tests below in sequence
-│   ├── test_linear.c               # 4-layer MLP on a synthetic checkerboard task
-│   ├── test_conv2d.c               # tiny 2-layer ConvNet sanity check
-│   ├── test_mnist.c                # 4-layer strided ConvNet trained on real MNIST
-│   ├── train_worker.c              # same ConvNet, trained on Fashion-MNIST, streams progress to train_viewer
-│   ├── train_viewer.c              # SDL2 live-training window (chart, sample, per-layer weights)
-│   ├── train_record.h              # wire format shared between train_worker and train_viewer
-│   ├── mnist.c(.h)                 # IDX-format loader (works for MNIST and Fashion-MNIST alike)
-│   ├── dataset.c(.h), train_config.c(.h)
-│   └── test.h
-└── data/
-    ├── mnist/                      # (gitignored) downloaded MNIST files, used by test_mnist
-    └── fashion-mnist/              # (gitignored) downloaded Fashion-MNIST files, used by train_worker
-```
-
-There is no separate `optimizer/` module yet — the SGD step lives inline as
-`tensor_update()` in `module/tensor.cu`. `Makefile`'s `OPT_DIR` is a reserved
-slot for when that gets split out.
-
-
-## ✅ Requirements
-
-- NVIDIA GPU with CUDA support
-- CUDA Toolkit installed (version 11.x or later), with `nvcc` on your `PATH`
-- `gcc` (the `test/` sources are plain C, not C++)
-
-Check your toolkit:
+## Tests
 
 ```bash
-nvcc --version
+make test        # builds test_main and runs it
 ```
 
-If you don't have it yet, follow the [CUDA installation guide](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html).
+- **`test_graph_ops`** — finite-difference gradient checks for add, batchnorm (4D and 2D), max pool,
+  global average pool, conv2d (stride / padding / 1x1) and a residual block where one tensor feeds
+  two consumers.
+- **`test_linear`**, **`test_conv2d`** — an MLP and a tiny ConvNet on synthetic tasks.
+- **`test_mnist`** — a 4-layer strided ConvNet on MNIST, ~97% test accuracy in 3 epochs. Skipped with a
+  message if `data/mnist/` is missing.
 
-Check your driver and the CUDA version it supports:
+## Live training GUI
+
+`make train_gui` opens the **settings screen**: training parameters on the left, a **node editor** for
+the model on the right. Everything is validated continuously: every block shows the shape it outputs,
+the parameter count updates live, and anything that can't run (shape mismatch, a model that doesn't end
+in one output per class, a batch that won't fit in GPU memory, ...) is shown in red with the offending
+block outlined, instead of reaching the GPU. Start switches to the live dashboard; **restart** re-runs,
+**settings** goes back to the form.
+
+| field | meaning |
+|---|---|
+| dataset | folders under `data/`; image size, channels and class count are read from the files, and picking one loads its suggested settings |
+| epochs, batch size, learning rate, seed | |
+| momentum | SGD momentum, 0 = plain SGD |
+| normalize | 1 = standardize pixels per channel |
+| augment | 0 = none, 1 = random horizontal + vertical flips, 2 = horizontal flip + shift by up to 4 px |
+| fc viz pool, weights every N | weights viewer only |
+
+### Model editor
+
+The model is a graph: a node reads the output of whatever its input dot is wired to, and one output
+can feed several nodes, so branches and skip connections work.
+
+| block | parameters | needs |
+|---|---|---|
+| conv | out channels 1-64, kernel 1-7, stride 1-4, padding 0-3 | an image |
+| relu | | anything |
+| bn | learned scale and shift per channel; batch size >= 2 | anything |
+| pool | max pool, window 1-4, stride 1-4 | an image |
+| gap | global average pool, gives C values (already flat) | an image |
+| add | two inputs, summed | two tensors of the same shape |
+| flatten | (C,H,W) to C*H*W values | an image |
+| fc | out features 1-1024 | a flat input |
+
+The graph must end in a block with one value per class; limits are 32 blocks and 16 conv + fc layers.
+
+- **Build** — click a palette chip to append a block, or drag it onto the canvas. Drag from an output dot
+  to an input dot to wire; grab a wired input dot to move its wire; `x` deletes a block and re-joins its
+  neighbours; scroll or drag the background to pan; `arrange` lays the nodes out.
+- **Presets** — `cnn` (4 conv + fc, the default) and `resnet` (stem, an identity residual block, a stride-2
+  block with a 1x1-conv shortcut, global average pool, fc).
+- **Read the graph** — wires are blue between neighbours in evaluation order and pink for skips and
+  branches; hover a block to light up everything it reads and everything that reads it.
+
+![The resnet preset in the node editor](docs/gui_resnet_editor.png)
+
+### Training dashboard
+
+A **model graph** across the top (a box per layer with its output shape, relu / bn folded in as
+`+bn +relu`, residual shortcuts as pink arcs, hover to trace), the loss curve, the current sample
+(green border = predicted correctly), the running test accuracy, and the weights viewer.
+
+![Training window with the ResNet dependency graph](docs/gui_resnet_run.png)
+
+### Weights viewer
+
+"View layer weights" opens a second window with one tab per conv / fc layer, drawn in 3D and updated
+live: conv filters as bars (height = weight, blue < 0 < red), fc matrices as a height-field surface.
+Drag to rotate, scroll to zoom, `0` resets.
+
+![fc1 weights in 3D](docs/weights_fc1.png)
+
+### Two processes
+
+`train_worker` (pure CUDA: trains, streams progress) and `train_viewer` (pure SDL2: form and dashboard)
+are separate executables talking over two FIFOs (`/tmp/tinydl_train.fifo`, `/tmp/tinydl_train_cmd.fifo`),
+so a GUI bug can't take down a training run and vice versa. The worker re-validates every config it
+receives with the same `train_cfg_derive()` the form uses.
+
+## Datasets
+
+A dataset is a folder `data/<name>/` with IDX files (`train-images-idx3-ubyte`, `train-labels-idx1-ubyte`,
+and optionally `t10k-*` for a test split evaluated every epoch). Images are grey or colour, up to
+128x128, 2-16 classes. Colour images use a 4-dimensional variant (magic `0x00000804`: count, channels,
+rows, cols, each image stored channel by channel). Optional `classes.txt` names the classes; optional
+`defaults.txt` (`key value` lines: `epochs`, `batch_size`, `lr`, `momentum`, `normalize`, `augment`)
+is loaded into the form when the dataset is picked.
+
+| dataset | get it | result |
+|---|---|---|
+| MNIST | `curl` below | ~97% (`test_mnist`) |
+| Fashion-MNIST (GUI default) | `curl` below | ~88% in 3 epochs |
+| NEU-CLS (steel defects, 6 classes, 1440 images) | `python3 tool/prepare_neu_cls.py` | ~90% (CNN), 88-93% (ResNet) |
+| CIFAR-10 (colour, 10 classes) | `python3 tool/prepare_cifar10.py` | ~73% after 10 epochs (ResNet, width 32) |
 
 ```bash
-nvidia-smi
-```
-
-**If `nvcc --version` reports a newer CUDA version than `nvidia-smi`'s "CUDA
-Version" field** (common on WSL2 when the toolkit gets upgraded ahead of the
-Windows-side driver), runtime calls like `cudaMalloc` fail with `CUDA driver
-version is insufficient for CUDA runtime version`. Fix it by building with a
-toolkit that matches your driver instead of the default `nvcc` — install the
-matching `cuda-<version>` package alongside your current one, then point the
-Makefile at it:
-
-```bash
-make NVCC=/usr/local/cuda-12.9/bin/nvcc   # match whatever nvidia-smi reports
-```
-
-For code style, you can install:
-
-```bash
-pre-commit install
-```
-
-
-## 🔨 Build Commands
-
-### Build everything
-
-Compiles every `.cu` under `module/`/`tool/` and every `.c` under `test/`, and
-links them into the `test_main` executable.
-
-```bash
-make
-```
-
-### Run tests
-
-Builds the project (if needed) and runs `test_main`, which runs three
-training runs back to back:
-
-1. **`test_linear`** — a 4-layer MLP learning a synthetic checkerboard
-   classification task (validates the `Linear`/`ReLU`/autograd path).
-2. **`test_conv2d`** — a tiny 2-layer ConvNet learning a synthetic striped
-   image classification task (validates `Conv2D` forward/backward, including
-   stride and padding).
-3. **`test_mnist`** — a 4-layer strided ConvNet (no pooling layer exists yet,
-   so downsampling is done with `stride=2` convs) trained on the real MNIST
-   dataset. Reaches ~97% test accuracy in 3 epochs (~10s/epoch on an RTX
-   5060). **Requires the MNIST files to be downloaded first — see below.**
-
-```bash
-make test
-```
-
-#### Downloading MNIST
-
-`test_mnist` expects the raw IDX-format files under `data/mnist/` (that
-directory is gitignored, so it isn't shipped in the repo):
-
-```bash
+# MNIST (Fashion-MNIST: BASE=http://fashion-mnist.s3-website.eu-central-1.amazonaws.com, into data/fashion-mnist)
 mkdir -p data/mnist && cd data/mnist
 BASE=https://ossci-datasets.s3.amazonaws.com/mnist
 for f in train-images-idx3-ubyte train-labels-idx1-ubyte t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
   curl -sS -o "$f.gz" "$BASE/$f.gz" && gunzip -f "$f.gz"
 done
 cd -
+
+pip install pyarrow numpy pillow          # for the two converters
 ```
 
-If those files are missing, `test_mnist` prints a message and skips itself
-instead of failing the build.
+Notes from training the harder sets: NEU-CLS needs per-epoch shuffling (the files are sorted by class),
+standardization, momentum 0.9, flips and lr ~1e-4 for the CNN (its `defaults.txt` has them); a residual
+network does not beat the CNN on 1440 images. The CIFAR-10 run was stopped at epoch 10 of 15
+(about 50 s/epoch), so ~73% is a partial result, not a tuned one.
 
-### Live training GUI (SDL2)
+![NEU-CLS samples, one class per row](docs/neu_cls_samples.png)
 
-<video src="docs/demo.mp4" controls width="700"></video>
-
-*Loss curve, live predictions, and per-layer weight visualization (with zoom), recorded during an actual training run.*
-
-![Main training window](docs/gui_main.png)
-
-#### Layer weights viewer
-
-Click "view layer weights" to open a second window with one tab per layer
-(screenshots taken after 3 epochs of training). Conv tabs show each 3x3 filter
-(conv2-4 are averaged over input channels); fc tabs show the weight matrix as a
-heatmap with min/max/mean/rms stats underneath. Scroll to zoom, `0` to reset.
-
-| conv1 | conv2 | conv3 |
-|:---:|:---:|:---:|
-| ![conv1](docs/weights_conv1.png) | ![conv2](docs/weights_conv2.png) | ![conv3](docs/weights_conv3.png) |
-
-| conv4 | fc1 | fc2 |
-|:---:|:---:|:---:|
-| ![conv4](docs/weights_conv4.png) | ![fc1](docs/weights_fc1.png) | ![fc2](docs/weights_fc2.png) |
+## Development
 
 ```bash
-make train_gui
-```
-
-Opens a window with a live scrolling loss curve, the current training sample
-(green border if the model got it right, red if not), a per-layer live
-weights viewer (click "view layer weights"), and the model architecture — a
-5-layer ConvNet (one layer deeper than `test_mnist`'s: an extra same-resolution
-conv before the final logits layer) trained on **Fashion-MNIST** (clothing
-categories) instead of handwritten digits, so the two are easy to tell apart
-at a glance — reaches ~88-89% test accuracy in 3 epochs, notably below
-`test_mnist`'s ~97% since Fashion-MNIST is the harder dataset. Requires
-Fashion-MNIST downloaded (below) plus `libsdl2-dev` and `libsdl2-ttf-dev`:
-
-```bash
-sudo apt install -y libsdl2-dev libsdl2-ttf-dev
-```
-
-#### Downloading Fashion-MNIST
-
-`train_worker` expects the raw IDX-format files under `data/fashion-mnist/`
-(same IDX format as MNIST, same filenames, just clothing photos instead of
-digits — that directory is gitignored, so it isn't shipped in the repo):
-
-```bash
-mkdir -p data/fashion-mnist && cd data/fashion-mnist
-BASE=http://fashion-mnist.s3-website.eu-central-1.amazonaws.com
-for f in train-images-idx3-ubyte train-labels-idx1-ubyte t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
-  curl -sS -o "$f.gz" "$BASE/$f.gz" && gunzip -f "$f.gz"
-done
-cd -
-```
-
-This is actually two executables, `train_worker` (pure CUDA, trains and
-streams progress) and `train_viewer` (pure SDL2, draws it), handed off over a
-FIFO at `/tmp/tinydl_train.fifo`. They're kept in separate processes on
-purpose: while chasing a crash in an earlier single-process version (which
-briefly also looked like a CUDA/WSLg driver interop issue, since linking
-SDL2 pulls in GL/X11/Wayland libraries alongside a live CUDA context), the
-actual bug turned out to be mundane — an uninitialized `Gui` struct causing a
-stray pointer dereference inside SDL. That's fixed now, but keeping compute
-and rendering as separate processes is still the safer default: it means the
-training run can never be taken down by a GUI bug (or vice versa), so it's
-staying this way. You can also run the two halves by hand in separate
-terminals (`./train_viewer`, then `./train_worker`) if you want to watch
-their logs independently.
-
-### Code formatting
-
-Format the code using `clang-format` to ensure consistent style across the project.
-
-```bash
-make format
-```
-
-The pre-commit hook will automatically check the formatting of your code before committing. If the formatting is not correct, it will automatically format the code for you. Also, You can run pre-commit against all files to ensure format passed before commiting your changes to ensure code quality and style consistency.
-
-```bash
-pre-commit run --all-files
-```
-
-### Clean
-
-Clean generated files and executables.
-
-```bash
+make format                    # clang-format
+pre-commit run --all-files     # same check as the commit hook
 make clean
 ```

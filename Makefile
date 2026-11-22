@@ -67,7 +67,7 @@ test: $(EXEC)
 
 # train_worker is plain CUDA/C (no SDL2) - built and linked with $(NVCC) like
 # everything else.
-$(OBJ_DIR)/train_worker.o: $(TEST_DIR)/train_worker.c | $(OBJ_DIR)
+$(OBJ_DIR)/train_worker.o: $(TEST_DIR)/train_worker.c $(TEST_DIR)/train_record.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(WORKER_EXEC): $(MODULE_OBJ) $(OPT_OBJ) $(TOOL_CU_OBJ) $(OBJ_DIR)/mnist.o $(OBJ_DIR)/train_worker.o
@@ -75,7 +75,7 @@ $(WORKER_EXEC): $(MODULE_OBJ) $(OPT_OBJ) $(TOOL_CU_OBJ) $(OBJ_DIR)/mnist.o $(OBJ
 
 # train_viewer is plain SDL2 (no CUDA headers or libraries at all) - built
 # and linked with $(CC) only, deliberately never touching $(NVCC).
-$(OBJ_DIR)/train_viewer.o: $(TEST_DIR)/train_viewer.c | $(OBJ_DIR)
+$(OBJ_DIR)/train_viewer.o: $(TEST_DIR)/train_viewer.c $(TEST_DIR)/train_record.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) $(SDL2_CFLAGS) -c $< -o $@
 
 $(VIEWER_EXEC): $(OBJ_DIR)/train_viewer.o

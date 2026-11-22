@@ -1,10 +1,18 @@
-/* SDL2 viewer half of the live-training UI - reads TrainRecord structs from
- * a FIFO and draws them. Deliberately has no CUDA dependency at all (see the
- * big comment at the top of train_worker.c for why this is a separate
- * process from the trainer). Run both together with `make train_gui`. */
+/* SDL2 viewer half of the live-training UI. Two screens:
+ *   - setup: a form where every training parameter (dataset, epochs, batch
+ *     size, learning rate, seed, the conv/fc layer stack, ...) is typed in.
+ *     Start sends the validated TrainConfig to train_worker.
+ *   - training: the live dashboard (loss curve, current sample, architecture,
+ *     per-layer weights window) driven by the messages the worker streams back.
+ * Deliberately has no CUDA dependency at all (see the big comment at the top
+ * of train_worker.c for why this is a separate process from the trainer).
+ * Run both together with `make train_gui`. */
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,155 +31,173 @@
 #define LOSS_CLIP 2.5f
 #define MAX_LABEL_W 440
 #define MAX_LABEL_H 32
+#define NUM_LABEL_SLOTS 400  /* main window text, one slot per draw call per frame */
+#define NUM_WLABEL_SLOTS 64  /* weights window text */
 
-/* Shared between render_frame() (draws it) and pump_events() (hit-tests
- * clicks against it) so the two can never drift apart. */
+#define SCREEN_SETUP 0
+#define SCREEN_RUN 1
+
+/* Hit-tested by pump_events() and drawn by the render functions from the same
+ * constants so the two can never drift apart. */
 static const SDL_Rect WEIGHTS_BUTTON = {830, 370, 300, 150};
+static const SDL_Rect RESTART_BUTTON = {830, 644, 146, 36};
+static const SDL_Rect SETTINGS_BUTTON = {984, 644, 146, 36};
 
-/* Training doesn't begin until Start is clicked - centered in the chart area,
- * which has nothing to show yet anyway before the first record arrives.
- * Restart is a small persistent control once a run exists (whether still in
- * progress or finished), tucked into the bottom of the info box in place of
- * the old static hint line. */
-static const SDL_Rect START_BUTTON = {265, 360, 300, 90};
-static const SDL_Rect RESTART_BUTTON = {830, 644, 300, 36};
+static const SDL_Rect PANEL_TRAIN = {20, 20, 370, 660};
+static const SDL_Rect PANEL_GRAPH = {410, 20, 720, 546};
+static const SDL_Rect GRAPH_VIEW = {411, 66, 718, 499}; /* the node canvas, below the palette row */
+static const SDL_Rect BTN_ARRANGE = {900, 28, 70, 30};
+static const SDL_Rect BTN_RESET = {976, 28, 50, 30};   /* the plain CNN preset */
+static const SDL_Rect BTN_RESNET = {1032, 28, 88, 30}; /* the mini-ResNet preset */
+#define NUM_PALETTE 8
+static const int PALETTE_TYPES[NUM_PALETTE] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR,
+                                               BLK_ADD,  BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP};
 
-/* Static (compile-time-known) description of the ConvNet train_worker.c
- * builds - purely informational, doesn't need anything from the FIFO. Two
- * lines per box: name, then shape + kernel/stride. Keep in sync with
- * model_init() in train_worker.c if that ever changes. */
-typedef struct ArchBox {
-    const char *name;
-    const char *info;
-} ArchBox;
-static const ArchBox ARCH_BOXES[] = {
-    {"input", "28x28x1"},
-    {"conv1", "28x28x8 3x3 s1"},
-    {"conv2", "14x14x16 3x3 s2"},
-    {"conv3", "7x7x32 3x3 s2"},
-    {"conv4", "7x7x32 3x3 s1"},
-    {"fc1", "1568 -> 128"},
-    {"fc2", "128 -> 10"},
-};
-#define NUM_ARCH_BOXES (int)(sizeof(ARCH_BOXES) / sizeof(ARCH_BOXES[0]))
+static SDL_Rect palette_rect(int i) {
+    SDL_Rect r = {418 + i * 60, 28, 56, 30};
+    return r;
+}
+static const SDL_Rect BTN_START = {880, 582, 250, 98};
+static const SDL_Rect BTN_BACK = {410, 646, 230, 34};
 
-/* Fashion-MNIST's label order is fixed by the dataset itself (not something
- * train_worker.c computes or sends) - purely a display lookup. */
-static const char *CLASS_NAMES[10] = {"T-shirt/top", "Trouser", "Pullover", "Dress",  "Coat",
-                                       "Sandal",      "Shirt",   "Sneaker",  "Bag",    "Ankle boot"};
+static const char *FASHION_NAMES[10] = {"T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
+                                         "Sandal",      "Shirt",   "Sneaker",  "Bag",   "Ankle boot"};
 
-enum {
-    LBL_CHART_CAPTION,
-    LBL_DIGIT_CAPTION,
-    LBL_EPOCH,
-    LBL_BATCH,
-    LBL_LOSS,
-    LBL_ELAPSED,
-    LBL_WEIGHTS_BTN_TITLE,
-    LBL_WEIGHTS_BTN_SUB,
-    LBL_START_TITLE,
-    LBL_RESTART,
-    LBL_ARCH_CAPTION,
-    LBL_ARCH_BASE /* NUM_ARCH_BOXES * 2 slots follow (name line, info line) */
-};
-#define NUM_LABEL_SLOTS (LBL_ARCH_BASE + NUM_ARCH_BOXES * 2)
+#define COL_BG 11, 13, 19, 255
+#define COL_SURFACE 20, 23, 32, 255
+#define COL_SURFACE2 28, 32, 44, 255 /* raised: buttons, chips, cards' bodies */
+#define COL_BORDER 40, 45, 60, 255
+#define COL_BORDER_HI 62, 70, 94, 255
+#define COL_GRID 28, 32, 44, 255
+#define COL_TEXT 232, 236, 244, 255
+#define COL_TEXT_DIM 143, 151, 170, 255
+#define COL_LOSS 96, 140, 255, 255 /* the accent colour */
+#define COL_GOOD 62, 200, 128, 255
+#define COL_BAD 245, 101, 112, 255
 
-/* Text inside the weights window - separate slot space from the main
- * window's since they belong to a different renderer. One slot per tab
- * button plus one for the caption above the active layer's grid (only one
- * layer is ever shown at a time - see Gui::weights_tab). */
-enum {
-    WLBL_TAB0,
-    WLBL_TAB1,
-    WLBL_TAB2,
-    WLBL_TAB3,
-    WLBL_TAB4,
-    WLBL_TAB5,
-    WLBL_CAPTION,
-    WLBL_STATS,
-    WLBL_ZOOM,
-    NUM_WEIGHTS_LABEL_SLOTS
-};
+/* -- form fields --------------------------------------------------------- */
 
-/* One tab per conv layer. conv1 has in_channels=1 so its kernels are full
- * detail; conv2-4 mix multiple input channels per kernel, so those show
- * mean(|weight|) over the input-channel axis instead (see
- * reduce_filter_magnitude in train_worker.c) - a same-size "how much this
- * output channel weighs each kernel position overall" map, not the literal
- * weights. fc1/fc2 (the MLP head after conv4) aren't shown here - they're
- * not spatial filters, so there's no grid of thumbnails for them the way
- * there is for the conv layers. `cols` is just a layout choice picked per
- * layer to keep cells roughly square given how many filters there are. */
-#define TABKIND_CONV_GRID 0 /* grid of square (ksize,ksize) thumbnails, one per filter */
-#define TABKIND_FC_MATRIX 1 /* a single (rows,cols) heatmap - reuses count=rows, cols=cols */
-typedef struct WeightsTab {
-    const char *tab_label;
-    const char *caption;
+enum { FK_INT, FK_FLOAT, FK_NAME, FK_CHOICE /* picked from a dropdown, never typed */ };
+
+typedef struct Field {
+    char text[40];
     int kind;
-    int count; /* CONV_GRID: filter count | FC_MATRIX: matrix rows */
-    int cols;  /* CONV_GRID: grid columns | FC_MATRIX: matrix cols */
-    int ksize; /* CONV_GRID only: kernel size (square) */
-} WeightsTab;
-static const WeightsTab WEIGHTS_TABS[6] = {
-    {"conv1", "conv1 - 8 filters (3x3, full detail)", TABKIND_CONV_GRID, CONV1_OUT, 4, CONV1_K},
-    {"conv2", "conv2 - 16 maps (3x3, mean |w| over in-ch)", TABKIND_CONV_GRID, CONV2_OUT, 4, CONV2_K},
-    {"conv3", "conv3 - 32 maps (3x3, mean |w| over in-ch)", TABKIND_CONV_GRID, CONV3_OUT, 8, CONV3_K},
-    {"conv4", "conv4 - 32 maps (3x3, mean |w| over in-ch)", TABKIND_CONV_GRID, CONV4_OUT, 8, CONV4_K},
-    {"fc1", NULL /* built from FC1_POOL at render time, see render_weights_window */, TABKIND_FC_MATRIX,
-     FC1_VIZ_ROWS, FC1_VIZ_COLS, 0},
-    {"fc2", "fc2 weight (128->10, full detail)", TABKIND_FC_MATRIX, FC2_ROWS, FC2_COLS, 0},
-};
-#define NUM_WEIGHTS_TABS 6
+    SDL_Rect rect;
+    int visible;
+} Field;
 
-#define COL_BG 13, 15, 20, 255
-#define COL_SURFACE 22, 25, 34, 255
-#define COL_BORDER 42, 47, 59, 255
-#define COL_GRID 30, 34, 44, 255
-#define COL_TEXT 238, 240, 244, 255
-#define COL_TEXT_DIM 170, 176, 189, 255
-#define COL_LOSS 57, 135, 229, 255
-#define COL_GOOD 12, 163, 12, 255
-#define COL_BAD 230, 103, 103, 255
+enum { F_DATASET, F_EPOCHS, F_BATCH, F_LR, F_MOMENTUM, F_NORMALIZE, F_AUGMENT, F_SEED, F_POOL, F_VIZ, NUM_GENERAL_FIELDS };
+
+/* The model editor: every node may carry up to 4 parameter fields, which live
+ * in the same fields[] array as the general ones (index F_NODE(node, j)). A
+ * conv node uses j = 0 out channels, 1 kernel, 2 stride, 3 padding; fc: j = 0 out;
+ * maxpool: j = 0 window, 1 stride. */
+#define MAX_NODES 40
+#define F_NODE(i, j) (NUM_GENERAL_FIELDS + (i)*4 + (j))
+#define NUM_FIELDS (NUM_GENERAL_FIELDS + MAX_NODES * 4)
+#define NODE_INPUT 0
+#define NODE_OUTPUT 15 /* node types are the BLK_* values plus these two */
+#define NODE_W 112
+#define NODE_GAP 24 /* horizontal space left between auto-placed nodes */
+#define DRAG_NONE 0
+#define DRAG_NODE 1 /* moving a node */
+#define DRAG_PAN 2  /* panning the canvas */
+#define DRAG_LINK 3 /* pulling a wire out of a node's output dot */
+#define DRAG_PAL 4  /* carrying a palette block */
+
+/* A node reads the outputs of the nodes its input wires point at (in[0], and for an add node also
+ * in[1]); an output dot may feed any number of nodes. That is the whole graph. */
+typedef struct Node {
+    int used;
+    int type;
+    int x, y;    /* canvas coordinates (before panning) */
+    int in[2];   /* source node of each input port, or -1 */
+} Node;
+#define FIELD_MAX_CHARS 31
+#define MAX_DATASETS 12
+
+/* What the viewer learns about a data/<name>/ folder before any training:
+ * image size and sample count from the IDX header, class count from the label
+ * file (or classes.txt, which also names the classes), and optionally the
+ * settings that work well for it from defaults.txt ("key value" lines:
+ * epochs, batch_size, lr, momentum, normalize, augment). */
+typedef struct DatasetInfo {
+    char name[32]; /* must stay first: the list is sorted with a plain strcmp */
+    int count, rows, cols, channels, n_classes;
+    int has_names;
+    char class_names[MAX_CLASSES][CLASS_NAME_LEN];
+    int def_epochs, def_batch, def_normalize, def_augment; /* -1 = not given */
+    float def_lr, def_momentum;                           /* < 0 = not given */
+} DatasetInfo;
 
 typedef struct Gui {
     SDL_Window *win;
     SDL_Renderer *ren;
     TTF_Font *font;
     TTF_Font *font_big;
-    SDL_Texture *digit_tex;
+    TTF_Font *font_med; /* same size as font, heavier weight: titles */
+    TTF_Font *font_small;
+    SDL_Texture *digit_tex; /* the current training sample, digit_w x digit_h */
+    int digit_w, digit_h, digit_c;
     SDL_Texture *label_tex[NUM_LABEL_SLOTS];
+    int slot; /* next free label_tex slot this frame */
     float loss_hist[HISTORY_LEN];
     int hist_count;
     int hist_head;
     int mouse_x, mouse_y;
 
-    int cmd_fd;      /* write end of the viewer->worker command FIFO */
-    int started;     /* Start (or Restart) has been clicked at least once */
-    int has_record;  /* at least one TrainRecord has arrived since the last (re)start */
+    int cmd_fd; /* write end of the viewer->worker command FIFO */
+    int screen;
+    int run_active;  /* a Start was sent and not rejected since */
+    int worker_gone; /* data FIFO hit EOF / protocol error */
+    char worker_msg[256];
 
-    /* Opened on demand by clicking the "view live weights" button. Textures
+    /* setup form */
+    Field fields[NUM_FIELDS];
+    int focus; /* index into fields, or -1 */
+    Node nodes[MAX_NODES];
+    int pan_x, pan_y;
+    int drag, drag_node, drag_type, drag_moved, press_x, press_y;
+    int chain[MAX_BLOCKS];     /* the node behind each block of form_cfg, in block (evaluation) order */
+    int chain_len;
+    int node_block[MAX_NODES]; /* node -> index into form_cfg.blocks, or -1 if not on the path */
+    char node_name[MAX_NODES][12];
+    int form_err_node;
+    DatasetInfo ds[MAX_DATASETS]; /* folders under data/ that hold a usable dataset */
+    int n_datasets;
+    int dropdown_open; /* dataset dropdown list is showing */
+    TrainConfig form_cfg;
+    NetShapes form_shapes;
+    int form_valid;
+    char form_err[200];
+    int form_err_field;
+
+    /* current run, as described by the worker */
+    int has_model;
+    ModelInfo model;
+    TrainConfig run_cfg; /* what the dashboard is showing: set on Start/Restart, confirmed by MSG_MODEL */
+    NetShapes run_shapes;
+    float *weights;
+    int weights_valid;
+    int has_record;
+    Progress prog;
+    unsigned char *sample; /* pixels of prog's sample, run_cfg.img_h * img_w */
+    DatasetInfo run_ds;    /* the dataset the dashboard is showing, for class names */
+
+    /* Opened on demand by clicking the "view layer weights" button. Textures
      * and label caches belong to weights_ren specifically (SDL textures
      * aren't shared across renderers), so they get their own arrays instead
      * of reusing anything from the main window. All NULL when closed. */
     SDL_Window *weights_win;
     SDL_Renderer *weights_ren;
-    int weights_tab; /* which of WEIGHTS_TABS is shown; persists across close/reopen */
-    SDL_Texture *weights_label_tex[NUM_WEIGHTS_LABEL_SLOTS];
-    SDL_Texture *tex_conv1[CONV1_OUT];
-    SDL_Texture *tex_conv2[CONV2_OUT];
-    SDL_Texture *tex_conv3[CONV3_OUT];
-    SDL_Texture *tex_conv4[CONV4_OUT];
-    SDL_Texture *tex_fc1;
-    SDL_Texture *tex_fc2;
-
-    /* Zoom into whatever the active tab is showing: the tab's content (filter
-     * grid or fc heatmap) is drawn once into this fixed-size offscreen
-     * target, then a centered crop of it is scaled up into the visible box -
-     * draw_filter_section/draw_fc_matrix don't need to know zoom exists at
-     * all, they just always draw at native size into the content texture. */
-    SDL_Texture *weights_content_tex;
-    float weights_zoom; /* 1.0 = fully zoomed out (the whole content visible) */
+    int weights_tab; /* index into model.layers; persists across close/reopen */
+    int wslot;
+    SDL_Texture *weights_label_tex[NUM_WLABEL_SLOTS];
+    float yaw, pitch;   /* 3D camera orbit, radians */
+    float zoom3d;
 } Gui;
+
+static void close_weights_window(Gui *g);
 
 static int gui_init(Gui *g) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -182,8 +208,8 @@ static int gui_init(Gui *g) {
         fprintf(stderr, "TTF_Init failed: %s\n", TTF_GetError());
         return -1;
     }
-    g->win = SDL_CreateWindow("tinyDL - Fashion-MNIST training", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIN_W,
-                               WIN_H, SDL_WINDOW_SHOWN);
+    g->win = SDL_CreateWindow("tinyDL - training", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIN_W, WIN_H,
+                               SDL_WINDOW_SHOWN);
     if (!g->win) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return -1;
@@ -191,24 +217,34 @@ static int gui_init(Gui *g) {
     g->ren = SDL_CreateRenderer(g->win, -1, SDL_RENDERER_SOFTWARE);
     SDL_SetRenderDrawBlendMode(g->ren, SDL_BLENDMODE_BLEND);
 
-    const char *font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
-    g->font = TTF_OpenFont(font_path, 14);
-    g->font_big = TTF_OpenFont(font_path, 20);
-    if (!g->font || !g->font_big) {
-        fprintf(stderr, "TTF_OpenFont failed (%s): %s\n", font_path, TTF_GetError());
+    /* A proportional UI font reads more modern than a monospace one; the first of each list that
+     * exists is used (Ubuntu ships with most desktops here, DejaVu nearly everywhere). */
+    static const char *regular[] = {"/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+                                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", NULL};
+    static const char *medium[] = {"/usr/share/fonts/truetype/ubuntu/Ubuntu-M.ttf",
+                                   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                                   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", NULL};
+    for (int i = 0; regular[i] && !g->font; ++i) {
+        g->font = TTF_OpenFont(regular[i], 15);
+        g->font_small = TTF_OpenFont(regular[i], 12);
+        g->font_big = TTF_OpenFont(medium[i], 22);
+        g->font_med = TTF_OpenFont(medium[i], 15);
+        if (!g->font || !g->font_small || !g->font_big || !g->font_med) {
+            if (g->font) TTF_CloseFont(g->font);
+            if (g->font_small) TTF_CloseFont(g->font_small);
+            if (g->font_big) TTF_CloseFont(g->font_big);
+            if (g->font_med) TTF_CloseFont(g->font_med);
+            g->font = g->font_small = g->font_big = g->font_med = NULL;
+        }
+    }
+    if (!g->font) {
+        fprintf(stderr, "no usable UI font found: %s\n", TTF_GetError());
         return -1;
     }
 
-    g->digit_tex =
-        SDL_CreateTexture(g->ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, TRAIN_IMG_SIZE, TRAIN_IMG_SIZE);
-    if (g->digit_tex) SDL_SetTextureScaleMode(g->digit_tex, SDL_ScaleModeNearest);
-
-    g->hist_count = 0;
-    g->hist_head = 0;
     return 0;
 }
-
-static void close_weights_window(Gui *g);
 
 static void gui_shutdown(Gui *g) {
     close_weights_window(g);
@@ -217,8 +253,12 @@ static void gui_shutdown(Gui *g) {
         if (g->label_tex[i]) SDL_DestroyTexture(g->label_tex[i]);
     if (g->font) TTF_CloseFont(g->font);
     if (g->font_big) TTF_CloseFont(g->font_big);
+    if (g->font_med) TTF_CloseFont(g->font_med);
+    if (g->font_small) TTF_CloseFont(g->font_small);
     if (g->ren) SDL_DestroyRenderer(g->ren);
     if (g->win) SDL_DestroyWindow(g->win);
+    free(g->weights);
+    free(g->sample);
     TTF_Quit();
     SDL_Quit();
 }
@@ -229,14 +269,19 @@ static void gui_push_point(Gui *g, float loss) {
     if (g->hist_count < HISTORY_LEN) g->hist_count++;
 }
 
-/* `slot` is the address of one persistent per-label SDL_Texture* (either a
- * slot in Gui::label_tex for the main window, or in Gui::weights_label_tex
- * for the weights window) so re-rendering the same line of text every frame
- * updates that texture's pixels in place instead of doing a fresh
- * SDL_CreateTexture/DestroyTexture - see the comment on Gui::digit_tex's
- * origin story for why that churn matters on this renderer/driver. Takes the
- * renderer explicitly (rather than always using a Gui's main `ren`) so the
- * same function draws into either window. */
+static void gui_clear_history(Gui *g) {
+    g->hist_count = 0;
+    g->hist_head = 0;
+}
+
+/* `slot` is the address of one persistent per-label SDL_Texture* (a slot in
+ * Gui::label_tex for the main window, or in Gui::weights_label_tex for the
+ * weights window) so re-rendering a line of text every frame updates that
+ * texture's pixels in place instead of doing a fresh SDL_CreateTexture/
+ * DestroyTexture - that churn once exhausted the GPU resources of this
+ * renderer/driver mid-run. Takes the renderer explicitly so the same function
+ * draws into either window. Each slot may be used at most once per frame (the
+ * renderer queues draws, so a second upload would overwrite the first). */
 static void draw_text(SDL_Renderer *ren, SDL_Texture **slot, TTF_Font *font, const char *s, int x, int y,
                        SDL_Color color) {
     SDL_Surface *raw = TTF_RenderText_Blended(font, s, color);
@@ -270,17 +315,1982 @@ static void draw_text(SDL_Renderer *ren, SDL_Texture **slot, TTF_Font *font, con
     SDL_FreeSurface(surf);
 }
 
-static void draw_panel(SDL_Renderer *ren, SDL_Rect r) {
-    SDL_SetRenderDrawColor(ren, COL_SURFACE);
-    SDL_RenderFillRect(ren, &r);
-    SDL_SetRenderDrawColor(ren, COL_BORDER);
-    SDL_RenderDrawRect(ren, &r);
+/* Main-window text: takes the next free label slot of this frame. */
+static void txt(Gui *g, TTF_Font *font, const char *s, int x, int y, SDL_Color color) {
+    if (!s[0] || g->slot >= NUM_LABEL_SLOTS) return;
+    draw_text(g->ren, &g->label_tex[g->slot++], font, s, x, y, color);
 }
+
+static void wtxt(Gui *g, const char *s, int x, int y, SDL_Color color) {
+    if (!s[0] || g->wslot >= NUM_WLABEL_SLOTS) return;
+    draw_text(g->weights_ren, &g->weights_label_tex[g->wslot++], g->font, s, x, y, color);
+}
+
+/* -- shapes: rounded rectangles, soft shadows, smooth circles -------------- */
+
+static void set_color(SDL_Renderer *r, SDL_Color c) { SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a); }
+
+static SDL_Color col_mix(SDL_Color a, SDL_Color b, float t) {
+    SDL_Color c = {(Uint8)(a.r + (b.r - a.r) * t), (Uint8)(a.g + (b.g - a.g) * t), (Uint8)(a.b + (b.b - a.b) * t),
+                   (Uint8)(a.a + (b.a - a.a) * t)};
+    return c;
+}
+
+/* Filled rounded rectangle; the corner pixels get partial alpha so the curve is smooth. */
+static void fill_rrect(SDL_Renderer *r, SDL_Rect rc, int rad, SDL_Color c) {
+    if (rc.w <= 0 || rc.h <= 0) return;
+    if (rad * 2 > rc.h) rad = rc.h / 2;
+    if (rad * 2 > rc.w) rad = rc.w / 2;
+    set_color(r, c);
+    SDL_Rect mid = {rc.x, rc.y + rad, rc.w, rc.h - 2 * rad};
+    if (mid.h > 0) SDL_RenderFillRect(r, &mid);
+    for (int i = 0; i < rad; ++i) {
+        float dy = (float)rad - (float)i - 0.5f;
+        float inset = (float)rad - sqrtf((float)rad * (float)rad - dy * dy);
+        int ix = (int)inset;
+        float cover = 1.0f - (inset - (float)ix); /* how much of the edge pixel is inside the curve */
+        int x0 = rc.x + ix + 1, x1 = rc.x + rc.w - ix - 2;
+        int yt = rc.y + i, yb = rc.y + rc.h - 1 - i;
+        if (x1 >= x0) {
+            SDL_RenderDrawLine(r, x0, yt, x1, yt);
+            SDL_RenderDrawLine(r, x0, yb, x1, yb);
+        }
+        SDL_SetRenderDrawColor(r, c.r, c.g, c.b, (Uint8)(c.a * cover));
+        SDL_RenderDrawPoint(r, rc.x + ix, yt);
+        SDL_RenderDrawPoint(r, rc.x + rc.w - 1 - ix, yt);
+        SDL_RenderDrawPoint(r, rc.x + ix, yb);
+        SDL_RenderDrawPoint(r, rc.x + rc.w - 1 - ix, yb);
+        set_color(r, c);
+    }
+}
+
+/* Rounded rectangle with a 1px border: border colour underneath, fill inset by one. */
+static void rrect_bordered(SDL_Renderer *r, SDL_Rect rc, int rad, SDL_Color fill, SDL_Color border) {
+    fill_rrect(r, rc, rad, border);
+    SDL_Rect in = {rc.x + 1, rc.y + 1, rc.w - 2, rc.h - 2};
+    fill_rrect(r, in, rad > 1 ? rad - 1 : 0, fill);
+}
+
+/* A few translucent, growing copies under a card: cheap soft shadow. */
+static void draw_shadow(SDL_Renderer *r, SDL_Rect rc, int rad) {
+    for (int k = 5; k >= 1; --k) {
+        SDL_Rect s = {rc.x - k, rc.y - k + 3, rc.w + 2 * k, rc.h + 2 * k};
+        fill_rrect(r, s, rad + k, (SDL_Color){0, 0, 0, 16});
+    }
+}
+
+/* Filled circle with a smooth edge. */
+static void fill_circle_aa(SDL_Renderer *r, int cx, int cy, int rad, SDL_Color c) {
+    set_color(r, c);
+    for (int dy = -rad; dy <= rad; ++dy) {
+        float half = sqrtf((float)(rad * rad - dy * dy) + 0.25f);
+        int ix = (int)half;
+        float frac = half - (float)ix;
+        SDL_RenderDrawLine(r, cx - ix, cy + dy, cx + ix, cy + dy);
+        SDL_SetRenderDrawColor(r, c.r, c.g, c.b, (Uint8)(c.a * frac));
+        SDL_RenderDrawPoint(r, cx - ix - 1, cy + dy);
+        SDL_RenderDrawPoint(r, cx + ix + 1, cy + dy);
+        set_color(r, c);
+    }
+}
+
+static void draw_panel(SDL_Renderer *ren, SDL_Rect r) {
+    int rad = r.h >= 80 ? 12 : 7;
+    rrect_bordered(ren, r, rad, (SDL_Color){COL_SURFACE}, (SDL_Color){COL_BORDER});
+}
+
+/* Secondary button: raised surface, accent outline on hover. */
+static void draw_button(Gui *g, SDL_Rect r, const char *label, TTF_Font *font, int hovered, int enabled) {
+    SDL_Color fill = hovered && enabled ? (SDL_Color){36, 42, 60, 255} : (SDL_Color){COL_SURFACE2};
+    SDL_Color border = !enabled ? (SDL_Color){COL_BORDER} : (hovered ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_BORDER_HI});
+    rrect_bordered(g->ren, r, 8, fill, border);
+    int tw = 0;
+    TTF_SizeText(font, label, &tw, NULL);
+    SDL_Color col = enabled ? (SDL_Color){COL_TEXT} : (SDL_Color){COL_TEXT_DIM};
+    txt(g, font, label, r.x + (r.w - tw) / 2, r.y + (r.h - TTF_FontHeight(font)) / 2, col);
+}
+
+/* Primary action: filled accent, dark label. */
+static void draw_button_primary(Gui *g, SDL_Rect r, const char *label, TTF_Font *font, int hovered, int enabled) {
+    SDL_Color fill = enabled ? (hovered ? (SDL_Color){128, 166, 255, 255} : (SDL_Color){COL_LOSS})
+                             : (SDL_Color){COL_SURFACE2};
+    if (enabled) draw_shadow(g->ren, r, 10);
+    fill_rrect(g->ren, r, 10, fill);
+    int tw = 0;
+    TTF_SizeText(font, label, &tw, NULL);
+    SDL_Color col = enabled ? (SDL_Color){10, 14, 28, 255} : (SDL_Color){COL_TEXT_DIM};
+    txt(g, font, label, r.x + (r.w - tw) / 2, r.y + (r.h - TTF_FontHeight(font)) / 2, col);
+}
+
+/* Greedy word wrap into at most `max_lines` lines of `max_chars` characters. */
+static void draw_wrapped(Gui *g, TTF_Font *font, const char *s, int x, int y, int max_chars, int line_h,
+                          int max_lines, SDL_Color col) {
+    char line[128];
+    const char *p = s;
+    for (int ln = 0; ln < max_lines && *p; ++ln) {
+        int n = (int)strlen(p);
+        if (n > max_chars) {
+            n = max_chars;
+            int cut = n;
+            while (cut > 0 && p[cut] != ' ') cut--;
+            if (cut > 0) n = cut;
+        }
+        if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
+        memcpy(line, p, (size_t)n);
+        line[n] = '\0';
+        txt(g, font, line, x, y + ln * line_h, col);
+        p += n;
+        while (*p == ' ') p++;
+    }
+}
+
+/* -- setup form + node editor -------------------------------------------- */
+
+static uint32_t be_u32(const unsigned char *b) { return ((uint32_t)b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]; }
+
+static void parse_defaults(const char *path, DatasetInfo *d) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[96], key[32];
+    double v;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%31s %lf", key, &v) != 2) continue;
+        if (!strcmp(key, "epochs")) d->def_epochs = (int)v;
+        else if (!strcmp(key, "batch_size")) d->def_batch = (int)v;
+        else if (!strcmp(key, "lr")) d->def_lr = (float)v;
+        else if (!strcmp(key, "momentum")) d->def_momentum = (float)v;
+        else if (!strcmp(key, "normalize")) d->def_normalize = (int)v;
+        else if (!strcmp(key, "augment")) d->def_augment = (int)v;
+    }
+    fclose(f);
+}
+
+/* Fills *d for data/<name>/ or returns 0 if it isn't a usable dataset: the name
+ * has to be one train_cfg_derive() accepts, the IDX files must exist with a
+ * supported image size, and there must be at least two classes. */
+static int dataset_probe(const char *name, DatasetInfo *d) {
+    size_t n = strlen(name);
+    if (n == 0 || n >= sizeof(d->name)) return 0;
+    for (size_t i = 0; i < n; ++i) {
+        char c = name[i];
+        if (!(isalnum((unsigned char)c) || c == '-' || c == '_')) return 0;
+    }
+    memset(d, 0, sizeof(*d));
+    snprintf(d->name, sizeof(d->name), "%s", name);
+    d->def_epochs = d->def_batch = d->def_normalize = d->def_augment = -1;
+    d->def_lr = d->def_momentum = -1.0f;
+
+    char path[128];
+    unsigned char hdr[20];
+    snprintf(path, sizeof(path), "data/%s/train-images-idx3-ubyte", name);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t got = fread(hdr, 1, sizeof(hdr), f);
+    fclose(f);
+    /* magic 0x803: (count, rows, cols) grey images; 0x804: (count, channels, rows, cols) colour */
+    unsigned magic = got >= 4 ? be_u32(hdr) : 0;
+    if (got < 16 || (magic != 0x00000803u && magic != 0x00000804u)) return 0;
+    if (magic == 0x00000804u && got < 20) return 0;
+    d->count = (int)be_u32(hdr + 4);
+    d->channels = magic == 0x00000804u ? (int)be_u32(hdr + 8) : 1;
+    d->rows = (int)be_u32(hdr + (magic == 0x00000804u ? 12 : 8));
+    d->cols = (int)be_u32(hdr + (magic == 0x00000804u ? 16 : 12));
+    if (d->channels < 1 || d->channels > MAX_IMG_CH) return 0;
+    if (d->count < 1 || d->rows < 1 || d->rows > MAX_IMG_SIDE || d->cols < 1 || d->cols > MAX_IMG_SIDE) return 0;
+
+    snprintf(path, sizeof(path), "data/%s/train-labels-idx1-ubyte", name);
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char lh[8];
+    if (fread(lh, 1, sizeof(lh), f) != sizeof(lh) || be_u32(lh) != 0x00000801u) { fclose(f); return 0; }
+    int max_label = -1;
+    unsigned char buf[4096];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), f)) > 0)
+        for (size_t i = 0; i < r; ++i)
+            if (buf[i] > max_label) max_label = buf[i];
+    fclose(f);
+    d->n_classes = max_label + 1;
+
+    snprintf(path, sizeof(path), "data/%s/classes.txt", name);
+    f = fopen(path, "r");
+    if (f) {
+        char line[64];
+        int k = 0;
+        while (k < MAX_CLASSES && fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!line[0]) continue;
+            snprintf(d->class_names[k++], CLASS_NAME_LEN, "%.23s", line);
+        }
+        fclose(f);
+        if (k > 0) {
+            d->has_names = 1;
+            if (k > d->n_classes) d->n_classes = k;
+        }
+    } else if (!strcmp(name, "fashion-mnist") && d->n_classes <= 10) {
+        for (int k = 0; k < 10; ++k) snprintf(d->class_names[k], CLASS_NAME_LEN, "%s", FASHION_NAMES[k]);
+        d->has_names = 1;
+        d->n_classes = 10;
+    }
+    if (d->n_classes < 2 || d->n_classes > MAX_CLASSES) return 0;
+
+    snprintf(path, sizeof(path), "data/%s/defaults.txt", name);
+    parse_defaults(path, d);
+    return 1;
+}
+
+static int cmp_names(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+
+static void scan_datasets(Gui *g) {
+    g->n_datasets = 0;
+    DIR *dir = opendir("data");
+    if (!dir) return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) && g->n_datasets < MAX_DATASETS) {
+        if (ent->d_name[0] == '.') continue;
+        if (dataset_probe(ent->d_name, &g->ds[g->n_datasets])) g->n_datasets++;
+    }
+    closedir(dir);
+    qsort(g->ds, (size_t)g->n_datasets, sizeof(g->ds[0]), cmp_names);
+}
+
+static const DatasetInfo *ds_find(const Gui *g, const char *name) {
+    for (int i = 0; i < g->n_datasets; ++i)
+        if (strcmp(g->ds[i].name, name) == 0) return &g->ds[i];
+    return NULL;
+}
+
+/* The dataset currently picked in the form, or NULL. */
+static const DatasetInfo *form_dataset(const Gui *g) { return ds_find(g, g->fields[F_DATASET].text); }
+
+static const char *class_name(const DatasetInfo *d, int label, char *buf, size_t bufsz) {
+    if (d->has_names && label >= 0 && label < MAX_CLASSES && d->class_names[label][0]) return d->class_names[label];
+    snprintf(buf, bufsz, "%d", label);
+    return buf;
+}
+
+static void field_set(Gui *g, int idx, const char *text, int kind) {
+    snprintf(g->fields[idx].text, sizeof(g->fields[idx].text), "%s", text);
+    g->fields[idx].kind = kind;
+}
+
+/* -- the node graph ------------------------------------------------------- */
+
+static int node_height(int type) {
+    switch (type) {
+    case BLK_CONV: return 100;
+    case BLK_LINEAR:
+    case BLK_MAXPOOL: return 72;
+    case BLK_ADD: return 62;
+    default: return 46;
+    }
+}
+
+static int node_nparams(int type) {
+    switch (type) {
+    case BLK_CONV: return 4;
+    case BLK_LINEAR: return 1;
+    case BLK_MAXPOOL: return 2;
+    default: return 0;
+    }
+}
+static int node_nin(int type) { return type == NODE_INPUT ? 0 : (type == BLK_ADD ? 2 : 1); }
+static int node_deletable(int type) { return type != NODE_INPUT && type != NODE_OUTPUT; }
+
+static const char *node_type_title(int type) {
+    switch (type) {
+    case NODE_INPUT: return "input";
+    case NODE_OUTPUT: return "output";
+    case BLK_CONV: return "conv";
+    case BLK_RELU: return "relu";
+    case BLK_FLATTEN: return "flatten";
+    case BLK_ADD: return "add";
+    case BLK_BATCHNORM: return "bn";
+    case BLK_MAXPOOL: return "pool";
+    case BLK_GAP: return "gap";
+    default: return "fc";
+    }
+}
+
+static SDL_Color node_accent(int type) {
+    switch (type) {
+    case BLK_CONV: return (SDL_Color){57, 135, 229, 255};
+    case BLK_RELU: return (SDL_Color){96, 181, 120, 255};
+    case BLK_FLATTEN: return (SDL_Color){176, 138, 224, 255};
+    case BLK_LINEAR: return (SDL_Color){232, 160, 76, 255};
+    case BLK_ADD: return (SDL_Color){232, 108, 160, 255};
+    case BLK_BATCHNORM: return (SDL_Color){64, 196, 200, 255};
+    case BLK_MAXPOOL: return (SDL_Color){214, 200, 90, 255};
+    case BLK_GAP: return (SDL_Color){150, 206, 84, 255};
+    default: return (SDL_Color){150, 156, 168, 255};
+    }
+}
+
+static SDL_Rect node_rect(const Gui *g, int i) {
+    const Node *n = &g->nodes[i];
+    SDL_Rect r = {GRAPH_VIEW.x + g->pan_x + n->x, GRAPH_VIEW.y + g->pan_y + n->y, NODE_W, node_height(n->type)};
+    return r;
+}
+
+static SDL_Point node_out_port(const Gui *g, int i) {
+    SDL_Rect r = node_rect(g, i);
+    SDL_Point p = {r.x + r.w, r.y + 11};
+    return p;
+}
+
+/* Input port k of node i: an add node has two, stacked. */
+static SDL_Point node_in_port(const Gui *g, int i, int k) {
+    SDL_Rect r = node_rect(g, i);
+    SDL_Point p = {r.x, r.y + 11 + k * 22};
+    return p;
+}
+
+static SDL_Rect node_del_rect(SDL_Rect r) {
+    SDL_Rect d = {r.x + r.w - 20, r.y + 4, 16, 16};
+    return d;
+}
+
+static int near_port(SDL_Point port, SDL_Point p) {
+    int dx = port.x - p.x, dy = port.y - p.y;
+    return dx * dx + dy * dy <= 10 * 10;
+}
+
+static int graph_find(const Gui *g, int type) {
+    for (int i = 0; i < MAX_NODES; ++i)
+        if (g->nodes[i].used && g->nodes[i].type == type) return i;
+    return -1;
+}
+
+/* How many input ports across the graph read node i's output. */
+static int graph_consumers(const Gui *g, int i) {
+    int n = 0;
+    for (int j = 0; j < MAX_NODES; ++j) {
+        if (!g->nodes[j].used) continue;
+        for (int k = 0; k < node_nin(g->nodes[j].type); ++k)
+            if (g->nodes[j].in[k] == i) n++;
+    }
+    return n;
+}
+
+/* Does `node` read `on`, directly or through other nodes? */
+static int graph_depends(const Gui *g, int node, int on, int *seen) {
+    if (node == on) return 1;
+    if (seen[node]) return 0;
+    seen[node] = 1;
+    const Node *n = &g->nodes[node];
+    for (int k = 0; k < node_nin(n->type); ++k)
+        if (n->in[k] >= 0 && graph_depends(g, n->in[k], on, seen)) return 1;
+    return 0;
+}
+
+/* Wires from's output into input port `port` of `to`, replacing whatever was there. A link that
+ * would close a loop is ignored. */
+static void graph_link(Gui *g, int from, int to, int port) {
+    if (from == to || from < 0 || to < 0 || !g->nodes[from].used || !g->nodes[to].used) return;
+    if (g->nodes[from].type == NODE_OUTPUT || g->nodes[to].type == NODE_INPUT) return;
+    if (port < 0 || port >= node_nin(g->nodes[to].type)) return;
+    int seen[MAX_NODES] = {0};
+    if (graph_depends(g, from, to, seen)) return;
+    g->nodes[to].in[port] = from;
+}
+
+static void node_set_defaults(Gui *g, int i) {
+    static const char *conv_def[4] = {"16", "3", "1", "1"};
+    int t = g->nodes[i].type;
+    if (t == BLK_CONV)
+        for (int j = 0; j < 4; ++j) field_set(g, F_NODE(i, j), conv_def[j], FK_INT);
+    else if (t == BLK_LINEAR) field_set(g, F_NODE(i, 0), "64", FK_INT);
+    else if (t == BLK_MAXPOOL) {
+        field_set(g, F_NODE(i, 0), "2", FK_INT);
+        field_set(g, F_NODE(i, 1), "2", FK_INT);
+    }
+}
+
+static int graph_add(Gui *g, int type, int x, int y) {
+    for (int i = 0; i < MAX_NODES; ++i) {
+        if (g->nodes[i].used) continue;
+        g->nodes[i].used = 1;
+        g->nodes[i].type = type;
+        g->nodes[i].x = x;
+        g->nodes[i].y = y;
+        g->nodes[i].in[0] = g->nodes[i].in[1] = -1;
+        node_set_defaults(g, i);
+        return i;
+    }
+    return -1;
+}
+
+/* Deleting a block re-joins the graph: whatever read it now reads what it read (its first input). */
+static void graph_remove(Gui *g, int i) {
+    if (!g->nodes[i].used || !node_deletable(g->nodes[i].type)) return;
+    int repl = g->nodes[i].in[0];
+    for (int j = 0; j < MAX_NODES; ++j) {
+        if (!g->nodes[j].used || j == i) continue;
+        for (int k = 0; k < 2; ++k)
+            if (g->nodes[j].in[k] == i) g->nodes[j].in[k] = repl;
+    }
+    g->nodes[i].used = 0;
+    g->nodes[i].in[0] = g->nodes[i].in[1] = -1;
+    if (g->focus >= F_NODE(i, 0) && g->focus < F_NODE(i, 4)) g->focus = -1;
+}
+
+static int rects_overlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+    return ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+}
+
+/* First position at or after (x,y) - scanning right, wrapping down - where a
+ * node of `type` wouldn't sit on top of another one. */
+static void graph_free_spot(const Gui *g, int ignore, int type, int *x, int *y) {
+    int h = node_height(type);
+    for (int tries = 0; tries < 400; ++tries) {
+        if (*x + NODE_W > GRAPH_VIEW.w - 8) {
+            *x = 14;
+            *y += 110;
+        }
+        int hit = 0;
+        for (int i = 0; i < MAX_NODES && !hit; ++i) {
+            if (!g->nodes[i].used || i == ignore) continue;
+            if (rects_overlap(*x - 6, *y - 6, NODE_W + 12, h + 12, g->nodes[i].x, g->nodes[i].y, NODE_W,
+                              node_height(g->nodes[i].type)))
+                hit = 1;
+        }
+        if (!hit) return;
+        *x += NODE_W + NODE_GAP;
+        if (*x + NODE_W > GRAPH_VIEW.w - 8) {
+            *x = 14;
+            *y += 110;
+        }
+    }
+}
+
+/* Pans the canvas just far enough that node i is on screen, clear of the hint text at the bottom. */
+static void graph_reveal(Gui *g, int i) {
+    SDL_Rect r = node_rect(g, i);
+    int bottom = GRAPH_VIEW.y + GRAPH_VIEW.h - 60, right = GRAPH_VIEW.x + GRAPH_VIEW.w - 8;
+    if (r.y + r.h > bottom) g->pan_y -= r.y + r.h - bottom;
+    if (r.y < GRAPH_VIEW.y + 8) g->pan_y += GRAPH_VIEW.y + 8 - (r.y);
+    if (r.x + r.w > right) g->pan_x -= r.x + r.w - right;
+    if (r.x < GRAPH_VIEW.x + 8) g->pan_x += GRAPH_VIEW.x + 8 - r.x;
+}
+
+/* Clicking a palette block appends it after the block that feeds the output node (an add block gets
+ * that on its first port; its second port is for you to wire), and the output node now reads it. */
+static void graph_append(Gui *g, int type) {
+    int in = graph_find(g, NODE_INPUT), out = graph_find(g, NODE_OUTPUT);
+    if (in < 0 || out < 0) return;
+    int pred = g->nodes[out].in[0];
+    if (pred < 0) pred = in;
+    int x = g->nodes[pred].x + NODE_W + NODE_GAP, y = g->nodes[pred].y;
+    graph_free_spot(g, -1, type, &x, &y);
+    int n = graph_add(g, type, x, y);
+    if (n < 0) return;
+    g->nodes[n].in[0] = pred;
+    g->nodes[out].in[0] = n;
+    int ox = x + NODE_W + NODE_GAP, oy = y;
+    graph_free_spot(g, out, NODE_OUTPUT, &ox, &oy);
+    g->nodes[out].x = ox;
+    g->nodes[out].y = oy;
+    graph_reveal(g, n);
+}
+
+/* Depth-first walk backwards from `node` along the input wires; every node is appended to order[]
+ * after everything it reads, which is exactly an evaluation order. Returns 0, or 1 if an input port
+ * is unwired (err_node and err_port say which), or 2 if the wires loop. */
+static int graph_visit(const Gui *g, int node, int *state, int *order, int *n, int *err_node, int *err_port) {
+    state[node] = 1;
+    const Node *nd = &g->nodes[node];
+    for (int k = 0; k < node_nin(nd->type); ++k) {
+        int src = nd->in[k];
+        if (src < 0 || !g->nodes[src].used) {
+            *err_node = node;
+            *err_port = k;
+            return 1;
+        }
+        if (state[src] == 1) {
+            *err_node = node;
+            return 2;
+        }
+        if (state[src] == 0) {
+            int r = graph_visit(g, src, state, order, n, err_node, err_port);
+            if (r) return r;
+        }
+    }
+    state[node] = 2;
+    order[(*n)++] = node;
+    return 0;
+}
+
+/* Lays the nodes out left to right in evaluation order, wrapping into rows; anything not connected
+ * to the output goes last. */
+static void graph_arrange(Gui *g) {
+    int order[MAX_NODES], n = 0, state[MAX_NODES] = {0}, en = -1, ep = 0;
+    int out = graph_find(g, NODE_OUTPUT);
+    if (out >= 0) {
+        /* a partial walk still orders everything it reached, so keep what it produced */
+        graph_visit(g, out, state, order, &n, &en, &ep);
+    }
+    int placed[MAX_NODES] = {0};
+    for (int k = 0; k < n; ++k) placed[order[k]] = 1;
+    for (int i = 0; i < MAX_NODES; ++i)
+        if (g->nodes[i].used && !placed[i]) order[n++] = i;
+
+    int x = 14, y = 14, row_h = 0;
+    for (int k = 0; k < n; ++k) {
+        Node *nd = &g->nodes[order[k]];
+        int h = node_height(nd->type);
+        if (x + NODE_W > GRAPH_VIEW.w - 8) {
+            x = 14;
+            y += row_h + 34;
+            row_h = 0;
+        }
+        nd->x = x;
+        nd->y = y;
+        x += NODE_W + NODE_GAP;
+        if (h > row_h) row_h = h;
+    }
+    g->pan_x = g->pan_y = 0;
+}
+
+/* Sets the last fc (the one feeding the output node) to the dataset's class count. */
+static void graph_fit_classes(Gui *g, int n_classes) {
+    int out = graph_find(g, NODE_OUTPUT);
+    int last = out >= 0 ? g->nodes[out].in[0] : -1;
+    if (last >= 0 && g->nodes[last].type == BLK_LINEAR) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", n_classes);
+        field_set(g, F_NODE(last, 0), buf, FK_INT);
+    }
+}
+
+static void graph_clear(Gui *g) {
+    memset(g->nodes, 0, sizeof(g->nodes));
+    g->focus = -1;
+    g->drag = DRAG_NONE;
+}
+
+/* Adds a node with its parameter values (a..d, in field order) and wires its inputs. */
+static int gadd(Gui *g, int type, int a, int b, int c, int d, int in0, int in1) {
+    int n = graph_add(g, type, 0, 0);
+    if (n < 0) return -1;
+    int v[4] = {a, b, c, d};
+    char buf[16];
+    for (int j = 0; j < node_nparams(type); ++j) {
+        snprintf(buf, sizeof(buf), "%d", v[j]);
+        field_set(g, F_NODE(n, j), buf, FK_INT);
+    }
+    g->nodes[n].in[0] = in0;
+    g->nodes[n].in[1] = in1;
+    return n;
+}
+
+static void graph_finish(Gui *g, int last) {
+    int out = graph_add(g, NODE_OUTPUT, 0, 0);
+    g->nodes[out].in[0] = last;
+    const DatasetInfo *d = form_dataset(g);
+    graph_fit_classes(g, d ? d->n_classes : 10);
+    graph_arrange(g);
+}
+
+/* The model the trainer used before the editor existed: a plain conv chain. */
+static void graph_reset(Gui *g) {
+    graph_clear(g);
+    static const int def[][5] = {{BLK_CONV, 8, 3, 1, 1},  {BLK_RELU, 0, 0, 0, 0},   {BLK_CONV, 16, 3, 2, 1},
+                                  {BLK_RELU, 0, 0, 0, 0},  {BLK_CONV, 32, 3, 2, 1},   {BLK_RELU, 0, 0, 0, 0},
+                                  {BLK_CONV, 32, 3, 1, 1}, {BLK_RELU, 0, 0, 0, 0},    {BLK_FLATTEN, 0, 0, 0, 0},
+                                  {BLK_LINEAR, 128, 0, 0, 0}, {BLK_RELU, 0, 0, 0, 0}, {BLK_LINEAR, 10, 0, 0, 0}};
+    int prev = graph_add(g, NODE_INPUT, 0, 0);
+    for (unsigned k = 0; k < sizeof(def) / sizeof(def[0]); ++k)
+        prev = gadd(g, def[k][0], def[k][1], def[k][2], def[k][3], def[k][4], prev, -1);
+    graph_finish(g, prev);
+}
+
+/* conv-bn-relu-conv-bn, plus the block's input added back on (through a 1x1 conv + bn when the
+ * block changes the shape), then relu. Returns the node holding the block's output. */
+static int resnet_block(Gui *g, int x, int ch, int stride, int project) {
+    int c1 = gadd(g, BLK_CONV, ch, 3, stride, 1, x, -1);
+    int b1 = gadd(g, BLK_BATCHNORM, 0, 0, 0, 0, c1, -1);
+    int r1 = gadd(g, BLK_RELU, 0, 0, 0, 0, b1, -1);
+    int c2 = gadd(g, BLK_CONV, ch, 3, 1, 1, r1, -1);
+    int b2 = gadd(g, BLK_BATCHNORM, 0, 0, 0, 0, c2, -1);
+    int skip = x;
+    if (project) {
+        int pc = gadd(g, BLK_CONV, ch, 1, stride, 0, x, -1);
+        skip = gadd(g, BLK_BATCHNORM, 0, 0, 0, 0, pc, -1);
+    }
+    int sum = gadd(g, BLK_ADD, 0, 0, 0, 0, b2, skip);
+    return gadd(g, BLK_RELU, 0, 0, 0, 0, sum, -1);
+}
+
+/* A small ResNet: stem, one identity block, one down-sampling block with a 1x1 shortcut,
+ * global average pool, fc. Six convs plus the shortcut. */
+static void graph_preset_resnet(Gui *g) {
+    graph_clear(g);
+    int x = graph_add(g, NODE_INPUT, 0, 0);
+    x = gadd(g, BLK_CONV, 16, 3, 1, 1, x, -1);
+    x = gadd(g, BLK_BATCHNORM, 0, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_RELU, 0, 0, 0, 0, x, -1);
+    x = resnet_block(g, x, 16, 1, 0);
+    x = resnet_block(g, x, 32, 2, 1);
+    x = gadd(g, BLK_GAP, 0, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_LINEAR, 10, 0, 0, 0, x, -1);
+    graph_finish(g, x);
+}
+
+/* -- form state ----------------------------------------------------------- */
+
+/* Picking a dataset loads the settings that suit it: its defaults.txt if it
+ * ships one, otherwise batch 64 / lr 0.001 / plain SGD and enough epochs for
+ * about 3000 steps (so 3 for the 60000-image MNIST sets, more for tiny ones).
+ * The model's last fc is also resized to the dataset's class count. */
+static void apply_dataset_defaults(Gui *g, const DatasetInfo *d) {
+    char buf[32];
+    int batch = d->def_batch > 0 ? d->def_batch : 64;
+    int steps_per_epoch = (d->count + batch - 1) / batch;
+    int epochs = d->def_epochs > 0 ? d->def_epochs : (int)(3000.0 / (steps_per_epoch > 0 ? steps_per_epoch : 1) + 0.5);
+    if (epochs < 3) epochs = 3;
+    if (epochs > 200) epochs = 200;
+    snprintf(buf, sizeof(buf), "%d", batch);
+    field_set(g, F_BATCH, buf, FK_INT);
+    snprintf(buf, sizeof(buf), "%d", epochs);
+    field_set(g, F_EPOCHS, buf, FK_INT);
+    snprintf(buf, sizeof(buf), "%g", d->def_lr > 0 ? d->def_lr : 0.001f);
+    field_set(g, F_LR, buf, FK_FLOAT);
+    snprintf(buf, sizeof(buf), "%g", d->def_momentum >= 0 ? d->def_momentum : 0.0f);
+    field_set(g, F_MOMENTUM, buf, FK_FLOAT);
+    snprintf(buf, sizeof(buf), "%d", d->def_normalize >= 0 ? d->def_normalize : 0);
+    field_set(g, F_NORMALIZE, buf, FK_INT);
+    snprintf(buf, sizeof(buf), "%d", d->def_augment >= 0 ? d->def_augment : 0);
+    field_set(g, F_AUGMENT, buf, FK_INT);
+
+    graph_fit_classes(g, d->n_classes);
+}
+
+static void dataset_choose(Gui *g, const char *name) {
+    int changed = strcmp(g->fields[F_DATASET].text, name) != 0;
+    field_set(g, F_DATASET, name, FK_CHOICE);
+    const DatasetInfo *d = ds_find(g, name);
+    if (d && changed) apply_dataset_defaults(g, d);
+}
+
+/* Starts out as the config the old hardcoded trainer used. */
+static void form_defaults(Gui *g) {
+    scan_datasets(g);
+    const char *def = "";
+    for (int i = 0; i < g->n_datasets; ++i)
+        if (strcmp(g->ds[i].name, "fashion-mnist") == 0) def = g->ds[i].name;
+    if (!def[0] && g->n_datasets > 0) def = g->ds[0].name;
+    field_set(g, F_DATASET, "", FK_CHOICE);
+    field_set(g, F_SEED, "42", FK_INT);
+    field_set(g, F_POOL, "8", FK_INT);
+    field_set(g, F_VIZ, "1", FK_INT);
+    g->focus = -1;
+    graph_reset(g);
+    if (def[0]) dataset_choose(g, def);
+}
+
+/* Screen rectangles of every field. Node fields exist only for live nodes and
+ * follow their node as it is dragged or the canvas is panned. */
+static void form_layout(Gui *g) {
+    for (int i = 0; i < NUM_FIELDS; ++i) g->fields[i].visible = 0;
+    for (int i = 0; i < NUM_GENERAL_FIELDS; ++i) {
+        g->fields[i].rect = (SDL_Rect){PANEL_TRAIN.x + 196, 60 + i * 40, 150, 28};
+        g->fields[i].visible = 1;
+    }
+    for (int i = 0; i < MAX_NODES; ++i) {
+        if (!g->nodes[i].used) continue;
+        SDL_Rect r = node_rect(g, i);
+        if (g->nodes[i].type == BLK_CONV) {
+            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 30, r.y + 28, 36, 20};
+            g->fields[F_NODE(i, 1)].rect = (SDL_Rect){r.x + 78, r.y + 28, 28, 20};
+            g->fields[F_NODE(i, 2)].rect = (SDL_Rect){r.x + 18, r.y + 54, 28, 20};
+            g->fields[F_NODE(i, 3)].rect = (SDL_Rect){r.x + 66, r.y + 54, 28, 20};
+        } else if (g->nodes[i].type == BLK_LINEAR) {
+            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 30, r.y + 28, 64, 20};
+        } else if (g->nodes[i].type == BLK_MAXPOOL) {
+            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 22, r.y + 28, 28, 20};
+            g->fields[F_NODE(i, 1)].rect = (SDL_Rect){r.x + 72, r.y + 28, 28, 20};
+        }
+        for (int j = 0; j < node_nparams(g->nodes[i].type); ++j) g->fields[F_NODE(i, j)].visible = 1;
+    }
+}
+
+static int parse_int(const Field *f, int *out) {
+    char *end;
+    errno = 0;
+    long v = strtol(f->text, &end, 10);
+    if (!f->text[0] || *end || errno || v < INT_MIN || v > INT_MAX) return -1;
+    *out = (int)v;
+    return 0;
+}
+
+static int form_fail(Gui *g, int idx, const char *what) {
+    snprintf(g->form_err, sizeof(g->form_err), "%s: enter a whole number", what);
+    g->form_err_field = idx;
+    return -1;
+}
+
+/* Turns the node graph into form_cfg.blocks: walks backwards from the output node, which orders
+ * every block after the blocks it reads, then turns each block's wires into tensor ids (0 = the
+ * input, k+1 = block k) and reads its parameter fields. Fails (with form_err / form_err_node set)
+ * if a port is unwired, the wires loop, or a block doesn't lead to the output. Shape and range
+ * rules are then train_cfg_derive()'s job. */
+static int graph_compile(Gui *g) {
+    TrainConfig *c = &g->form_cfg;
+    for (int i = 0; i < MAX_NODES; ++i) {
+        g->node_block[i] = -1;
+        snprintf(g->node_name[i], sizeof(g->node_name[i]), "%s", node_type_title(g->nodes[i].type));
+    }
+    g->chain_len = 0;
+    int out = graph_find(g, NODE_OUTPUT);
+    int state[MAX_NODES] = {0}, order[MAX_NODES], n_order = 0, err_node = -1, err_port = 0;
+    int r = graph_visit(g, out, state, order, &n_order, &err_node, &err_port);
+    if (r == 1) {
+        int t = g->nodes[err_node].type;
+        if (t == NODE_OUTPUT) snprintf(g->form_err, sizeof(g->form_err), "wire a block to the output node");
+        else if (t == BLK_ADD) snprintf(g->form_err, sizeof(g->form_err), "add: wire both of its inputs");
+        else snprintf(g->form_err, sizeof(g->form_err), "wire the input of the %s block", node_type_title(t));
+        g->form_err_node = err_node;
+        return -1;
+    }
+    if (r == 2) {
+        snprintf(g->form_err, sizeof(g->form_err), "the wires form a loop");
+        g->form_err_node = err_node;
+        return -1;
+    }
+    for (int i = 0; i < MAX_NODES; ++i) {
+        if (g->nodes[i].used && node_deletable(g->nodes[i].type) && state[i] != 2) {
+            snprintf(g->form_err, sizeof(g->form_err), "a %s block does not lead to the output - wire it in or delete it",
+                     node_type_title(g->nodes[i].type));
+            g->form_err_node = i;
+            return -1;
+        }
+    }
+
+    static const char *conv_cols[4] = {"out channels", "kernel", "stride", "padding"};
+    static const char *pool_cols[2] = {"window", "stride"};
+    int id_of_node[MAX_NODES];
+    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0;
+    for (int k = 0; k < n_order; ++k) {
+        int node = order[k], type = g->nodes[node].type;
+        if (type == NODE_INPUT) {
+            id_of_node[node] = 0;
+            continue;
+        }
+        if (type == NODE_OUTPUT) continue;
+        if (g->chain_len >= MAX_BLOCKS) {
+            snprintf(g->form_err, sizeof(g->form_err), "the model can have at most %d blocks", MAX_BLOCKS);
+            g->form_err_node = node;
+            return -1;
+        }
+        int bi = g->chain_len++;
+        id_of_node[node] = bi + 1;
+        Block b = {type, 0, 0, 0, 0, {id_of_node[g->nodes[node].in[0]], -1}};
+        if (type == BLK_ADD) b.in[1] = id_of_node[g->nodes[node].in[1]];
+        int *dst[4] = {&b.a, &b.b, &b.c, &b.d};
+        char *nm = g->node_name[node];
+        size_t nsz = sizeof(g->node_name[node]);
+        if (type == BLK_CONV) snprintf(nm, nsz, "conv%d", ++n_conv);
+        else if (type == BLK_LINEAR) snprintf(nm, nsz, "fc%d", ++n_lin);
+        else if (type == BLK_BATCHNORM) snprintf(nm, nsz, "bn%d", ++n_bn);
+        else if (type == BLK_ADD) snprintf(nm, nsz, "add%d", ++n_add);
+        else if (type == BLK_MAXPOOL) snprintf(nm, nsz, "pool%d", ++n_pool);
+        for (int j = 0; j < node_nparams(type); ++j) {
+            if (parse_int(&g->fields[F_NODE(node, j)], dst[j])) {
+                char what[48];
+                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : "out features");
+                snprintf(what, sizeof(what), "%s %s", nm, col);
+                g->form_err_node = node;
+                return form_fail(g, F_NODE(node, j), what);
+            }
+        }
+        c->blocks[bi] = b;
+        g->chain[bi] = node;
+        g->node_block[node] = bi;
+    }
+    c->n_blocks = g->chain_len;
+    return 0;
+}
+
+/* Reads every field and the graph into form_cfg, then asks
+ * train_cfg_derive() (the same check the worker repeats) whether it can run.
+ * Runs every frame - cheap, and it keeps the node shapes, the parameter count
+ * and the Start button in sync with what has been edited so far. */
+static void form_update(Gui *g) {
+    TrainConfig *c = &g->form_cfg;
+    memset(c, 0, sizeof(*c));
+    memset(&g->form_shapes, 0, sizeof(g->form_shapes));
+    g->form_shapes.err_block = -1;
+    g->form_valid = 0;
+    g->form_err[0] = '\0';
+    g->form_err_field = -1;
+    g->form_err_node = -1;
+    g->chain_len = 0;
+    for (int i = 0; i < MAX_NODES; ++i) g->node_block[i] = -1;
+
+    if (!g->fields[F_DATASET].text[0]) {
+        snprintf(g->form_err, sizeof(g->form_err), "no dataset found under data/ - see README for the download commands");
+        g->form_err_field = F_DATASET;
+        return;
+    }
+    const DatasetInfo *ds = form_dataset(g);
+    if (!ds) {
+        snprintf(g->form_err, sizeof(g->form_err), "dataset '%.20s' is not available any more - pick another", g->fields[F_DATASET].text);
+        g->form_err_field = F_DATASET;
+        return;
+    }
+    snprintf(c->dataset, sizeof(c->dataset), "%.31s", ds->name);
+    c->img_h = ds->rows;
+    c->img_w = ds->cols;
+    c->img_c = ds->channels;
+    c->num_classes = ds->n_classes;
+    if (parse_int(&g->fields[F_EPOCHS], &c->epochs)) { form_fail(g, F_EPOCHS, "epochs"); return; }
+    if (parse_int(&g->fields[F_BATCH], &c->batch_size)) { form_fail(g, F_BATCH, "batch size"); return; }
+    {
+        char *end;
+        const char *t = g->fields[F_LR].text;
+        float v = strtof(t, &end);
+        if (!t[0] || *end || !isfinite(v)) {
+            snprintf(g->form_err, sizeof(g->form_err), "learning rate: enter a number like 0.001");
+            g->form_err_field = F_LR;
+            return;
+        }
+        c->lr = v;
+    }
+    {
+        char *end;
+        const char *t = g->fields[F_MOMENTUM].text;
+        float v = strtof(t, &end);
+        if (!t[0] || *end || !isfinite(v)) {
+            snprintf(g->form_err, sizeof(g->form_err), "momentum: enter a number like 0.9 (0 = plain SGD)");
+            g->form_err_field = F_MOMENTUM;
+            return;
+        }
+        c->momentum = v;
+    }
+    if (parse_int(&g->fields[F_NORMALIZE], &c->normalize)) { form_fail(g, F_NORMALIZE, "normalize"); return; }
+    if (parse_int(&g->fields[F_AUGMENT], &c->augment)) { form_fail(g, F_AUGMENT, "augment"); return; }
+    if (parse_int(&g->fields[F_SEED], &c->seed)) { form_fail(g, F_SEED, "seed"); return; }
+    if (parse_int(&g->fields[F_POOL], &c->fc_pool)) { form_fail(g, F_POOL, "fc viz pool"); return; }
+    if (parse_int(&g->fields[F_VIZ], &c->viz_every)) { form_fail(g, F_VIZ, "weights every N"); return; }
+
+    if (graph_compile(g) != 0) return;
+    if (train_cfg_derive(c, &g->form_shapes, g->form_err, sizeof(g->form_err)) == 0) {
+        g->form_valid = 1;
+    } else if (g->form_shapes.err_block >= 0 && g->form_shapes.err_block < g->chain_len) {
+        g->form_err_node = g->chain[g->form_shapes.err_block];
+    }
+}
+
+static long count_parameters(const TrainConfig *c, const NetShapes *s) {
+    long total = 0;
+    for (int i = 0; i < c->n_blocks && i < s->n_ok; ++i) {
+        const Block *b = &c->blocks[i];
+        LayerShape in = train_block_input(s, b);
+        if (b->type == BLK_CONV) total += (long)b->a * in.c * b->b * b->b + b->a;
+        else if (b->type == BLK_LINEAR) total += (long)in.c * b->a + b->a;
+        else if (b->type == BLK_BATCHNORM) total += 2L * in.c; /* scale + shift */
+    }
+    return total;
+}
+
+/* -- drawing --------------------------------------------------------------- */
+
+static void draw_field(Gui *g, int idx) {
+    const Field *f = &g->fields[idx];
+    int rad = f->rect.h < 24 ? 4 : 7;
+    SDL_Color border = g->focus == idx ? (SDL_Color){COL_LOSS}
+                       : g->form_err_field == idx ? (SDL_Color){COL_BAD}
+                                                  : (SDL_Color){COL_BORDER_HI};
+    if (g->focus == idx) { /* soft focus ring */
+        SDL_Rect ring = {f->rect.x - 2, f->rect.y - 2, f->rect.w + 4, f->rect.h + 4};
+        fill_rrect(g->ren, ring, rad + 2, (SDL_Color){96, 140, 255, 55});
+    }
+    rrect_bordered(g->ren, f->rect, rad, (SDL_Color){14, 16, 23, 255}, border);
+
+    /* Text is clipped to the field, intersected with whatever clip the caller
+     * (the node canvas) already set, and that clip is put back afterwards. */
+    SDL_Rect saved = {0, 0, 0, 0}, clip = f->rect;
+    int had_clip = SDL_RenderIsClipEnabled(g->ren);
+    if (had_clip) {
+        SDL_RenderGetClipRect(g->ren, &saved);
+        SDL_IntersectRect(&clip, &saved, &clip);
+    }
+    int pad = f->rect.w < 50 ? 5 : 8;
+    SDL_RenderSetClipRect(g->ren, &clip);
+    txt(g, g->font, f->text, f->rect.x + pad, f->rect.y + (f->rect.h - TTF_FontHeight(g->font)) / 2,
+        (SDL_Color){COL_TEXT});
+    SDL_RenderSetClipRect(g->ren, had_clip ? &saved : NULL);
+
+    if (f->kind == FK_CHOICE) {
+        int ax = f->rect.x + f->rect.w - 20, ay = f->rect.y + 11;
+        SDL_SetRenderDrawColor(g->ren, COL_TEXT_DIM);
+        SDL_RenderDrawLine(g->ren, ax, ay, ax + 4, ay + 4);
+        SDL_RenderDrawLine(g->ren, ax, ay + 1, ax + 4, ay + 5);
+        SDL_RenderDrawLine(g->ren, ax + 4, ay + 4, ax + 8, ay);
+        SDL_RenderDrawLine(g->ren, ax + 4, ay + 5, ax + 8, ay + 1);
+    }
+
+    if (g->focus == idx && f->kind != FK_CHOICE && (SDL_GetTicks() / 500) % 2 == 0) {
+        int tw = 0;
+        TTF_SizeText(g->font, f->text, &tw, NULL);
+        int cx = f->rect.x + pad + tw + 1;
+        if (cx > f->rect.x + f->rect.w - 4) cx = f->rect.x + f->rect.w - 4;
+        SDL_SetRenderDrawColor(g->ren, COL_TEXT);
+        SDL_RenderDrawLine(g->ren, cx, f->rect.y + 3, cx, f->rect.y + f->rect.h - 4);
+    }
+}
+
+static SDL_Rect dropdown_row_rect(const Gui *g, int i) {
+    const SDL_Rect *f = &g->fields[F_DATASET].rect;
+    SDL_Rect r = {f->x, f->y + f->h + 2 + i * 28, f->w, 28};
+    return r;
+}
+
+/* Drawn after everything else in the form so it floats over the fields below. */
+static void draw_dropdown(Gui *g) {
+    int rows = g->n_datasets > 0 ? g->n_datasets : 1;
+    SDL_Rect first = dropdown_row_rect(g, 0);
+    SDL_Rect bg = {first.x, first.y, first.w, rows * 28 + 8};
+    bg.y -= 4;
+    draw_shadow(g->ren, bg, 9);
+    rrect_bordered(g->ren, bg, 9, (SDL_Color){COL_SURFACE2}, (SDL_Color){COL_LOSS});
+    SDL_Point mouse = {g->mouse_x, g->mouse_y};
+    if (g->n_datasets == 0) {
+        txt(g, g->font_small, "no dataset in data/", first.x + 10, first.y + 8, (SDL_Color){COL_BAD});
+    }
+    for (int i = 0; i < g->n_datasets; ++i) {
+        SDL_Rect r = dropdown_row_rect(g, i);
+        int current = strcmp(g->ds[i].name, g->fields[F_DATASET].text) == 0;
+        if (SDL_PointInRect(&mouse, &r)) {
+            SDL_Rect hl = {r.x + 4, r.y + 1, r.w - 8, r.h - 2};
+            fill_rrect(g->ren, hl, 6, (SDL_Color){52, 62, 92, 255});
+        }
+        if (current) fill_circle_aa(g->ren, r.x + 12, r.y + r.h / 2, 3, (SDL_Color){COL_LOSS});
+        txt(g, g->font, g->ds[i].name, r.x + 24, r.y + 4, current ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_TEXT});
+    }
+}
+
+
+/* Cubic bezier through four control points: a 2px core with a faint halo either side, which reads
+ * as a smooth line on the software renderer. */
+static void draw_curve(Gui *g, float p0x, float p0y, float p1x, float p1y, float p2x, float p2y, float p3x, float p3y,
+                       SDL_Color col) {
+    enum { SEG = 40 };
+    int xs[SEG + 1], ys[SEG + 1];
+    for (int k = 0; k <= SEG; ++k) {
+        float t = (float)k / SEG, u = 1.0f - t;
+        xs[k] = (int)(u * u * u * p0x + 3 * u * u * t * p1x + 3 * u * t * t * p2x + t * t * t * p3x);
+        ys[k] = (int)(u * u * u * p0y + 3 * u * u * t * p1y + 3 * u * t * t * p2y + t * t * t * p3y);
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        SDL_SetRenderDrawColor(g->ren, col.r, col.g, col.b, pass == 0 ? 55 : 255);
+        for (int k = 1; k <= SEG; ++k) {
+            if (pass == 0) {
+                SDL_RenderDrawLine(g->ren, xs[k - 1], ys[k - 1] - 1, xs[k], ys[k] - 1);
+                SDL_RenderDrawLine(g->ren, xs[k - 1], ys[k - 1] + 2, xs[k], ys[k] + 2);
+            } else {
+                SDL_RenderDrawLine(g->ren, xs[k - 1], ys[k - 1], xs[k], ys[k]);
+                SDL_RenderDrawLine(g->ren, xs[k - 1], ys[k - 1] + 1, xs[k], ys[k] + 1);
+            }
+        }
+    }
+}
+
+/* Cubic bezier leaving a rightwards and entering b from the left, ComfyUI style. */
+static void draw_wire(Gui *g, SDL_Point a, SDL_Point b, SDL_Color col) {
+    float dx = fmaxf(40.0f, fabsf((float)(b.x - a.x)) * 0.5f);
+    draw_curve(g, (float)a.x, (float)a.y, (float)a.x + dx, (float)a.y, (float)b.x - dx, (float)b.y, (float)b.x,
+               (float)b.y, col);
+}
+
+/* A socket: dark ring on the card's edge, filled with the wire colour once something is connected. */
+static void draw_port(Gui *g, SDL_Point p, int linked, SDL_Color col) {
+    fill_circle_aa(g->ren, p.x, p.y, 6, (SDL_Color){58, 66, 90, 255});
+    fill_circle_aa(g->ren, p.x, p.y, 4, (SDL_Color){COL_BG});
+    if (linked) fill_circle_aa(g->ren, p.x, p.y, 3, col);
+}
+
+static void draw_node(Gui *g, int i, SDL_Point mouse) {
+    const Node *n = &g->nodes[i];
+    SDL_Rect r = node_rect(g, i);
+    if (!SDL_HasIntersection(&r, &GRAPH_VIEW)) return;
+
+    SDL_Color accent = node_accent(n->type);
+    int err = g->form_err_node == i;
+    int hover = SDL_PointInRect(&mouse, &r) && g->drag == DRAG_NONE;
+    SDL_Color border = err ? (SDL_Color){COL_BAD} : (hover ? col_mix((SDL_Color){62, 70, 94, 255}, accent, 0.6f) : (SDL_Color){50, 57, 78, 255});
+    draw_shadow(g->ren, r, 9);
+    rrect_bordered(g->ren, r, 9, (SDL_Color){COL_SURFACE2}, border);
+
+    /* header: the card's rounded top, tinted with the block's colour (drawn through a clip so only
+     * the top 24px of the rounded shape shows) */
+    SDL_Rect saved = {0, 0, 0, 0}, hdr = {r.x, r.y, r.w, 25};
+    int had_clip = SDL_RenderIsClipEnabled(g->ren);
+    if (had_clip) {
+        SDL_RenderGetClipRect(g->ren, &saved);
+        SDL_IntersectRect(&hdr, &saved, &hdr);
+    }
+    SDL_RenderSetClipRect(g->ren, &hdr);
+    SDL_Rect inner = {r.x + 1, r.y + 1, r.w - 2, r.h - 2};
+    fill_rrect(g->ren, inner, 8, col_mix((SDL_Color){COL_SURFACE2}, accent, 0.22f));
+    SDL_RenderSetClipRect(g->ren, had_clip ? &saved : NULL);
+    SDL_SetRenderDrawColor(g->ren, 20, 23, 32, 120);
+    SDL_RenderDrawLine(g->ren, r.x + 1, r.y + 25, r.x + r.w - 2, r.y + 25);
+
+    fill_circle_aa(g->ren, r.x + 14, r.y + 13, 3, accent);
+    txt(g, g->font_med, g->node_name[i], r.x + 24, r.y + 4, (SDL_Color){COL_TEXT});
+    if (node_deletable(n->type)) {
+        SDL_Rect d = node_del_rect(r);
+        int over = SDL_PointInRect(&mouse, &d);
+        if (over) fill_circle_aa(g->ren, d.x + 8, d.y + 8, 8, (SDL_Color){245, 101, 112, 60});
+        SDL_SetRenderDrawColor(g->ren, over ? 245 : 143, over ? 101 : 151, over ? 112 : 170, 255);
+        SDL_RenderDrawLine(g->ren, d.x + 5, d.y + 5, d.x + 11, d.y + 11);
+        SDL_RenderDrawLine(g->ren, d.x + 11, d.y + 5, d.x + 5, d.y + 11);
+    }
+
+    for (int k = 0; k < node_nin(n->type); ++k) draw_port(g, node_in_port(g, i, k), n->in[k] >= 0, (SDL_Color){COL_LOSS});
+    if (n->type != NODE_OUTPUT) draw_port(g, node_out_port(g, i), graph_consumers(g, i) > 0, accent);
+
+    SDL_Color dim = {COL_TEXT_DIM};
+    if (n->type == BLK_CONV) {
+        txt(g, g->font_small, "out", r.x + 6, r.y + 31, dim);
+        txt(g, g->font_small, "k", r.x + 70, r.y + 31, dim);
+        txt(g, g->font_small, "s", r.x + 6, r.y + 57, dim);
+        txt(g, g->font_small, "p", r.x + 56, r.y + 57, dim);
+    } else if (n->type == BLK_LINEAR) {
+        txt(g, g->font_small, "out", r.x + 6, r.y + 31, dim);
+    } else if (n->type == BLK_MAXPOOL) {
+        txt(g, g->font_small, "k", r.x + 8, r.y + 31, dim);
+        txt(g, g->font_small, "s", r.x + 58, r.y + 31, dim);
+    } else if (n->type == BLK_ADD) {
+        txt(g, g->font_small, "top + bottom", r.x + 14, r.y + 24, dim);
+    }
+    for (int j = 0; j < node_nparams(n->type); ++j) draw_field(g, F_NODE(i, j));
+
+    char shape[32] = "";
+    const DatasetInfo *fds = form_dataset(g);
+    if (n->type == NODE_INPUT) {
+        if (fds) snprintf(shape, sizeof(shape), "%dx%dx%d", fds->rows, fds->cols, fds->channels);
+    } else if (n->type == NODE_OUTPUT) {
+        if (fds) snprintf(shape, sizeof(shape), "%d classes", fds->n_classes);
+    } else if (g->node_block[i] >= 0 && g->node_block[i] < g->form_shapes.n_ok) {
+        const LayerShape *o = &g->form_shapes.out[g->node_block[i]];
+        if (o->flat) snprintf(shape, sizeof(shape), "-> %d", o->c);
+        else snprintf(shape, sizeof(shape), "-> %dx%dx%d", o->h, o->w, o->c);
+    }
+    txt(g, g->font_small, shape, r.x + 8, r.y + r.h - 17, dim);
+}
+
+/* -- model dependency graph (training dashboard) ------------------------- */
+
+#define ARCH_ROWS 3
+#define ARCH_MAX_GROUPS (MAX_BLOCKS + 1)
+
+/* One box of the graph: a block, with the relu / batch-norm blocks that directly follow it (and
+ * nothing else reads its output) folded in so a deep net still fits the bar. */
+typedef struct ArchGroup {
+    char name[16];
+    char l2[28];     /* output shape */
+    char params[20]; /* kernel / stride, shown when nothing was folded in */
+    char fold[20];   /* e.g. "+bn +relu" */
+    int type;        /* BLK_* or NODE_INPUT: picks the accent colour */
+    int level, row;  /* layer = longest path from the input; row separates parallel branches */
+    int src[2], nsrc;
+} ArchGroup;
+
+static void shape_str(LayerShape l, char *buf, size_t n) {
+    if (l.flat) snprintf(buf, n, "%d", l.c);
+    else snprintf(buf, n, "%dx%dx%d", l.h, l.w, l.c);
+}
+
+static void arch_append(char *dst, size_t n, const char *add) {
+    size_t len = strlen(dst);
+    if (len + strlen(add) + 2 < n) snprintf(dst + len, n - len, "%s%s", len ? " " : "", add);
+}
+
+static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
+    int n = 0, uses[MAX_BLOCKS + 1] = {0}, gid_of_id[MAX_BLOCKS + 1] = {0}, out_id[ARCH_MAX_GROUPS] = {0};
+    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0;
+    int nb = c->n_blocks < s->n_ok ? c->n_blocks : s->n_ok;
+    for (int i = 0; i < nb; ++i) {
+        uses[c->blocks[i].in[0]]++;
+        if (c->blocks[i].type == BLK_ADD) uses[c->blocks[i].in[1]]++;
+    }
+
+    memset(&gr[0], 0, sizeof(gr[0]));
+    snprintf(gr[0].name, sizeof(gr[0].name), "input");
+    shape_str(s->input, gr[0].l2, sizeof(gr[0].l2));
+    gr[0].type = NODE_INPUT;
+    n = 1;
+
+    for (int i = 0; i < nb; ++i) {
+        const Block *k = &c->blocks[i];
+        int in0 = k->in[0];
+        if ((k->type == BLK_RELU || k->type == BLK_BATCHNORM) && in0 > 0 && uses[in0] == 1 &&
+            out_id[gid_of_id[in0]] == in0) {
+            int gi = gid_of_id[in0];
+            arch_append(gr[gi].fold, sizeof(gr[gi].fold), k->type == BLK_RELU ? "+relu" : "+bn");
+            out_id[gi] = i + 1;
+            gid_of_id[i + 1] = gi;
+            continue;
+        }
+        ArchGroup *q = &gr[n];
+        memset(q, 0, sizeof(*q));
+        q->type = k->type;
+        q->src[0] = gid_of_id[in0];
+        q->nsrc = 1;
+        if (k->type == BLK_ADD) {
+            q->src[1] = gid_of_id[k->in[1]];
+            q->nsrc = 2;
+        }
+        shape_str(s->out[i], q->l2, sizeof(q->l2));
+        switch (k->type) {
+        case BLK_CONV:
+            snprintf(q->name, sizeof(q->name), "conv%d", ++n_conv);
+            snprintf(q->params, sizeof(q->params), "%dx%d s%d", k->b, k->b, k->c);
+            break;
+        case BLK_LINEAR: snprintf(q->name, sizeof(q->name), "fc%d", ++n_lin); break;
+        case BLK_ADD: snprintf(q->name, sizeof(q->name), "add%d", ++n_add); break;
+        case BLK_BATCHNORM: snprintf(q->name, sizeof(q->name), "bn%d", ++n_bn); break;
+        case BLK_MAXPOOL:
+            snprintf(q->name, sizeof(q->name), "pool%d", ++n_pool);
+            snprintf(q->params, sizeof(q->params), "%dx%d s%d", k->a, k->a, k->b);
+            break;
+        default: snprintf(q->name, sizeof(q->name), "%s", train_block_type_name(k->type)); break;
+        }
+        out_id[n] = i + 1;
+        gid_of_id[i + 1] = n;
+        n++;
+    }
+
+    /* layers: one past the deepest thing a box reads; rows: stay in the first input's row unless a
+     * parallel branch already took that spot in the same layer. */
+    int taken[ARCH_MAX_GROUPS][ARCH_ROWS];
+    memset(taken, 0, sizeof(taken));
+    taken[0][0] = 1;
+    for (int gi = 1; gi < n; ++gi) {
+        ArchGroup *q = &gr[gi];
+        int lvl = 0;
+        for (int k = 0; k < q->nsrc; ++k)
+            if (gr[q->src[k]].level + 1 > lvl) lvl = gr[q->src[k]].level + 1;
+        q->level = lvl;
+        int row = gr[q->src[0]].row;
+        while (row < ARCH_ROWS - 1 && taken[lvl][row]) row++;
+        q->row = row;
+        taken[lvl][row] = 1;
+    }
+    return n;
+}
+
+static void draw_arrow_head(Gui *g, float x, float y, float dx, float dy, SDL_Color col) {
+    float px = -dy, py = dx; /* perpendicular */
+    SDL_SetRenderDrawColor(g->ren, col.r, col.g, col.b, 255);
+    SDL_RenderDrawLine(g->ren, (int)x, (int)y, (int)(x - dx * 6 + px * 3.5f), (int)(y - dy * 6 + py * 3.5f));
+    SDL_RenderDrawLine(g->ren, (int)x, (int)y, (int)(x - dx * 6 - px * 3.5f), (int)(y - dy * 6 - py * 3.5f));
+}
+
+/* The model as a dependency graph: boxes are layers of the network, wires are "reads the output
+ * of". Residual shortcuts show up as pink arcs over the boxes they skip; hover a box to light up
+ * everything it reads and everything that reads it. */
+static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const NetShapes *shapes) {
+    draw_panel(g->ren, r);
+    txt(g, g->font, "model graph", r.x + 10, r.y + 6, (SDL_Color){COL_TEXT_DIM});
+    txt(g, g->font_small, "pink = skip / branch    hover a box to trace its wires", r.x + r.w - 420, r.y + r.h - 17,
+        (SDL_Color){COL_TEXT_DIM});
+    if (!cfg || cfg->n_blocks == 0) return;
+
+    ArchGroup gr[ARCH_MAX_GROUPS];
+    int n = build_arch(cfg, shapes, gr);
+    int n_levels = 0, n_rows = 1;
+    for (int i = 0; i < n; ++i) {
+        if (gr[i].level + 1 > n_levels) n_levels = gr[i].level + 1;
+        if (gr[i].row + 1 > n_rows) n_rows = gr[i].row + 1;
+    }
+    int area_x = r.x + 12, area_w = r.w - 24;
+    int col_w = area_w / n_levels;
+    int box_w = col_w - 14 > 124 ? 124 : col_w - 14;
+    int top = r.y + 44; /* room above row 0 for the skip arcs */
+    int avail = r.y + r.h - 22 - top;
+    int box_h = 46, pitch = 0;
+    if (n_rows > 1) {
+        pitch = (avail - box_h) / (n_rows - 1);
+        if (pitch < box_h + 4) { /* rows don't fit at full height: shrink the boxes instead */
+            box_h = (avail - 4 * (n_rows - 1)) / n_rows;
+            if (box_h < 30) box_h = 30;
+            pitch = box_h + 4;
+        }
+    } else {
+        top += (avail - box_h) / 2 - 4;
+    }
+
+    SDL_Rect box[ARCH_MAX_GROUPS];
+    for (int i = 0; i < n; ++i) {
+        int col_x = area_x + gr[i].level * col_w + (col_w - box_w) / 2;
+        int row_y = top + (n_rows > 1 ? gr[i].row * pitch : 0);
+        box[i] = (SDL_Rect){col_x, row_y, box_w, box_h};
+    }
+    SDL_Point mouse = {g->mouse_x, g->mouse_y};
+    int hover = -1;
+    for (int i = 0; i < n; ++i)
+        if (SDL_PointInRect(&mouse, &box[i])) hover = i;
+
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int i = 0; i < n; ++i) {
+            for (int k = 0; k < gr[i].nsrc; ++k) {
+                int a = gr[i].src[k];
+                int arc = gr[a].row == gr[i].row && gr[i].level - gr[a].level > 1;
+                int skip = arc || gr[a].row != gr[i].row;
+                int lit = a == hover || i == hover;
+                int my_pass = lit ? 2 : (skip ? 1 : 0);
+                if (my_pass != pass) continue;
+                SDL_Color col = lit ? (SDL_Color){240, 200, 90, 255}
+                                    : (skip ? (SDL_Color){232, 108, 160, 255} : (SDL_Color){110, 150, 210, 255});
+                if (arc) {
+                    float x0 = box[a].x + box[a].w * 0.5f, x1 = box[i].x + box[i].w * 0.5f;
+                    float y = (float)box[a].y;
+                    float lift = 14.0f + 6.0f * (gr[i].level - gr[a].level - 1);
+                    if (lift > 24.0f) lift = 24.0f;
+                    draw_curve(g, x0, y, x0, y - lift * 1.35f, x1, y - lift * 1.35f, x1, y - 1, col);
+                    draw_arrow_head(g, x1, y - 1, 0.0f, 1.0f, col);
+                } else {
+                    SDL_Point p0 = {box[a].x + box[a].w, box[a].y + box[a].h / 2};
+                    SDL_Point p1 = {box[i].x, box[i].y + box[i].h / 2};
+                    float dx = fmaxf(10.0f, (float)(p1.x - p0.x) * 0.5f);
+                    draw_curve(g, (float)p0.x, (float)p0.y, p0.x + dx, (float)p0.y, p1.x - dx, (float)p1.y, (float)p1.x - 1,
+                               (float)p1.y, col);
+                    draw_arrow_head(g, (float)p1.x - 1, (float)p1.y, 1.0f, 0.0f, col);
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        draw_panel(g->ren, box[i]);
+        SDL_Color acc = node_accent(gr[i].type);
+        SDL_Rect bar = {box[i].x + 7, box[i].y + 1, box[i].w - 14, 3};
+        fill_rrect(g->ren, bar, 1, acc);
+        if (i == hover) rrect_bordered(g->ren, box[i], 7, (SDL_Color){COL_SURFACE2}, (SDL_Color){250, 204, 96, 255});
+        SDL_RenderSetClipRect(g->ren, &box[i]);
+        txt(g, g->font, gr[i].name, box[i].x + 6, box[i].y + 3, (SDL_Color){COL_TEXT});
+        txt(g, g->font_small, gr[i].l2, box[i].x + 6, box[i].y + 19, (SDL_Color){COL_TEXT_DIM});
+        const char *l3 = gr[i].fold[0] ? gr[i].fold : gr[i].params;
+        if (box_h >= 40) txt(g, g->font_small, l3, box[i].x + 6, box[i].y + 31, (SDL_Color){COL_TEXT_DIM});
+        SDL_RenderSetClipRect(g->ren, NULL);
+    }
+}
+
+static const char *PALETTE_LABELS[NUM_PALETTE] = {"conv", "relu", "flat", "fc", "add", "bn", "pool", "gap"};
+
+/* A palette entry: the block's colour as a dot, then its name. */
+static void draw_chip(Gui *g, SDL_Rect r, const char *label, SDL_Color accent, int hovered) {
+    SDL_Color fill = hovered ? col_mix((SDL_Color){COL_SURFACE2}, accent, 0.18f) : (SDL_Color){COL_SURFACE2};
+    SDL_Color border = hovered ? accent : (SDL_Color){COL_BORDER_HI};
+    rrect_bordered(g->ren, r, 8, fill, border);
+    fill_circle_aa(g->ren, r.x + 10, r.y + r.h / 2, 3, accent);
+    txt(g, g->font, label, r.x + 18, r.y + (r.h - TTF_FontHeight(g->font)) / 2, (SDL_Color){COL_TEXT});
+}
+
+static void draw_graph(Gui *g) {
+    SDL_Point mouse = {g->mouse_x, g->mouse_y};
+    draw_panel(g->ren, PANEL_GRAPH);
+    for (int i = 0; i < NUM_PALETTE; ++i) {
+        SDL_Rect pr = palette_rect(i);
+        draw_chip(g, pr, PALETTE_LABELS[i], node_accent(PALETTE_TYPES[i]), SDL_PointInRect(&mouse, &pr));
+    }
+    draw_button(g, BTN_ARRANGE, "arrange", g->font, SDL_PointInRect(&mouse, &BTN_ARRANGE), 1);
+    draw_button(g, BTN_RESET, "cnn", g->font, SDL_PointInRect(&mouse, &BTN_RESET), 1);
+    draw_button(g, BTN_RESNET, "resnet", g->font, SDL_PointInRect(&mouse, &BTN_RESNET), 1);
+
+    SDL_Rect canvas = {GRAPH_VIEW.x + 1, GRAPH_VIEW.y, GRAPH_VIEW.w - 2, GRAPH_VIEW.h};
+    fill_rrect(g->ren, canvas, 10, (SDL_Color){13, 15, 22, 255});
+    SDL_RenderSetClipRect(g->ren, &GRAPH_VIEW);
+
+    /* dot grid that scrolls with the canvas */
+    SDL_SetRenderDrawColor(g->ren, 44, 50, 68, 255);
+    int off_x = ((g->pan_x % 24) + 24) % 24, off_y = ((g->pan_y % 24) + 24) % 24;
+    for (int y = GRAPH_VIEW.y + off_y; y < GRAPH_VIEW.y + GRAPH_VIEW.h; y += 24)
+        for (int x = GRAPH_VIEW.x + off_x; x < GRAPH_VIEW.x + GRAPH_VIEW.w; x += 24) SDL_RenderDrawPoint(g->ren, x, y);
+
+    /* The node under the cursor: its wires light up, which makes "what does this read, who reads it"
+     * readable even where wires cross. */
+    int hover = -1;
+    if (SDL_PointInRect(&mouse, &GRAPH_VIEW) && g->drag == DRAG_NONE) {
+        for (int i = MAX_NODES - 1; i >= 0 && hover < 0; --i) {
+            SDL_Rect r = node_rect(g, i);
+            if (g->nodes[i].used && SDL_PointInRect(&mouse, &r)) hover = i;
+        }
+    }
+    /* Wires are drawn in three passes so the interesting ones end up on top: ordinary
+     * (blue), skip / branch (pink: the source isn't the block right before the reader in
+     * evaluation order, e.g. a residual shortcut), then the hovered node's (gold). */
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int t = 0; t < MAX_NODES; ++t) {
+            if (!g->nodes[t].used) continue;
+            for (int k = 0; k < node_nin(g->nodes[t].type); ++k) {
+                int src = g->nodes[t].in[k];
+                if (src < 0) continue;
+                int src_id = g->nodes[src].type == NODE_INPUT ? 0 : g->node_block[src] + 1;
+                int dst_id = g->nodes[t].type == NODE_OUTPUT ? g->chain_len + 1 : g->node_block[t] + 1;
+                int on_path = (g->nodes[src].type == NODE_INPUT || g->node_block[src] >= 0) &&
+                              (g->nodes[t].type == NODE_OUTPUT || g->node_block[t] >= 0);
+                int skip = on_path && src_id != dst_id - 1;
+                int lit = src == hover || t == hover;
+                int my_pass = lit ? 2 : (skip ? 1 : 0);
+                if (my_pass != pass) continue;
+                SDL_Color col = lit ? (SDL_Color){240, 200, 90, 255}
+                                    : (!on_path ? (SDL_Color){110, 116, 130, 255}
+                                                : (skip ? (SDL_Color){232, 108, 160, 255} : (SDL_Color){57, 135, 229, 255}));
+                draw_wire(g, node_out_port(g, src), node_in_port(g, t, k), col);
+            }
+        }
+    }
+    for (int i = 0; i < MAX_NODES; ++i)
+        if (g->nodes[i].used) draw_node(g, i, mouse);
+
+    if (g->drag == DRAG_LINK) draw_wire(g, node_out_port(g, g->drag_node), mouse, (SDL_Color){250, 204, 96, 255});
+    if (g->drag == DRAG_PAL && g->drag_moved) {
+        SDL_Rect ghost = {mouse.x - NODE_W / 2, mouse.y - 12, NODE_W, node_height(g->drag_type)};
+        SDL_Color a = node_accent(g->drag_type);
+        SDL_SetRenderDrawColor(g->ren, a.r, a.g, a.b, 90);
+        SDL_RenderFillRect(g->ren, &ghost);
+        SDL_SetRenderDrawColor(g->ren, a.r, a.g, a.b, 255);
+        SDL_RenderDrawRect(g->ren, &ghost);
+    }
+
+    SDL_Color dim = {128, 136, 156, 255};
+    SDL_Rect hint_bg = {GRAPH_VIEW.x + 6, GRAPH_VIEW.y + GRAPH_VIEW.h - 58, 318, 50};
+    fill_rrect(g->ren, hint_bg, 8, (SDL_Color){13, 15, 22, 215});
+    txt(g, g->font_small, "click a block to append it, or drag it onto the canvas", GRAPH_VIEW.x + 14,
+        GRAPH_VIEW.y + GRAPH_VIEW.h - 50, dim);
+    txt(g, g->font_small, "wire: drag dot to dot; an output can feed many blocks", GRAPH_VIEW.x + 14,
+        GRAPH_VIEW.y + GRAPH_VIEW.h - 34, dim);
+    txt(g, g->font_small, "pink = skip / branch; hover to trace; scroll = pan", GRAPH_VIEW.x + 14,
+        GRAPH_VIEW.y + GRAPH_VIEW.h - 18, dim);
+    SDL_RenderSetClipRect(g->ren, NULL);
+}
+
+static void draw_form(Gui *g) {
+    SDL_Point mouse = {g->mouse_x, g->mouse_y};
+    form_layout(g);
+
+    /* training parameters */
+    draw_panel(g->ren, PANEL_TRAIN);
+    txt(g, g->font_big, "Training", PANEL_TRAIN.x + 18, PANEL_TRAIN.y + 14, (SDL_Color){COL_TEXT});
+    static const char *labels[NUM_GENERAL_FIELDS] = {"dataset", "epochs", "batch size", "learning rate", "momentum",
+                                                       "normalize (0/1)", "augment (0-2)", "seed", "fc viz pool",
+                                                       "weights every N"};
+    SDL_Color dim = (SDL_Color){COL_TEXT_DIM};
+    for (int i = 0; i < NUM_GENERAL_FIELDS; ++i) {
+        txt(g, g->font, labels[i], PANEL_TRAIN.x + 18, g->fields[i].rect.y + 5, dim);
+        draw_field(g, i);
+    }
+    int hy = 60 + NUM_GENERAL_FIELDS * 40 + 2;
+    const DatasetInfo *fds = form_dataset(g);
+    char info[64] = "";
+    if (fds) snprintf(info, sizeof(info), "%dx%d%s px  -  %d images  -  %d classes", fds->cols, fds->rows,
+                      fds->channels == 3 ? " colour" : "", fds->count, fds->n_classes);
+    SDL_Rect pill = {PANEL_TRAIN.x + 16, hy - 2, PANEL_TRAIN.w - 32, 24};
+    fill_rrect(g->ren, pill, 8, col_mix((SDL_Color){COL_SURFACE}, (SDL_Color){COL_LOSS}, 0.14f));
+    txt(g, g->font_small, info, pill.x + 10, pill.y + 5, (SDL_Color){COL_LOSS});
+    txt(g, g->font_small, "picking a dataset loads its suggested settings", PANEL_TRAIN.x + 18, hy + 30, dim);
+    txt(g, g->font_small, "normalize: zero-mean, unit-variance pixels", PANEL_TRAIN.x + 18, hy + 44, dim);
+    txt(g, g->font_small, "augment: 1 flips both ways, 2 flips + shifts", PANEL_TRAIN.x + 18, hy + 58, dim);
+    txt(g, g->font_small, "momentum 0 = plain SGD (try 0.9 + lower lr)", PANEL_TRAIN.x + 18, hy + 72, dim);
+    txt(g, g->font_small, "fc viz pool, weights every N: viewer only", PANEL_TRAIN.x + 18, hy + 86, dim);
+
+    int ry = hy + 108;
+    SDL_SetRenderDrawColor(g->ren, COL_BORDER);
+    SDL_RenderDrawLine(g->ren, PANEL_TRAIN.x + 16, ry - 8, PANEL_TRAIN.x + PANEL_TRAIN.w - 16, ry - 8);
+    txt(g, g->font_med, "Model rules", PANEL_TRAIN.x + 18, ry, (SDL_Color){COL_TEXT});
+    static const char *rules[] = {"conv / pool / gap need an image, fc a flat input (flatten / gap)",
+                                  "add sums two same-shape tensors (skip link)",
+                                  "every block's output must be read by another",
+                                  "end with an fc whose out = #classes",
+                                  "x deletes a block, re-joining its neighbours"};
+    for (int i = 0; i < 5; ++i) {
+        fill_circle_aa(g->ren, PANEL_TRAIN.x + 22, ry + 30 + i * 15, 2, (SDL_Color){COL_LOSS});
+        txt(g, g->font_small, rules[i], PANEL_TRAIN.x + 32, ry + 23 + i * 15, dim);
+    }
+
+    draw_graph(g);
+
+    /* status + start */
+    char status[300];
+    SDL_Color status_col = (SDL_Color){COL_BAD};
+    if (g->worker_gone) {
+        snprintf(status, sizeof(status), "train_worker is not running - quit and start it again (make train_gui)");
+    } else if (!g->form_valid) {
+        snprintf(status, sizeof(status), "%s", g->form_err);
+    } else if (g->worker_msg[0]) {
+        snprintf(status, sizeof(status), "%s", g->worker_msg);
+    } else {
+        status_col = (SDL_Color){COL_GOOD};
+        snprintf(status, sizeof(status), "ready - %ld trainable parameters", count_parameters(&g->form_cfg, &g->form_shapes));
+    }
+    fill_circle_aa(g->ren, 418, 598, 4, status_col);
+    draw_wrapped(g, g->font, status, 430, 589, 50, 20, 3, status_col);
+    if (g->run_active) {
+        txt(g, g->font_small, "a run is active: applying replaces it", 410, 628, dim);
+        draw_button(g, BTN_BACK, "< back to training view", g->font, SDL_PointInRect(&mouse, &BTN_BACK), 1);
+    }
+    int can_start = g->form_valid && !g->worker_gone;
+    draw_button_primary(g, BTN_START, g->run_active ? "Apply & restart" : "Start training", g->font_big,
+                        SDL_PointInRect(&mouse, &BTN_START), can_start);
+    if (g->dropdown_open) draw_dropdown(g);
+}
+
+/* -- messages from the worker -------------------------------------------- */
+
+static int model_info_ok(const ModelInfo *m) {
+    NetShapes s;
+    char err[64];
+    if (train_cfg_derive(&m->cfg, &s, err, sizeof(err)) != 0) return 0;
+    int weighted = 0;
+    for (int i = 0; i < m->cfg.n_blocks; ++i)
+        if (m->cfg.blocks[i].type == BLK_CONV || m->cfg.blocks[i].type == BLK_LINEAR) weighted++;
+    if (m->n_viz != weighted || m->n_viz > MAX_VIZ_LAYERS) return 0;
+    long used = 0;
+    for (int i = 0; i < m->n_viz; ++i) {
+        const LayerViz *lv = &m->layers[i];
+        long n;
+        if (lv->kind == VIZ_CONV_GRID) {
+            if (lv->count < 1 || lv->count > MAX_CONV_CHANNELS || lv->ksize < 1 || lv->ksize > MAX_KERNEL || lv->cols < 1)
+                return 0;
+            n = (long)lv->count * lv->ksize * lv->ksize;
+        } else if (lv->kind == VIZ_MATRIX) {
+            if (lv->count < 1 || lv->cols < 1 || (long)lv->count * lv->cols > 4 * 65536) return 0;
+            n = (long)lv->count * lv->cols;
+        } else {
+            return 0;
+        }
+        if (lv->offset != used) return 0;
+        used += n;
+    }
+    return used == m->total_floats;
+}
+
+/* The sample texture and pixel buffer follow the dataset's image size, which
+ * can change from one run to the next. */
+static void ensure_sample(Gui *g) {
+    int w = g->run_cfg.img_w, h = g->run_cfg.img_h, c = g->run_cfg.img_c;
+    if (w < 1 || h < 1 || c < 1) return;
+    if (g->digit_tex && g->digit_w == w && g->digit_h == h && g->digit_c == c) return;
+    if (g->digit_tex) SDL_DestroyTexture(g->digit_tex);
+    g->digit_tex = SDL_CreateTexture(g->ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
+    if (g->digit_tex) SDL_SetTextureScaleMode(g->digit_tex, SDL_ScaleModeNearest);
+    g->digit_w = w;
+    g->digit_h = h;
+    g->digit_c = c;
+    free(g->sample);
+    g->sample = (unsigned char *)calloc((size_t)w * (size_t)h * (size_t)c, 1);
+}
+
+static void refresh_run_ds(Gui *g) {
+    const DatasetInfo *d = ds_find(g, g->run_cfg.dataset);
+    if (d) g->run_ds = *d;
+    else memset(&g->run_ds, 0, sizeof(g->run_ds));
+}
+
+static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32_t bytes) {
+    if (type == MSG_MODEL) {
+        if (bytes != sizeof(ModelInfo)) return;
+        ModelInfo info;
+        memcpy(&info, p, sizeof(info));
+        if (!model_info_ok(&info)) {
+            snprintf(g->worker_msg, sizeof(g->worker_msg), "worker sent a model description this viewer can't use");
+            return;
+        }
+        g->model = info;
+        g->run_cfg = info.cfg;
+        train_cfg_derive(&g->run_cfg, &g->run_shapes, NULL, 0);
+        refresh_run_ds(g);
+        ensure_sample(g);
+        free(g->weights);
+        g->weights = (float *)calloc((size_t)(info.total_floats > 0 ? info.total_floats : 1), sizeof(float));
+        g->weights_valid = 0;
+        g->has_model = 1;
+        g->has_record = 0;
+        if (g->weights_tab >= g->model.n_viz) g->weights_tab = 0;
+        gui_clear_history(g);
+    } else if (type == MSG_PROGRESS) {
+        if (!g->has_model) return;
+        size_t wbytes = sizeof(float) * (size_t)g->model.total_floats;
+        size_t img_bytes = (size_t)g->run_cfg.img_h * (size_t)g->run_cfg.img_w * (size_t)g->run_cfg.img_c;
+        size_t base = sizeof(Progress) + img_bytes;
+        if (!g->sample || bytes < base || (bytes != base && bytes != base + wbytes)) return;
+        Progress prog;
+        memcpy(&prog, p, sizeof(prog));
+        if (prog.has_weights) {
+            if (bytes != base + wbytes) return;
+            memcpy(g->weights, p + base, wbytes);
+            g->weights_valid = 1;
+        } else if (bytes != base) {
+            return;
+        }
+        memcpy(g->sample, p + sizeof(Progress), img_bytes);
+        g->prog = prog;
+        g->has_record = 1;
+        gui_push_point(g, prog.loss);
+    } else if (type == MSG_ERROR) {
+        size_t n = bytes < sizeof(g->worker_msg) ? bytes : sizeof(g->worker_msg) - 1;
+        memcpy(g->worker_msg, p, n);
+        g->worker_msg[n] = '\0';
+        g->run_active = 0;
+        g->has_record = 0;
+        g->weights_valid = 0;
+        g->screen = SCREEN_SETUP;
+        SDL_StartTextInput();
+    }
+}
+
+/* Re-assembles framed messages across partial non-blocking reads. */
+typedef struct Rx {
+    unsigned char hdr[sizeof(MsgHeader)];
+    size_t hdr_have;
+    MsgHeader h;
+    unsigned char *buf;
+    size_t cap;
+    size_t have;
+    int in_payload;
+} Rx;
+
+static void rx_pump(Rx *r, int fd, Gui *g) {
+    long budget = 8 * 1024 * 1024; /* keep one frame's worth of reading bounded so the UI stays responsive */
+    while (budget > 0 && !g->worker_gone) {
+        if (!r->in_payload) {
+            ssize_t n = read(fd, r->hdr + r->hdr_have, sizeof(MsgHeader) - r->hdr_have);
+            if (n == 0) { g->worker_gone = 1; return; }
+            if (n < 0) { if (errno == EINTR) continue; return; }
+            r->hdr_have += (size_t)n;
+            budget -= n;
+            if (r->hdr_have < sizeof(MsgHeader)) continue;
+            memcpy(&r->h, r->hdr, sizeof(MsgHeader));
+            if (r->h.magic != TRAIN_MAGIC || r->h.bytes > MSG_MAX_BYTES) {
+                snprintf(g->worker_msg, sizeof(g->worker_msg), "protocol error on the data stream (mismatched worker build?)");
+                g->worker_gone = 1;
+                return;
+            }
+            if (r->h.bytes > r->cap) {
+                unsigned char *nb = (unsigned char *)realloc(r->buf, r->h.bytes);
+                if (!nb) { g->worker_gone = 1; return; }
+                r->buf = nb;
+                r->cap = r->h.bytes;
+            }
+            r->have = 0;
+            r->in_payload = 1;
+        }
+        if (r->have < r->h.bytes) {
+            ssize_t n = read(fd, r->buf + r->have, r->h.bytes - r->have);
+            if (n == 0) { g->worker_gone = 1; return; }
+            if (n < 0) { if (errno == EINTR) continue; return; }
+            r->have += (size_t)n;
+            budget -= n;
+            if (r->have < r->h.bytes) continue;
+        }
+        handle_message(g, r->h.type, r->buf, r->h.bytes);
+        r->in_payload = 0;
+        r->hdr_have = 0;
+    }
+}
+
+/* -- weights window ------------------------------------------------------ */
+
+#define WEIGHTS_WIN_W 700
+#define WEIGHTS_WIN_H 600
+#define WEIGHTS_TAB_Y 20
+#define WEIGHTS_TAB_H 44
+#define WEIGHTS_CONTENT_W (WEIGHTS_WIN_W - 40)
+#define WEIGHTS_CONTENT_H (WEIGHTS_WIN_H - (WEIGHTS_TAB_Y + WEIGHTS_TAB_H + 16) - 20)
+
+/* Pure function of (i, n) (no Gui) so render_weights_window (draws tabs) and
+ * pump_events (hit-tests clicks on them) use the exact same rects. */
+static SDL_Rect weights_tab_rect(int i, int n) {
+    int bar_w = WEIGHTS_WIN_W - 40;
+    int tab_w = bar_w / (n > 0 ? n : 1);
+    SDL_Rect r = {20 + i * tab_w, WEIGHTS_TAB_Y, tab_w - 4, WEIGHTS_TAB_H};
+    return r;
+}
+
+static void close_weights_window(Gui *g) {
+    if (!g->weights_win) return;
+    for (int i = 0; i < NUM_WLABEL_SLOTS; ++i) {
+        if (g->weights_label_tex[i]) SDL_DestroyTexture(g->weights_label_tex[i]);
+        g->weights_label_tex[i] = NULL;
+    }
+    if (g->weights_ren) SDL_DestroyRenderer(g->weights_ren);
+    g->weights_ren = NULL;
+    SDL_DestroyWindow(g->weights_win);
+    g->weights_win = NULL;
+}
+
+static void open_weights_window(Gui *g) {
+    if (g->weights_win) { SDL_RaiseWindow(g->weights_win); return; }
+
+    g->weights_win = SDL_CreateWindow("tinyDL - layer weights (live)", SDL_WINDOWPOS_UNDEFINED,
+                                       SDL_WINDOWPOS_UNDEFINED, WEIGHTS_WIN_W, WEIGHTS_WIN_H, SDL_WINDOW_SHOWN);
+    if (!g->weights_win) {
+        fprintf(stderr, "SDL_CreateWindow (weights) failed: %s\n", SDL_GetError());
+        return;
+    }
+    g->weights_ren = SDL_CreateRenderer(g->weights_win, -1, SDL_RENDERER_SOFTWARE);
+    if (!g->weights_ren) {
+        fprintf(stderr, "SDL_CreateRenderer (weights) failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(g->weights_win);
+        g->weights_win = NULL;
+        return;
+    }
+    SDL_SetRenderDrawBlendMode(g->weights_ren, SDL_BLENDMODE_BLEND);
+
+}
+
+static void compute_mean_rms(const float *data, int n, float *out_mean, float *out_rms) {
+    double sum = 0.0, sumsq = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += data[i];
+        sumsq += (double)data[i] * (double)data[i];
+    }
+    *out_mean = (float)(sum / n);
+    *out_rms = (float)sqrt(sumsq / n);
+}
+
+
+/* -- 3D weights view ----------------------------------------------------- */
+
+/* The viewer has no 3D library: this is a tiny painter's-algorithm renderer.
+ * Every surface becomes a flat-shaded quad (4 projected corners), all quads
+ * of a frame are sorted far-to-near and handed to SDL_RenderGeometry in one
+ * call. conv filters are drawn as bars (one bar per weight, height = value);
+ * fc weight matrices as a height-field surface. */
+#define CAM_DIST 3.4f
+#define VIEW3D_HEIGHT 0.5f /* world height of the largest |weight| on small layers */
+#define VIEW3D_GRID_MAX 64 /* fc matrices are averaged down to at most this many cells per side */
+
+typedef struct V3 {
+    float x, y, z;
+} V3;
+
+typedef struct Cam {
+    float cosy, siny, cosp, sinp, focal, ox, oy;
+} Cam;
+
+typedef struct Face {
+    float depth; /* view-space z of the centre: larger = farther */
+    SDL_FPoint p[4];
+    SDL_Color c[4];
+} Face;
+
+static Face *g_faces;
+static int g_faces_n, g_faces_cap;
+static SDL_Vertex *g_verts;
+static int *g_idx;
+static int g_geo_cap;
+
+/* World -> view space (yaw about the vertical axis, then pitch down onto the
+ * scene). +z in view space points away from the camera. */
+static V3 cam_rot(const Cam *c, V3 p) {
+    float x1 = p.x * c->cosy + p.z * c->siny;
+    float z1 = -p.x * c->siny + p.z * c->cosy;
+    V3 r = {x1, p.y * c->cosp + z1 * c->sinp, -p.y * c->sinp + z1 * c->cosp};
+    return r;
+}
+
+static SDL_FPoint cam_proj(const Cam *c, V3 v) {
+    float d = v.z + CAM_DIST;
+    if (d < 0.3f) d = 0.3f;
+    SDL_FPoint r = {c->ox + v.x * c->focal / d, c->oy - v.y * c->focal / d};
+    return r;
+}
+
+static SDL_Color color_lerp(SDL_Color a, SDL_Color b, float t) {
+    SDL_Color r = {(Uint8)(a.r + (b.r - a.r) * t), (Uint8)(a.g + (b.g - a.g) * t), (Uint8)(a.b + (b.b - a.b) * t), 255};
+    return r;
+}
+
+/* t in [-1,1]: blue for negative weights, warm red for positive, gray at 0. */
+static SDL_Color color_signed(float t) {
+    if (t > 1.0f) t = 1.0f;
+    if (t < -1.0f) t = -1.0f;
+    SDL_Color zero = {176, 181, 192, 255};
+    SDL_Color neg = {57, 135, 229, 255};
+    SDL_Color pos = {236, 104, 72, 255};
+    return color_lerp(zero, t >= 0 ? pos : neg, fabsf(t));
+}
+
+/* t in [0,1], for the non-negative mean|w| maps. */
+static SDL_Color color_seq(float t) {
+    if (t > 1.0f) t = 1.0f;
+    if (t < 0.0f) t = 0.0f;
+    SDL_Color lo = {52, 84, 168, 255};
+    SDL_Color hi = {248, 208, 84, 255};
+    return color_lerp(lo, hi, t);
+}
+
+static void faces_reserve(int extra) {
+    if (g_faces_n + extra <= g_faces_cap) return;
+    int cap = g_faces_cap ? g_faces_cap : 1024;
+    while (cap < g_faces_n + extra) cap *= 2;
+    g_faces = (Face *)realloc(g_faces, sizeof(Face) * (size_t)cap);
+    g_faces_cap = cap;
+}
+
+/* `v` are the 4 view-space corners, `n` the unit view-space normal facing the camera. */
+static void face_push(const Cam *cam, const V3 v[4], const SDL_Color col[4], V3 n) {
+    static const V3 light = {-0.4f, 0.8f, -0.45f};
+    float diffuse = n.x * light.x + n.y * light.y + n.z * light.z;
+    if (diffuse < 0.0f) diffuse = 0.0f;
+    float shade = 0.42f + 0.58f * diffuse;
+    faces_reserve(1);
+    Face *f = &g_faces[g_faces_n++];
+    f->depth = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        f->p[i] = cam_proj(cam, v[i]);
+        float r = col[i].r * shade, gr = col[i].g * shade, b = col[i].b * shade;
+        f->c[i] = (SDL_Color){(Uint8)fminf(r, 255.0f), (Uint8)fminf(gr, 255.0f), (Uint8)fminf(b, 255.0f), 255};
+        f->depth += v[i].z * 0.25f;
+    }
+}
+
+/* One side of an axis-aligned box: drawn only if it faces the camera. */
+static void add_box_face(const Cam *cam, V3 a, V3 b, V3 c, V3 d, V3 normal, SDL_Color col) {
+    V3 v[4] = {cam_rot(cam, a), cam_rot(cam, b), cam_rot(cam, c), cam_rot(cam, d)};
+    V3 nv = cam_rot(cam, normal);
+    V3 mid = {(v[0].x + v[2].x) * 0.5f, (v[0].y + v[2].y) * 0.5f, (v[0].z + v[2].z) * 0.5f + CAM_DIST};
+    if (nv.x * mid.x + nv.y * mid.y + nv.z * mid.z >= 0.0f) return;
+    SDL_Color cols[4] = {col, col, col, col};
+    face_push(cam, v, cols, nv);
+}
+
+static void add_box(const Cam *cam, float x0, float x1, float y0, float y1, float z0, float z1, SDL_Color col) {
+    add_box_face(cam, (V3){x0, y1, z0}, (V3){x1, y1, z0}, (V3){x1, y1, z1}, (V3){x0, y1, z1}, (V3){0, 1, 0}, col);
+    add_box_face(cam, (V3){x0, y0, z0}, (V3){x1, y0, z0}, (V3){x1, y1, z0}, (V3){x0, y1, z0}, (V3){0, 0, -1}, col);
+    add_box_face(cam, (V3){x0, y0, z1}, (V3){x1, y0, z1}, (V3){x1, y1, z1}, (V3){x0, y1, z1}, (V3){0, 0, 1}, col);
+    add_box_face(cam, (V3){x0, y0, z0}, (V3){x0, y0, z1}, (V3){x0, y1, z1}, (V3){x0, y1, z0}, (V3){-1, 0, 0}, col);
+    add_box_face(cam, (V3){x1, y0, z0}, (V3){x1, y0, z1}, (V3){x1, y1, z1}, (V3){x1, y1, z0}, (V3){1, 0, 0}, col);
+}
+
+/* Two-sided quad (height-field cells, floors): the normal comes from the
+ * corners and is flipped to face the camera. `behind_all` forces it to be
+ * drawn first, under everything else. */
+static void add_surface_quad(const Cam *cam, V3 a, V3 b, V3 c, V3 d, const SDL_Color col[4], int behind_all) {
+    V3 v[4] = {cam_rot(cam, a), cam_rot(cam, b), cam_rot(cam, c), cam_rot(cam, d)};
+    V3 e1 = {v[1].x - v[0].x, v[1].y - v[0].y, v[1].z - v[0].z};
+    V3 e2 = {v[3].x - v[0].x, v[3].y - v[0].y, v[3].z - v[0].z};
+    V3 n = {e1.y * e2.z - e1.z * e2.y, e1.z * e2.x - e1.x * e2.z, e1.x * e2.y - e1.y * e2.x};
+    float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+    if (len < 1e-9f) return;
+    n.x /= len; n.y /= len; n.z /= len;
+    if (n.x * v[0].x + n.y * v[0].y + n.z * (v[0].z + CAM_DIST) > 0.0f) { n.x = -n.x; n.y = -n.y; n.z = -n.z; }
+    face_push(cam, v, col, n);
+    if (behind_all) g_faces[g_faces_n - 1].depth = 1e9f;
+}
+
+static void add_floor(const Cam *cam, float x0, float x1, float z0, float z1) {
+    SDL_Color floor_col = {30, 34, 46, 255};
+    SDL_Color cols[4] = {floor_col, floor_col, floor_col, floor_col};
+    add_surface_quad(cam, (V3){x0, 0, z0}, (V3){x1, 0, z0}, (V3){x1, 0, z1}, (V3){x0, 0, z1}, cols, 1);
+}
+
+static int face_cmp_far_first(const void *a, const void *b) {
+    float da = ((const Face *)a)->depth, db = ((const Face *)b)->depth;
+    return (da < db) - (da > db);
+}
+
+static void flush_faces(Gui *g, SDL_Rect clip) {
+    int n = g_faces_n;
+    if (n == 0) return;
+    qsort(g_faces, (size_t)n, sizeof(Face), face_cmp_far_first);
+    if (4 * n > g_geo_cap) {
+        g_geo_cap = 4 * n;
+        g_verts = (SDL_Vertex *)realloc(g_verts, sizeof(SDL_Vertex) * (size_t)g_geo_cap);
+        g_idx = (int *)realloc(g_idx, sizeof(int) * 6 * (size_t)n);
+    }
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < 4; ++k) {
+            g_verts[4 * i + k].position = g_faces[i].p[k];
+            g_verts[4 * i + k].color = g_faces[i].c[k];
+            g_verts[4 * i + k].tex_coord = (SDL_FPoint){0, 0};
+        }
+        static const int quad[6] = {0, 1, 2, 0, 2, 3};
+        for (int k = 0; k < 6; ++k) g_idx[6 * i + k] = 4 * i + quad[k];
+    }
+    SDL_RenderSetClipRect(g->weights_ren, &clip);
+    SDL_RenderGeometry(g->weights_ren, NULL, g_verts, 4 * n, g_idx, 6 * n);
+    SDL_RenderSetClipRect(g->weights_ren, NULL);
+}
+
+/* conv layer: the filters tiled on a floor, one bar per weight. Heights share
+ * one scale across the whole layer so filters can be compared by eye. */
+static void build_conv_3d(const Cam *cam, const LayerViz *lv, const float *data) {
+    int k = lv->ksize, count = lv->count, cols = lv->cols;
+    int rows = (count + cols - 1) / cols;
+    float gap = 1.0f;
+    float span_x = cols * k + (cols - 1) * gap, span_z = rows * k + (rows - 1) * gap;
+    float s = 2.0f / fmaxf(span_x, span_z);
+    float hmax = 1e-12f;
+    for (int i = 0; i < count * k * k; ++i) hmax = fmaxf(hmax, fabsf(data[i]));
+    float height = fminf(VIEW3D_HEIGHT, 1.5f * s * k);
+    faces_reserve(count * (k * k * 3 + 1) + 8);
+
+    for (int f = 0; f < count; ++f) {
+        float x0 = -span_x * 0.5f + (f % cols) * (k + gap);
+        float z0 = -span_z * 0.5f + (rows - 1 - f / cols) * (k + gap); /* filter row 0 at the far edge, like the flat view */
+        add_floor(cam, x0 * s, (x0 + k) * s, z0 * s, (z0 + k) * s);
+        for (int ky = 0; ky < k; ++ky) {
+            for (int kx = 0; kx < k; ++kx) {
+                float t = data[(f * k + ky) * k + kx] / hmax;
+                float h = t * height;
+                float y0 = h >= 0 ? 0.0f : h, y1 = h >= 0 ? h : 0.0f;
+                if (y1 - y0 < 0.004f) y1 = y0 + 0.004f; /* keep zero weights visible as a sliver */
+                float bz = z0 + (k - 1 - ky);
+                SDL_Color col = lv->full_detail ? color_signed(t) : color_seq(t);
+                add_box(cam, (x0 + kx + 0.07f) * s, (x0 + kx + 0.93f) * s, y0, y1, (bz + 0.07f) * s, (bz + 0.93f) * s,
+                        col);
+            }
+        }
+    }
+}
+
+static void resample_avg(const float *src, int sr, int sc, int dr, int dc, float *dst) {
+    for (int r = 0; r < dr; ++r) {
+        int r0 = (int)((long)r * sr / dr), r1 = (int)((long)(r + 1) * sr / dr);
+        if (r1 <= r0) r1 = r0 + 1;
+        for (int c = 0; c < dc; ++c) {
+            int c0 = (int)((long)c * sc / dc), c1 = (int)((long)(c + 1) * sc / dc);
+            if (c1 <= c0) c1 = c0 + 1;
+            float sum = 0.0f;
+            for (int y = r0; y < r1; ++y)
+                for (int x = c0; x < c1; ++x) sum += src[y * sc + x];
+            dst[r * dc + c] = sum / (float)((r1 - r0) * (c1 - c0));
+        }
+    }
+}
+
+/* fc weight matrix: a height-field surface, averaged down to a grid the
+ * software renderer can redraw every frame. */
+static void build_matrix_3d(const Cam *cam, const LayerViz *lv, const float *data) {
+    static float grid[VIEW3D_GRID_MAX * VIEW3D_GRID_MAX];
+    int rows = lv->count, cols = lv->cols;
+    int R = rows < VIEW3D_GRID_MAX ? rows : VIEW3D_GRID_MAX;
+    int C = cols < VIEW3D_GRID_MAX ? cols : VIEW3D_GRID_MAX;
+    if (R < 2) R = 2;
+    if (C < 2) C = 2;
+    resample_avg(data, rows, cols, R, C, grid);
+
+    float hmax = 1e-12f;
+    for (int i = 0; i < R * C; ++i) hmax = fmaxf(hmax, fabsf(grid[i]));
+    float ratio = (float)cols / (float)rows;
+    float hx = ratio >= 1.0f ? 1.0f : fmaxf(0.25f, ratio);
+    float hz = ratio >= 1.0f ? fmaxf(0.25f, 1.0f / ratio) : 1.0f;
+    float height = VIEW3D_HEIGHT * 0.6f;
+    faces_reserve((R - 1) * (C - 1) + 8);
+
+    add_floor(cam, -hx, hx, -hz, hz);
+    for (int r = 0; r < R - 1; ++r) {
+        for (int c = 0; c < C - 1; ++c) {
+            V3 corner[4];
+            SDL_Color col[4];
+            static const int dr[4] = {0, 0, 1, 1}, dc[4] = {0, 1, 1, 0};
+            for (int k = 0; k < 4; ++k) {
+                int rr = r + dr[k], cc = c + dc[k];
+                float t = grid[rr * C + cc] / hmax;
+                corner[k] = (V3){-hx + 2.0f * hx * cc / (C - 1), t * height, hz - 2.0f * hz * rr / (R - 1)};
+                col[k] = color_signed(t * 2.0f); /* most weights are small next to the largest: stretch the colours */
+            }
+            add_surface_quad(cam, corner[0], corner[1], corner[2], corner[3], col, 0);
+        }
+    }
+}
+
+static void draw_3d_view(Gui *g, SDL_Rect box, const LayerViz *lv, const float *data, const char *caption) {
+    draw_panel(g->weights_ren, box);
+
+    Cam cam = {cosf(g->yaw), sinf(g->yaw), cosf(g->pitch), sinf(g->pitch), 600.0f * g->zoom3d, box.x + box.w * 0.5f,
+               box.y + box.h * 0.5f + 20.0f};
+    g_faces_n = 0;
+    int n_data;
+    if (lv->kind == VIZ_CONV_GRID) {
+        build_conv_3d(&cam, lv, data);
+        n_data = lv->count * lv->ksize * lv->ksize;
+    } else {
+        build_matrix_3d(&cam, lv, data);
+        n_data = lv->count * lv->cols;
+    }
+    flush_faces(g, box);
+
+    SDL_Color dim = {COL_TEXT_DIM};
+    wtxt(g, caption, box.x + 10, box.y + 8, (SDL_Color){COL_TEXT});
+    wtxt(g, "drag = rotate   scroll = zoom   0 = reset", box.x + 10, box.y + 28, dim);
+
+    float vmin = data[0], vmax = data[0];
+    for (int i = 1; i < n_data; ++i) {
+        if (data[i] < vmin) vmin = data[i];
+        if (data[i] > vmax) vmax = data[i];
+    }
+    float vmean, vrms;
+    compute_mean_rms(data, n_data, &vmean, &vrms);
+    char stats[96];
+    snprintf(stats, sizeof(stats), "min % .5f  max % .5f  mean % .5f  rms %.5f", vmin, vmax, vmean, vrms);
+    wtxt(g, stats, box.x + 10, box.y + box.h - 22, dim);
+    const char *legend = (lv->kind == VIZ_CONV_GRID && !lv->full_detail)
+                             ? "height = mean |w| (blue low, yellow high)"
+                             : "height = weight (blue < 0, red > 0)";
+    wtxt(g, legend, box.x + 10, box.y + box.h - 42, dim);
+}
+
+static void render_weights_window(Gui *g) {
+    if (!g->weights_win) return;
+    g->wslot = 0;
+
+    SDL_SetRenderDrawColor(g->weights_ren, COL_BG);
+    SDL_RenderClear(g->weights_ren);
+
+    if (!g->has_model || !g->has_record || !g->weights_valid) {
+        wtxt(g, "waiting for weights from the trainer...", 30, 40, (SDL_Color){COL_TEXT_DIM});
+        SDL_RenderPresent(g->weights_ren);
+        return;
+    }
+
+    int n = g->model.n_viz;
+    for (int i = 0; i < n; ++i) {
+        SDL_Rect tab = weights_tab_rect(i, n);
+        int active = (g->weights_tab == i);
+        rrect_bordered(g->weights_ren, tab, 8, active ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_SURFACE},
+                       active ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_BORDER});
+        SDL_Color label_col = active ? (SDL_Color){10, 14, 28, 255} : (SDL_Color){COL_TEXT_DIM};
+        int tw = 0;
+        TTF_SizeText(g->font, g->model.layers[i].name, &tw, NULL);
+        wtxt(g, g->model.layers[i].name, tab.x + (tab.w - tw) / 2, tab.y + 13, label_col);
+    }
+
+    const LayerViz *lv = &g->model.layers[g->weights_tab];
+    const float *data = g->weights + lv->offset;
+    SDL_Rect grid_box = {20, WEIGHTS_TAB_Y + WEIGHTS_TAB_H + 16, WEIGHTS_CONTENT_W, WEIGHTS_CONTENT_H};
+
+    char caption[96];
+    if (lv->kind == VIZ_CONV_GRID) {
+        if (lv->full_detail)
+            snprintf(caption, sizeof(caption), "%s - %d filters (%dx%d, full detail)", lv->name, lv->count, lv->ksize,
+                     lv->ksize);
+        else
+            snprintf(caption, sizeof(caption), "%s - %d maps (%dx%d, mean |w| over in-ch)", lv->name, lv->count,
+                     lv->ksize, lv->ksize);
+    } else if (lv->pool == 1) {
+        snprintf(caption, sizeof(caption), "%s weight (%d->%d, full detail)", lv->name, lv->in_dim, lv->out_dim);
+    } else {
+        snprintf(caption, sizeof(caption), "%s weight (%d->%d, pooled %d rows/px)", lv->name, lv->in_dim, lv->out_dim,
+                 lv->pool);
+    }
+
+    draw_3d_view(g, grid_box, lv, data, caption);
+
+    SDL_RenderPresent(g->weights_ren);
+}
+
+/* -- training dashboard -------------------------------------------------- */
 
 static void draw_chart(Gui *g, SDL_Rect r) {
     draw_panel(g->ren, r);
-    draw_text(g->ren, &g->label_tex[LBL_CHART_CAPTION], g->font, "loss (0-2.5)", r.x + 10, r.y + 8,
-              (SDL_Color){COL_TEXT_DIM});
+    txt(g, g->font, "loss (0-2.5)", r.x + 10, r.y + 8, (SDL_Color){COL_TEXT_DIM});
 
     int pad_top = 32, pad_bottom = 10, pad_x = 10;
     int px0 = r.x + pad_x, px1 = r.x + r.w - pad_x;
@@ -309,510 +2319,421 @@ static void draw_chart(Gui *g, SDL_Rect r) {
     }
 }
 
-static void draw_architecture(Gui *g, SDL_Rect r) {
-    draw_panel(g->ren, r);
-    draw_text(g->ren, &g->label_tex[LBL_ARCH_CAPTION], g->font, "model architecture", r.x + 10, r.y + 6,
-              (SDL_Color){COL_TEXT_DIM});
-
-    int n = NUM_ARCH_BOXES;
-    int box_w = 140, box_h = 50;
-    int gap = (r.w - 20 - box_w * n) / (n - 1);
-    int y = r.y + 28 + (r.h - 28 - box_h) / 2;
-
-    for (int i = 0; i < n; ++i) {
-        int x = r.x + 10 + i * (box_w + gap);
-        SDL_Rect box = {x, y, box_w, box_h};
-        draw_panel(g->ren, box);
-        draw_text(g->ren, &g->label_tex[LBL_ARCH_BASE + i * 2], g->font, ARCH_BOXES[i].name, box.x + 8, box.y + 6,
-                  (SDL_Color){COL_TEXT});
-        draw_text(g->ren, &g->label_tex[LBL_ARCH_BASE + i * 2 + 1], g->font, ARCH_BOXES[i].info, box.x + 8,
-                  box.y + 26, (SDL_Color){COL_TEXT_DIM});
-
-        if (i < n - 1) {
-            int ax0 = box.x + box_w, ax1 = ax0 + gap;
-            int ay = y + box_h / 2;
-            SDL_SetRenderDrawColor(g->ren, COL_TEXT_DIM);
-            SDL_RenderDrawLine(g->ren, ax0, ay, ax1 - 6, ay);
-            SDL_RenderDrawLine(g->ren, ax1 - 6, ay, ax1 - 12, ay - 4);
-            SDL_RenderDrawLine(g->ren, ax1 - 6, ay, ax1 - 12, ay + 4);
-        }
-    }
-}
-
-/* Normalizes one kernel/filter-map/weight-matrix to its own min/max - the
- * raw values are small floats clustered near 0 (conv1, fc1, fc2) or
- * magnitudes that shrink with depth (the reduced conv2-4 maps), so a shared
- * scale would just show a stack of near-identical gray squares. Takes a bare
- * texture + dims (not Gui) so one function serves every layer and either
- * renderer - SDL_LockTexture only needs the texture itself. rows/cols need
- * not be equal (conv kernels are square; fc weight matrices aren't).
- * out_min/out_max are optional (pass NULL to ignore) - callers that want to
- * show the actual numbers next to the auto-contrasted image (the picture
- * alone can't tell you whether 0.009 drifted to 0.011 since every frame
- * re-stretches its own min..max to black..white) can read them back here
- * instead of re-scanning the data themselves. */
-static void fill_filter_texture(SDL_Texture *tex, const float *data, int rows, int cols, float *out_min,
-                                 float *out_max) {
-    int n = rows * cols;
-    float dmin = data[0], dmax = data[0];
-    for (int i = 1; i < n; ++i) {
-        if (data[i] < dmin) dmin = data[i];
-        if (data[i] > dmax) dmax = data[i];
-    }
-    if (out_min) *out_min = dmin;
-    if (out_max) *out_max = dmax;
-    float range = dmax - dmin;
-    if (range < 1e-6f) range = 1e-6f;
-
-    void *pixels;
-    int pitch;
-    if (SDL_LockTexture(tex, NULL, &pixels, &pitch) != 0) return;
-    for (int y = 0; y < rows; ++y) {
-        Uint32 *row_px = (Uint32 *)((Uint8 *)pixels + y * pitch);
-        for (int x = 0; x < cols; ++x) {
-            float val = data[y * cols + x];
-            Uint8 v = (Uint8)(((val - dmin) / range) * 255.0f);
-            row_px[x] = (0xFFu << 24) | (v << 16) | (v << 8) | v;
-        }
-    }
-    SDL_UnlockTexture(tex);
-}
-
-/* Clickable panel in the main window that replaces the old inline filter
- * grid; clicking it pops the live weights out into their own window (see
- * open_weights_window below) instead of eating space in the main layout. */
-static void draw_weights_button(Gui *g, SDL_Rect box, int hovered) {
-    SDL_SetRenderDrawColor(g->ren, COL_SURFACE);
-    SDL_RenderFillRect(g->ren, &box);
-    SDL_SetRenderDrawColor(g->ren, COL_LOSS);
-    SDL_RenderDrawRect(g->ren, &box);
-    if (hovered) {
-        SDL_Rect inset = {box.x + 2, box.y + 2, box.w - 4, box.h - 4};
-        SDL_RenderDrawRect(g->ren, &inset);
-    }
-    draw_text(g->ren, &g->label_tex[LBL_WEIGHTS_BTN_TITLE], g->font_big, "view layer weights", box.x + 18,
-              box.y + box.h / 2 - 26, (SDL_Color){COL_LOSS});
-    draw_text(g->ren, &g->label_tex[LBL_WEIGHTS_BTN_SUB], g->font, "opens a live weights window", box.x + 18,
-              box.y + box.h / 2 + 4, (SDL_Color){COL_TEXT_DIM});
-}
-
-/* Start and Restart both just write this one byte - the worker treats them
- * identically (reinitialize the model, train from scratch); which button the
- * user sees is purely a viewer-side UI state (Gui::started). Ignores write()
- * failures: if the worker's end is gone there's nothing useful to do about
- * it here, and the next frame's non-blocking read on the data FIFO will
- * notice the disconnect on its own. */
-static void send_train_command(Gui *g) {
-    unsigned char cmd = TRAIN_CMD_START;
-    ssize_t written = write(g->cmd_fd, &cmd, 1);
-    (void)written;
-}
-
-/* Shown in the chart area until the first record arrives. Before Start is
- * clicked (!g->started) this is the actual clickable button; once clicked,
- * g->started flips true immediately but the worker still needs a moment to
- * initialize the model and run its first batch - rendering a plain "waiting"
- * message for that gap (rather than leaving the button up) avoids it looking
- * like the click didn't register and inviting a confusing double-click. */
-static void draw_start_panel(Gui *g, SDL_Rect chart_box, int hovered) {
-    draw_panel(g->ren, chart_box);
-    draw_text(g->ren, &g->label_tex[LBL_CHART_CAPTION], g->font, "loss (0-2.5)", chart_box.x + 10, chart_box.y + 8,
-              (SDL_Color){COL_TEXT_DIM});
-
-    if (g->started) {
-        draw_text(g->ren, &g->label_tex[LBL_START_TITLE], g->font_big, "waiting for training to start...",
-                  START_BUTTON.x - 20, START_BUTTON.y + 34, (SDL_Color){COL_TEXT_DIM});
-        return;
-    }
-
-    SDL_SetRenderDrawColor(g->ren, COL_SURFACE);
-    SDL_RenderFillRect(g->ren, &START_BUTTON);
-    SDL_SetRenderDrawColor(g->ren, COL_LOSS);
-    SDL_RenderDrawRect(g->ren, &START_BUTTON);
-    if (hovered) {
-        SDL_Rect inset = {START_BUTTON.x + 2, START_BUTTON.y + 2, START_BUTTON.w - 4, START_BUTTON.h - 4};
-        SDL_RenderDrawRect(g->ren, &inset);
-    }
-    draw_text(g->ren, &g->label_tex[LBL_START_TITLE], g->font_big, "> start training", START_BUTTON.x + 62,
-              START_BUTTON.y + 34, (SDL_Color){COL_LOSS});
-}
-
-static void draw_restart_button(Gui *g, int hovered) {
-    SDL_SetRenderDrawColor(g->ren, COL_SURFACE);
-    SDL_RenderFillRect(g->ren, &RESTART_BUTTON);
-    SDL_SetRenderDrawColor(g->ren, COL_LOSS);
-    SDL_RenderDrawRect(g->ren, &RESTART_BUTTON);
-    if (hovered) {
-        SDL_Rect inset = {RESTART_BUTTON.x + 2, RESTART_BUTTON.y + 2, RESTART_BUTTON.w - 4, RESTART_BUTTON.h - 4};
-        SDL_RenderDrawRect(g->ren, &inset);
-    }
-    draw_text(g->ren, &g->label_tex[LBL_RESTART], g->font, "restart training", RESTART_BUTTON.x + 92,
-              RESTART_BUTTON.y + 9, (SDL_Color){COL_LOSS});
-}
-
-#define WEIGHTS_WIN_W 700
-#define WEIGHTS_WIN_H 600
-#define WEIGHTS_TAB_Y 20
-#define WEIGHTS_TAB_H 44
-#define WEIGHTS_CONTENT_W (WEIGHTS_WIN_W - 40)
-#define WEIGHTS_CONTENT_H (WEIGHTS_WIN_H - (WEIGHTS_TAB_Y + WEIGHTS_TAB_H + 16) - 20)
-#define WEIGHTS_ZOOM_MIN 1.0f
-#define WEIGHTS_ZOOM_MAX 8.0f
-
-/* Pure function of i (no Gui) so render_weights_window (draws tabs) and
- * pump_events (hit-tests clicks on them) use the exact same rects. */
-static SDL_Rect weights_tab_rect(int i) {
-    int bar_w = WEIGHTS_WIN_W - 40;
-    int tab_w = bar_w / NUM_WEIGHTS_TABS;
-    SDL_Rect r = {20 + i * tab_w, WEIGHTS_TAB_Y, tab_w - 4, WEIGHTS_TAB_H};
-    return r;
-}
-
-static void close_weights_window(Gui *g) {
-    if (!g->weights_win) return;
-    for (int i = 0; i < NUM_WEIGHTS_LABEL_SLOTS; ++i) {
-        if (g->weights_label_tex[i]) SDL_DestroyTexture(g->weights_label_tex[i]);
-        g->weights_label_tex[i] = NULL;
-    }
-#define DESTROY_ARR(arr, n)                                       \
-    do {                                                          \
-        for (int _i = 0; _i < (n); ++_i) {                        \
-            if (g->arr[_i]) SDL_DestroyTexture(g->arr[_i]);        \
-            g->arr[_i] = NULL;                                    \
-        }                                                         \
-    } while (0)
-    DESTROY_ARR(tex_conv1, CONV1_OUT);
-    DESTROY_ARR(tex_conv2, CONV2_OUT);
-    DESTROY_ARR(tex_conv3, CONV3_OUT);
-    DESTROY_ARR(tex_conv4, CONV4_OUT);
-#undef DESTROY_ARR
-    if (g->tex_fc1) SDL_DestroyTexture(g->tex_fc1);
-    g->tex_fc1 = NULL;
-    if (g->tex_fc2) SDL_DestroyTexture(g->tex_fc2);
-    g->tex_fc2 = NULL;
-    if (g->weights_content_tex) SDL_DestroyTexture(g->weights_content_tex);
-    g->weights_content_tex = NULL;
-    if (g->weights_ren) SDL_DestroyRenderer(g->weights_ren);
-    g->weights_ren = NULL;
-    SDL_DestroyWindow(g->weights_win);
-    g->weights_win = NULL;
-}
-
-static void create_filter_tex_array(SDL_Renderer *ren, SDL_Texture **arr, int count, int ksize) {
-    for (int f = 0; f < count; ++f) {
-        arr[f] = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, ksize, ksize);
-        if (arr[f]) SDL_SetTextureScaleMode(arr[f], SDL_ScaleModeNearest);
-    }
-}
-
-static void open_weights_window(Gui *g) {
-    if (g->weights_win) { SDL_RaiseWindow(g->weights_win); return; }
-
-    g->weights_win = SDL_CreateWindow("tinyDL - layer weights (live)", SDL_WINDOWPOS_UNDEFINED,
-                                       SDL_WINDOWPOS_UNDEFINED, WEIGHTS_WIN_W, WEIGHTS_WIN_H, SDL_WINDOW_SHOWN);
-    if (!g->weights_win) {
-        fprintf(stderr, "SDL_CreateWindow (weights) failed: %s\n", SDL_GetError());
-        return;
-    }
-    g->weights_ren = SDL_CreateRenderer(g->weights_win, -1, SDL_RENDERER_SOFTWARE);
-    if (!g->weights_ren) {
-        fprintf(stderr, "SDL_CreateRenderer (weights) failed: %s\n", SDL_GetError());
-        SDL_DestroyWindow(g->weights_win);
-        g->weights_win = NULL;
-        return;
-    }
-    SDL_SetRenderDrawBlendMode(g->weights_ren, SDL_BLENDMODE_BLEND);
-    create_filter_tex_array(g->weights_ren, g->tex_conv1, CONV1_OUT, CONV1_K);
-    create_filter_tex_array(g->weights_ren, g->tex_conv2, CONV2_OUT, CONV2_K);
-    create_filter_tex_array(g->weights_ren, g->tex_conv3, CONV3_OUT, CONV3_K);
-    create_filter_tex_array(g->weights_ren, g->tex_conv4, CONV4_OUT, CONV4_K);
-
-    g->tex_fc1 = SDL_CreateTexture(g->weights_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
-                                    FC1_VIZ_COLS, FC1_VIZ_ROWS);
-    if (g->tex_fc1) SDL_SetTextureScaleMode(g->tex_fc1, SDL_ScaleModeNearest);
-    g->tex_fc2 = SDL_CreateTexture(g->weights_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, FC2_COLS,
-                                    FC2_ROWS);
-    if (g->tex_fc2) SDL_SetTextureScaleMode(g->tex_fc2, SDL_ScaleModeNearest);
-
-    g->weights_content_tex = SDL_CreateTexture(g->weights_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET,
-                                                WEIGHTS_CONTENT_W, WEIGHTS_CONTENT_H);
-    if (g->weights_content_tex) {
-        SDL_SetTextureScaleMode(g->weights_content_tex, SDL_ScaleModeNearest);
-    } else {
-        fprintf(stderr, "SDL_CreateTexture (weights zoom target) failed: %s - zoom will be unavailable\n",
-                SDL_GetError());
-    }
-    g->weights_zoom = WEIGHTS_ZOOM_MIN;
-}
-
-/* One quadrant of the weights window: a caption plus a grid of normalized
- * filter/filter-map thumbnails for one conv layer. */
-static void draw_filter_section(Gui *g, SDL_Rect box, SDL_Texture **label_slot, const char *caption,
-                                 SDL_Texture **tex_array, int count, int cols, int ksize, const float *weights) {
-    draw_panel(g->weights_ren, box);
-    draw_text(g->weights_ren, label_slot, g->font, caption, box.x + 10, box.y + 8, (SDL_Color){COL_TEXT});
-
-    int rows = (count + cols - 1) / cols;
-    int pad = 10, gap = 6;
-    int cell_w = (box.w - 2 * pad - (cols - 1) * gap) / cols;
-    int cell_h = (box.h - 30 - pad - (rows - 1) * gap) / rows;
-    int cell = cell_w < cell_h ? cell_w : cell_h;
-
-    for (int f = 0; f < count; ++f) {
-        int col = f % cols, row = f / cols;
-        int x = box.x + pad + col * (cell + gap);
-        int y = box.y + 30 + row * (cell + gap);
-
-        fill_filter_texture(tex_array[f], weights + (size_t)f * ksize * ksize, ksize, ksize, NULL, NULL);
-
-        SDL_Rect dst = {x, y, cell, cell};
-        SDL_RenderCopy(g->weights_ren, tex_array[f], NULL, &dst);
-        SDL_SetRenderDrawColor(g->weights_ren, COL_BORDER);
-        SDL_RenderDrawRect(g->weights_ren, &dst);
-    }
-}
-
-static void compute_mean_rms(const float *data, int n, float *out_mean, float *out_rms) {
-    double sum = 0.0, sumsq = 0.0;
-    for (int i = 0; i < n; ++i) {
-        sum += data[i];
-        sumsq += (double)data[i] * (double)data[i];
-    }
-    *out_mean = (float)(sum / n);
-    *out_rms = (float)sqrt(sumsq / n);
-}
-
-/* fc1/fc2's weight is one (rows,cols) matrix, not a set of square filters -
- * rendered as a single heatmap scaled to fit the box while keeping its
- * aspect ratio (a weight matrix stretched to fill a differently-shaped box
- * would visually distort which rows/cols are near each other).
- *
- * Also prints min/max/mean/rms as text: fc1 in particular has no spatial
- * structure (its rows are pooled groups of flattened conv-output features,
- * its columns are output neurons, with no proximity relationship like an
- * image's pixels have), so a genuinely-updating heatmap of it still looks
- * like plain static to the eye - the per-frame min..max auto-contrast also
- * means the picture alone can't show the numbers actually drifting. The
- * numbers can. */
-static void draw_fc_matrix(Gui *g, SDL_Rect box, SDL_Texture **label_slot, SDL_Texture **stats_slot,
-                            const char *caption, SDL_Texture *tex, int rows, int cols, const float *data) {
-    draw_panel(g->weights_ren, box);
-    draw_text(g->weights_ren, label_slot, g->font, caption, box.x + 10, box.y + 8, (SDL_Color){COL_TEXT});
-
-    float vmin, vmax, vmean, vrms;
-    fill_filter_texture(tex, data, rows, cols, &vmin, &vmax);
-    compute_mean_rms(data, rows * cols, &vmean, &vrms);
-    char stats[96];
-    snprintf(stats, sizeof(stats), "min % .5f  max % .5f  mean % .5f  rms %.5f", vmin, vmax, vmean, vrms);
-    draw_text(g->weights_ren, stats_slot, g->font, stats, box.x + 10, box.y + box.h - 22, (SDL_Color){COL_TEXT_DIM});
-
-    int pad = 10;
-    int avail_w = box.w - 2 * pad;
-    int avail_h = box.h - 56 - pad;
-    float scale_w = (float)avail_w / cols;
-    float scale_h = (float)avail_h / rows;
-    float scale = scale_w < scale_h ? scale_w : scale_h;
-    int disp_w = (int)(cols * scale);
-    int disp_h = (int)(rows * scale);
-
-    SDL_Rect dst = {box.x + pad + (avail_w - disp_w) / 2, box.y + 30 + (avail_h - disp_h) / 2, disp_w, disp_h};
-    SDL_RenderCopy(g->weights_ren, tex, NULL, &dst);
-    SDL_SetRenderDrawColor(g->weights_ren, COL_BORDER);
-    SDL_RenderDrawRect(g->weights_ren, &dst);
-}
-
-static void render_weights_window(Gui *g, const TrainRecord *rec) {
-    if (!g->weights_win) return;
-
-    SDL_SetRenderDrawColor(g->weights_ren, COL_BG);
-    SDL_RenderClear(g->weights_ren);
-
-    for (int i = 0; i < NUM_WEIGHTS_TABS; ++i) {
-        SDL_Rect tab = weights_tab_rect(i);
-        int active = (g->weights_tab == i);
-        if (active) {
-            SDL_SetRenderDrawColor(g->weights_ren, COL_LOSS);
-        } else {
-            SDL_SetRenderDrawColor(g->weights_ren, COL_SURFACE);
-        }
-        SDL_RenderFillRect(g->weights_ren, &tab);
-        SDL_SetRenderDrawColor(g->weights_ren, COL_BORDER);
-        SDL_RenderDrawRect(g->weights_ren, &tab);
-        SDL_Color label_col = active ? (SDL_Color){COL_TEXT} : (SDL_Color){COL_TEXT_DIM};
-        draw_text(g->weights_ren, &g->weights_label_tex[WLBL_TAB0 + i], g->font, WEIGHTS_TABS[i].tab_label,
-                  tab.x + 16, tab.y + 13, label_col);
-    }
-
-    const WeightsTab *t = &WEIGHTS_TABS[g->weights_tab];
-    SDL_Rect grid_box = {20, WEIGHTS_TAB_Y + WEIGHTS_TAB_H + 16, WEIGHTS_CONTENT_W, WEIGHTS_CONTENT_H};
-
-    /* Draw the tab's content at native size into the offscreen target - a
-     * (0,0)-based box the same size as grid_box, since the content doesn't
-     * need to know it's about to be cropped/zoomed rather than shown
-     * directly. Falls back to drawing straight into the window (no zoom
-     * available) if the target texture failed to create. */
-    SDL_Texture *content = g->weights_content_tex;
-    SDL_Rect content_box = {0, 0, WEIGHTS_CONTENT_W, WEIGHTS_CONTENT_H};
-    SDL_Rect draw_box = content ? content_box : grid_box;
-    if (content) SDL_SetRenderTarget(g->weights_ren, content);
-
-    if (t->kind == TABKIND_CONV_GRID) {
-        SDL_Texture **tex_arrays[4] = {g->tex_conv1, g->tex_conv2, g->tex_conv3, g->tex_conv4};
-        const float *weights_by_tab[4] = {rec->conv1_weights, rec->conv2_filters, rec->conv3_filters,
-                                           rec->conv4_filters};
-        draw_filter_section(g, draw_box, &g->weights_label_tex[WLBL_CAPTION], t->caption,
-                             tex_arrays[g->weights_tab], t->count, t->cols, t->ksize,
-                             weights_by_tab[g->weights_tab]);
-    } else {
-        SDL_Texture *tex = (g->weights_tab == 4) ? g->tex_fc1 : g->tex_fc2;
-        const float *data = (g->weights_tab == 4) ? rec->fc1_viz : rec->fc2_weights;
-        char caption_buf[64];
-        const char *caption = t->caption;
-        if (g->weights_tab == 4) {
-            /* Built from FC1_POOL rather than baked into the WEIGHTS_TABS
-             * literal, so it can't drift out of sync with the actual pooling
-             * the worker does the way a hardcoded string could. */
-            snprintf(caption_buf, sizeof(caption_buf), "fc1 weight (1568->128, pooled %d rows/px)", FC1_POOL);
-            caption = caption_buf;
-        }
-        draw_fc_matrix(g, draw_box, &g->weights_label_tex[WLBL_CAPTION], &g->weights_label_tex[WLBL_STATS], caption,
-                       tex, t->count, t->cols, data);
-    }
-
-    if (content) {
-        SDL_SetRenderTarget(g->weights_ren, NULL);
-
-        /* Centered crop: at zoom 1 this is the whole texture (no-op); above
-         * that it's a shrinking, centered window into it, scaled back up to
-         * fill grid_box - the crop shrinks, not the box, so this is a
-         * magnifying glass, not a shrink-then-stretch. */
-        int crop_w = (int)(WEIGHTS_CONTENT_W / g->weights_zoom);
-        int crop_h = (int)(WEIGHTS_CONTENT_H / g->weights_zoom);
-        if (crop_w < 1) crop_w = 1;
-        if (crop_h < 1) crop_h = 1;
-        SDL_Rect src = {(WEIGHTS_CONTENT_W - crop_w) / 2, (WEIGHTS_CONTENT_H - crop_h) / 2, crop_w, crop_h};
-        SDL_RenderCopy(g->weights_ren, content, &src, &grid_box);
-
-        /* Top-right corner, clear of both the caption (top-left, inside the
-         * zoomed content) and the fc stats line (bottom-left, also inside
-         * the zoomed content and liable to scroll out of view once zoomed) -
-         * this is drawn straight onto the window, after the crop blit, so it
-         * always stays put regardless of zoom/pan. */
-        char zoom_buf[48];
-        int zoomed = g->weights_zoom > WEIGHTS_ZOOM_MIN + 0.01f;
-        if (zoomed) {
-            snprintf(zoom_buf, sizeof(zoom_buf), "zoom %.1fx (scroll=zoom, 0=reset)", g->weights_zoom);
-        } else {
-            snprintf(zoom_buf, sizeof(zoom_buf), "scroll to zoom in");
-        }
-        /* Backing rect so this stays legible regardless of what the zoomed
-         * image happens to look like underneath - there's no letterboxed
-         * margin to put chrome in since the content fills the whole box. */
-        SDL_Rect zoom_bg = {grid_box.x + grid_box.w - 304, grid_box.y + 4, 294, 22};
-        SDL_SetRenderDrawColor(g->weights_ren, 13, 15, 20, 215);
-        SDL_RenderFillRect(g->weights_ren, &zoom_bg);
-        draw_text(g->weights_ren, &g->weights_label_tex[WLBL_ZOOM], g->font, zoom_buf, zoom_bg.x + 6, zoom_bg.y + 4,
-                  zoomed ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_TEXT_DIM});
-    }
-
-    SDL_RenderPresent(g->weights_ren);
-}
-
-static void draw_digit(Gui *g, SDL_Rect box, const unsigned char *pixels255, int true_label, int pred_label) {
-    int correct = true_label == pred_label;
+static void draw_digit(Gui *g, SDL_Rect box) {
+    const Progress *p = &g->prog;
+    int correct = p->true_label == p->pred_label;
     draw_panel(g->ren, box);
+    if (!g->digit_tex || !g->sample) return;
 
     void *pixels;
     int pitch;
-    SDL_LockTexture(g->digit_tex, NULL, &pixels, &pitch);
-    for (int y = 0; y < TRAIN_IMG_SIZE; ++y) {
-        Uint32 *row = (Uint32 *)((Uint8 *)pixels + y * pitch);
-        for (int x = 0; x < TRAIN_IMG_SIZE; ++x) {
-            Uint8 v = pixels255[y * TRAIN_IMG_SIZE + x];
-            row[x] = (0xFFu << 24) | (v << 16) | (v << 8) | v;
+    if (SDL_LockTexture(g->digit_tex, NULL, &pixels, &pitch) == 0) {
+        for (int y = 0; y < g->digit_h; ++y) {
+            Uint32 *row = (Uint32 *)((Uint8 *)pixels + y * pitch);
+            for (int x = 0; x < g->digit_w; ++x) {
+                size_t plane = (size_t)g->digit_w * g->digit_h, at = (size_t)y * g->digit_w + x;
+                Uint8 r = g->sample[at];
+                Uint8 gr = g->digit_c >= 3 ? g->sample[plane + at] : r;
+                Uint8 b = g->digit_c >= 3 ? g->sample[2 * plane + at] : r;
+                row[x] = (0xFFu << 24) | (b << 16) | (gr << 8) | r;
+            }
         }
+        SDL_UnlockTexture(g->digit_tex);
     }
-    SDL_UnlockTexture(g->digit_tex);
 
     int size = box.h - 70;
-    SDL_Rect dst = {box.x + (box.w - size) / 2, box.y + 16, size, size};
-    SDL_SetRenderDrawColor(g->ren, correct ? COL_GOOD : COL_BAD);
+    float scale = (float)size / (float)(g->digit_w > g->digit_h ? g->digit_w : g->digit_h);
+    int dw = (int)(g->digit_w * scale), dh = (int)(g->digit_h * scale);
+    SDL_Rect dst = {box.x + (box.w - dw) / 2, box.y + 16 + (size - dh) / 2, dw, dh};
+    /* COL_GOOD/COL_BAD expand to four comma-separated values, so they can't sit inside ?: directly. */
+    SDL_Color verdict = correct ? (SDL_Color){COL_GOOD} : (SDL_Color){COL_BAD};
+    SDL_SetRenderDrawColor(g->ren, verdict.r, verdict.g, verdict.b, verdict.a);
     SDL_Rect ring = {dst.x - 4, dst.y - 4, dst.w + 8, dst.h + 8};
     SDL_RenderFillRect(g->ren, &ring);
     SDL_RenderCopy(g->ren, g->digit_tex, NULL, &dst);
 
-    /* Class names run a lot longer than MNIST's bare digits ("Ankle boot" vs
-     * "9"), so this is deliberately terser than the old "true %d pred %d"
-     * form - it has to fit the same ~300px-wide panel. */
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s -> %s  %s", CLASS_NAMES[true_label % 10], CLASS_NAMES[pred_label % 10],
-              correct ? "ok" : "WRONG");
-    draw_text(g->ren, &g->label_tex[LBL_DIGIT_CAPTION], g->font, buf, box.x + 14, dst.y + dst.h + 16,
-              (SDL_Color){correct ? COL_GOOD : COL_BAD});
+    char name_a[16], name_b[16], buf[64];
+    snprintf(buf, sizeof(buf), "label: %s", class_name(&g->run_ds, p->true_label, name_a, sizeof(name_a)));
+    txt(g, g->font, buf, box.x + 14, box.y + 16 + size + 8, (SDL_Color){COL_TEXT_DIM});
+    snprintf(buf, sizeof(buf), "pred:  %s  %s", class_name(&g->run_ds, p->pred_label, name_b, sizeof(name_b)),
+             correct ? "ok" : "WRONG");
+    txt(g, g->font, buf, box.x + 14, box.y + 16 + size + 28, verdict);
+}
+
+static void draw_dashboard(Gui *g) {
+    SDL_Point mouse = {g->mouse_x, g->mouse_y};
+    SDL_Rect arch_box = {20, 20, 1110, 164};
+    draw_architecture(g, arch_box, &g->run_cfg, &g->run_shapes);
+
+    SDL_Rect chart_box = {20, 194, 790, 486};
+    if (g->has_record) {
+        draw_chart(g, chart_box);
+    } else {
+        draw_panel(g->ren, chart_box);
+        txt(g, g->font, "loss (0-2.5)", chart_box.x + 10, chart_box.y + 8, (SDL_Color){COL_TEXT_DIM});
+        txt(g, g->font_big, g->worker_gone ? "train_worker is not running" : "waiting for training to start...",
+            chart_box.x + 220, chart_box.y + 250, (SDL_Color){COL_TEXT_DIM});
+    }
+
+    SDL_Rect digit_box = {830, 194, 300, 166};
+    if (g->has_record) draw_digit(g, digit_box);
+    else draw_panel(g->ren, digit_box);
+
+    SDL_Rect wb = WEIGHTS_BUTTON;
+    int wb_hover = SDL_PointInRect(&mouse, &wb);
+    rrect_bordered(g->ren, wb, 12, wb_hover ? col_mix((SDL_Color){COL_SURFACE}, (SDL_Color){COL_LOSS}, 0.16f) : (SDL_Color){COL_SURFACE},
+                   wb_hover ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_BORDER_HI});
+    txt(g, g->font_big, "View layer weights", wb.x + 20, wb.y + wb.h / 2 - 26, (SDL_Color){COL_LOSS});
+    txt(g, g->font, "opens a live 3D weights window", wb.x + 20, wb.y + wb.h / 2 + 4, (SDL_Color){COL_TEXT_DIM});
+
+    SDL_Rect info_box = {830, 530, 300, 150};
+    draw_panel(g->ren, info_box);
+    char line[96];
+    if (g->has_record) {
+        const Progress *p = &g->prog;
+        snprintf(line, sizeof(line), "epoch   %d / %d", p->epoch, p->epochs);
+        txt(g, g->font_big, line, info_box.x + 14, info_box.y + 12, (SDL_Color){COL_TEXT});
+        snprintf(line, sizeof(line), "batch %d / %d   %.1fs", p->batch, p->batch_count, p->elapsed);
+        txt(g, g->font, line, info_box.x + 14, info_box.y + 44, (SDL_Color){COL_TEXT_DIM});
+        snprintf(line, sizeof(line), "loss %.4f   acc %.1f%%", p->loss, p->acc * 100.0f);
+        txt(g, g->font, line, info_box.x + 14, info_box.y + 66, (SDL_Color){COL_LOSS});
+        if (p->test_acc >= 0.0f) snprintf(line, sizeof(line), "test acc %.1f%%", p->test_acc * 100.0f);
+        else snprintf(line, sizeof(line), "test acc --");
+        txt(g, g->font, line, info_box.x + 14, info_box.y + 88, (SDL_Color){COL_GOOD});
+    } else {
+        txt(g, g->font_big, "not started", info_box.x + 14, info_box.y + 12, (SDL_Color){COL_TEXT_DIM});
+    }
+    draw_button(g, RESTART_BUTTON, "restart", g->font, SDL_PointInRect(&mouse, &RESTART_BUTTON), !g->worker_gone);
+    draw_button(g, SETTINGS_BUTTON, "settings", g->font, SDL_PointInRect(&mouse, &SETTINGS_BUTTON), 1);
+}
+
+/* -- input --------------------------------------------------------------- */
+
+static int send_cmd(Gui *g, const TrainConfig *cfg) {
+    TrainCmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.magic = TRAIN_MAGIC;
+    cmd.type = TRAIN_CMD_START;
+    cmd.cfg = *cfg;
+    ssize_t w = write(g->cmd_fd, &cmd, sizeof(cmd));
+    if (w != (ssize_t)sizeof(cmd)) {
+        g->worker_gone = 1;
+        return -1;
+    }
+    return 0;
+}
+
+/* Clears the chart and drops the last record so the UI reads as "waiting for
+ * the new run" rather than silently continuing to show the old one's data
+ * until the worker's first fresh record arrives. */
+static void begin_run(Gui *g, const TrainConfig *cfg) {
+    g->run_active = 1;
+    g->worker_msg[0] = '\0';
+    g->has_record = 0;
+    g->weights_valid = 0;
+    gui_clear_history(g);
+    g->run_cfg = *cfg;
+    train_cfg_derive(&g->run_cfg, &g->run_shapes, NULL, 0);
+    refresh_run_ds(g);
+    ensure_sample(g);
+}
+
+static void start_from_form(Gui *g) {
+    if (!g->form_valid || g->worker_gone) return;
+    if (send_cmd(g, &g->form_cfg) != 0) return;
+    begin_run(g, &g->form_cfg);
+    g->screen = SCREEN_RUN;
+    g->focus = -1;
+    g->dropdown_open = 0;
+    SDL_StopTextInput();
+}
+
+static int field_accepts(int kind, char ch) {
+    unsigned char c = (unsigned char)ch;
+    switch (kind) {
+    case FK_INT: return isdigit(c);
+    case FK_FLOAT: return isdigit(c) || ch == '.' || ch == '-' || ch == '+' || ch == 'e' || ch == 'E';
+    case FK_CHOICE: return 0;
+    default: return isalnum(c) || ch == '-' || ch == '_';
+    }
+}
+
+static void field_insert(Gui *g, const char *utf8) {
+    if (g->focus < 0) return;
+    Field *f = &g->fields[g->focus];
+    size_t len = strlen(f->text);
+    for (const char *c = utf8; *c && len < FIELD_MAX_CHARS; ++c) {
+        if (field_accepts(f->kind, *c)) {
+            f->text[len++] = *c;
+            f->text[len] = '\0';
+        }
+    }
+}
+
+static void focus_step(Gui *g, int dir) {
+    int idx = g->focus;
+    g->dropdown_open = 0;
+    for (int tries = 0; tries < NUM_FIELDS; ++tries) {
+        idx = (idx + dir + NUM_FIELDS) % NUM_FIELDS;
+        if (idx < 0) idx = 0;
+        if (g->fields[idx].visible) { g->focus = idx; return; }
+    }
+}
+
+static void setup_click(Gui *g, SDL_Point p) {
+    form_layout(g);
+    g->drag = DRAG_NONE;
+    if (g->dropdown_open) {
+        /* The open list sits on top of everything: a click on a row picks it,
+         * a click on the dataset field closes it, any other click just closes
+         * it and is then handled normally. */
+        g->dropdown_open = 0;
+        for (int i = 0; i < g->n_datasets; ++i) {
+            SDL_Rect r = dropdown_row_rect(g, i);
+            if (SDL_PointInRect(&p, &r)) {
+                dataset_choose(g, g->ds[i].name);
+                return;
+            }
+        }
+        if (SDL_PointInRect(&p, &g->fields[F_DATASET].rect)) return;
+    }
+    for (int i = 0; i < NUM_GENERAL_FIELDS; ++i) {
+        if (SDL_PointInRect(&p, &g->fields[i].rect)) {
+            g->focus = i;
+            if (i == F_DATASET) {
+                scan_datasets(g);
+                g->dropdown_open = 1;
+            }
+            return;
+        }
+    }
+
+    if (SDL_PointInRect(&p, &GRAPH_VIEW)) {
+        for (int i = NUM_GENERAL_FIELDS; i < NUM_FIELDS; ++i) {
+            if (g->fields[i].visible && SDL_PointInRect(&p, &g->fields[i].rect)) {
+                g->focus = i;
+                return;
+            }
+        }
+        g->focus = -1;
+        for (int i = MAX_NODES - 1; i >= 0; --i) { /* topmost node first */
+            if (!g->nodes[i].used) continue;
+            int type = g->nodes[i].type;
+            if (type != NODE_OUTPUT && near_port(node_out_port(g, i), p)) {
+                g->drag = DRAG_LINK;
+                g->drag_node = i;
+                return;
+            }
+            for (int k = 0; k < node_nin(type); ++k) {
+                if (!near_port(node_in_port(g, i, k), p)) continue;
+                /* Grabbing a wired input dot pulls its wire off, to be dropped elsewhere. */
+                int src = g->nodes[i].in[k];
+                if (src >= 0) {
+                    g->nodes[i].in[k] = -1;
+                    g->drag = DRAG_LINK;
+                    g->drag_node = src;
+                }
+                return;
+            }
+            SDL_Rect r = node_rect(g, i);
+            if (SDL_PointInRect(&p, &r)) {
+                SDL_Rect d = node_del_rect(r);
+                if (node_deletable(type) && SDL_PointInRect(&p, &d)) {
+                    graph_remove(g, i);
+                } else {
+                    g->drag = DRAG_NODE;
+                    g->drag_node = i;
+                }
+                return;
+            }
+        }
+        g->drag = DRAG_PAN;
+        return;
+    }
+
+    g->focus = -1;
+    for (int i = 0; i < NUM_PALETTE; ++i) {
+        SDL_Rect pr = palette_rect(i);
+        if (SDL_PointInRect(&p, &pr)) {
+            g->drag = DRAG_PAL;
+            g->drag_type = PALETTE_TYPES[i];
+            g->drag_moved = 0;
+            g->press_x = p.x;
+            g->press_y = p.y;
+            return;
+        }
+    }
+    if (SDL_PointInRect(&p, &BTN_ARRANGE)) graph_arrange(g);
+    else if (SDL_PointInRect(&p, &BTN_RESET)) graph_reset(g);
+    else if (SDL_PointInRect(&p, &BTN_RESNET)) graph_preset_resnet(g);
+    else if (SDL_PointInRect(&p, &BTN_START)) start_from_form(g);
+    else if (g->run_active && SDL_PointInRect(&p, &BTN_BACK)) {
+        g->screen = SCREEN_RUN;
+        SDL_StopTextInput();
+    }
+    form_layout(g);
+}
+
+/* Finishes a drag: a wire dropped on a node connects to it, a palette block
+ * dropped on the canvas is placed there, or just clicked is appended. */
+static void setup_release(Gui *g, SDL_Point p) {
+    form_layout(g);
+    if (g->drag == DRAG_LINK) {
+        for (int i = MAX_NODES - 1; i >= 0; --i) {
+            if (!g->nodes[i].used || g->nodes[i].type == NODE_INPUT || i == g->drag_node) continue;
+            SDL_Rect r = node_rect(g, i);
+            if (SDL_PointInRect(&p, &r)) {
+                /* An add node has two ports: take the free one if only one is free, else the
+                 * port nearest the drop point. */
+                int nin = node_nin(g->nodes[i].type), port = 0;
+                if (nin == 2) {
+                    int free0 = g->nodes[i].in[0] < 0, free1 = g->nodes[i].in[1] < 0;
+                    if (free0 != free1) port = free0 ? 0 : 1;
+                    else port = abs(p.y - node_in_port(g, i, 0).y) <= abs(p.y - node_in_port(g, i, 1).y) ? 0 : 1;
+                }
+                graph_link(g, g->drag_node, i, port);
+                break;
+            }
+        }
+    } else if (g->drag == DRAG_PAL) {
+        if (!g->drag_moved) {
+            graph_append(g, g->drag_type);
+        } else if (SDL_PointInRect(&p, &GRAPH_VIEW)) {
+            graph_add(g, g->drag_type, p.x - GRAPH_VIEW.x - g->pan_x - NODE_W / 2, p.y - GRAPH_VIEW.y - g->pan_y - 12);
+        }
+    }
+    g->drag = DRAG_NONE;
+    form_layout(g);
 }
 
 static int pump_events(Gui *g) {
     SDL_Event e;
+    Uint32 main_id = SDL_GetWindowID(g->win);
+    form_layout(g);
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
         case SDL_QUIT:
             return 0;
-        case SDL_KEYDOWN:
-            if (e.key.keysym.sym == SDLK_ESCAPE) return 0;
-            if (g->weights_win && e.key.windowID == SDL_GetWindowID(g->weights_win) &&
-                e.key.keysym.sym == SDLK_0) {
-                g->weights_zoom = WEIGHTS_ZOOM_MIN;
+        case SDL_KEYDOWN: {
+            SDL_Keycode k = e.key.keysym.sym;
+            /* A clicked field owns the keyboard whichever window SDL thinks has focus - with
+             * the weights window open and no window manager to move focus on click, key
+             * events would otherwise keep arriving tagged with the weights window. */
+            int form_has_keys = e.key.windowID == main_id || g->focus >= 0;
+            if (form_has_keys && g->screen == SCREEN_SETUP) {
+                if (k == SDLK_ESCAPE) {
+                    if (g->dropdown_open) g->dropdown_open = 0;
+                    else if (g->focus >= 0) g->focus = -1;
+                    else return 0;
+                } else if ((k == SDLK_UP || k == SDLK_DOWN) && g->focus == F_DATASET && g->n_datasets > 0) {
+                    int cur = -1;
+                    for (int i = 0; i < g->n_datasets; ++i)
+                        if (strcmp(g->ds[i].name, g->fields[F_DATASET].text) == 0) cur = i;
+                    cur = (cur + (k == SDLK_DOWN ? 1 : -1) + g->n_datasets) % g->n_datasets;
+                    dataset_choose(g, g->ds[cur].name);
+                } else if (k == SDLK_BACKSPACE) {
+                    if (g->focus >= 0 && g->fields[g->focus].kind != FK_CHOICE) {
+                        size_t len = strlen(g->fields[g->focus].text);
+                        if (len > 0) g->fields[g->focus].text[len - 1] = '\0';
+                    }
+                } else if (k == SDLK_TAB) {
+                    focus_step(g, (e.key.keysym.mod & KMOD_SHIFT) ? -1 : 1);
+                } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                    start_from_form(g);
+                } else if (k == SDLK_v && (e.key.keysym.mod & KMOD_CTRL)) {
+                    char *clip = SDL_GetClipboardText();
+                    if (clip) { field_insert(g, clip); SDL_free(clip); }
+                }
+                break;
             }
+            if (k == SDLK_ESCAPE) return 0;
+            if (g->weights_win && e.key.windowID == SDL_GetWindowID(g->weights_win) && k == SDLK_0) {
+                g->yaw = 0.6f;
+                g->pitch = 0.75f;
+                g->zoom3d = 1.0f;
+            }
+            break;
+        }
+        case SDL_TEXTINPUT:
+            if (g->screen == SCREEN_SETUP && g->focus >= 0) field_insert(g, e.text.text);
             break;
         case SDL_MOUSEWHEEL:
             if (g->weights_win && e.wheel.windowID == SDL_GetWindowID(g->weights_win)) {
                 float factor = e.wheel.y > 0 ? 1.15f : e.wheel.y < 0 ? (1.0f / 1.15f) : 1.0f;
-                g->weights_zoom *= factor;
-                if (g->weights_zoom < WEIGHTS_ZOOM_MIN) g->weights_zoom = WEIGHTS_ZOOM_MIN;
-                if (g->weights_zoom > WEIGHTS_ZOOM_MAX) g->weights_zoom = WEIGHTS_ZOOM_MAX;
+                g->zoom3d *= factor;
+                if (g->zoom3d < 0.4f) g->zoom3d = 0.4f;
+                if (g->zoom3d > 5.0f) g->zoom3d = 5.0f;
+            } else if (g->screen == SCREEN_SETUP && g->win && e.wheel.windowID == main_id) {
+                /* scrolling over the node canvas pans it (shift = sideways) */
+                SDL_Point m = {g->mouse_x, g->mouse_y};
+                if (SDL_PointInRect(&m, &GRAPH_VIEW)) {
+                    int step = 48;
+                    if (SDL_GetModState() & KMOD_SHIFT) g->pan_x += e.wheel.y * step;
+                    else g->pan_y += e.wheel.y * step;
+                    g->pan_x += e.wheel.x * step;
+                }
             }
             break;
         case SDL_MOUSEMOTION:
-            if (e.motion.windowID == SDL_GetWindowID(g->win)) {
+            if (e.motion.windowID == main_id) {
                 g->mouse_x = e.motion.x;
                 g->mouse_y = e.motion.y;
+                if (g->drag != DRAG_NONE) {
+                    if (!(e.motion.state & SDL_BUTTON_LMASK)) {
+                        g->drag = DRAG_NONE; /* the release happened outside the window */
+                    } else if (g->drag == DRAG_NODE) {
+                        g->nodes[g->drag_node].x += e.motion.xrel;
+                        g->nodes[g->drag_node].y += e.motion.yrel;
+                    } else if (g->drag == DRAG_PAN) {
+                        g->pan_x += e.motion.xrel;
+                        g->pan_y += e.motion.yrel;
+                    } else if (g->drag == DRAG_PAL && abs(e.motion.x - g->press_x) + abs(e.motion.y - g->press_y) > 6) {
+                        g->drag_moved = 1;
+                    }
+                }
+            } else if (g->weights_win && e.motion.windowID == SDL_GetWindowID(g->weights_win) &&
+                       (e.motion.state & SDL_BUTTON_LMASK)) {
+                g->yaw += e.motion.xrel * 0.01f;
+                g->pitch += e.motion.yrel * 0.01f;
+                if (g->pitch < 0.12f) g->pitch = 0.12f;
+                if (g->pitch > 1.5f) g->pitch = 1.5f;
             }
             break;
         case SDL_MOUSEBUTTONDOWN:
-            if (e.button.windowID == SDL_GetWindowID(g->win)) {
+            if (e.button.windowID == main_id) {
                 SDL_Point p = {e.button.x, e.button.y};
-                if (SDL_PointInRect(&p, &WEIGHTS_BUTTON)) {
+                if (g->screen == SCREEN_SETUP) {
+                    if (e.button.button == SDL_BUTTON_LEFT) setup_click(g, p);
+                } else if (SDL_PointInRect(&p, &WEIGHTS_BUTTON)) {
                     open_weights_window(g);
-                } else if (!g->started && SDL_PointInRect(&p, &START_BUTTON)) {
-                    send_train_command(g);
-                    g->started = 1;
-                } else if (g->started && SDL_PointInRect(&p, &RESTART_BUTTON)) {
-                    send_train_command(g);
-                    /* Clear the chart and drop the last record so the UI
-                     * reads as "waiting for the new run" rather than
-                     * silently continuing to show the old one's data until
-                     * the worker's first fresh record arrives. */
-                    g->has_record = 0;
-                    g->hist_count = 0;
-                    g->hist_head = 0;
+                } else if (SDL_PointInRect(&p, &RESTART_BUTTON)) {
+                    if (!g->worker_gone && send_cmd(g, &g->run_cfg) == 0) begin_run(g, &g->run_cfg);
+                } else if (SDL_PointInRect(&p, &SETTINGS_BUTTON)) {
+                    g->screen = SCREEN_SETUP;
+                    SDL_StartTextInput();
                 }
-            } else if (g->weights_win && e.button.windowID == SDL_GetWindowID(g->weights_win)) {
+            } else if (g->weights_win && e.button.windowID == SDL_GetWindowID(g->weights_win) && g->has_model) {
                 SDL_Point p = {e.button.x, e.button.y};
-                for (int i = 0; i < NUM_WEIGHTS_TABS; ++i) {
-                    SDL_Rect tab = weights_tab_rect(i);
+                for (int i = 0; i < g->model.n_viz; ++i) {
+                    SDL_Rect tab = weights_tab_rect(i, g->model.n_viz);
                     if (SDL_PointInRect(&p, &tab)) {
-                        if (g->weights_tab != i) g->weights_zoom = WEIGHTS_ZOOM_MIN; /* don't carry zoom to a different layer */
                         g->weights_tab = i;
                         break;
                     }
                 }
             }
             break;
+        case SDL_MOUSEBUTTONUP:
+            if (e.button.button == SDL_BUTTON_LEFT && e.button.windowID == main_id && g->screen == SCREEN_SETUP) {
+                SDL_Point p = {e.button.x, e.button.y};
+                setup_release(g, p);
+            }
+            break;
         case SDL_WINDOWEVENT:
             if (e.window.event == SDL_WINDOWEVENT_CLOSE) {
                 if (g->weights_win && e.window.windowID == SDL_GetWindowID(g->weights_win)) {
                     close_weights_window(g);
-                } else if (e.window.windowID == SDL_GetWindowID(g->win)) {
+                } else if (e.window.windowID == main_id) {
                     return 0;
                 }
             }
@@ -822,59 +2743,36 @@ static int pump_events(Gui *g) {
     return 1;
 }
 
-static void render_frame(Gui *g, const TrainRecord *rec) {
+static void render_frame(Gui *g) {
+    g->slot = 0;
     SDL_SetRenderDrawColor(g->ren, COL_BG);
     SDL_RenderClear(g->ren);
 
-    SDL_Rect arch_box = {20, 20, 1110, 90};
-    draw_architecture(g, arch_box);
-
-    SDL_Point mouse = {g->mouse_x, g->mouse_y};
-    SDL_Rect chart_box = {20, 130, 790, 550};
-    if (g->has_record) {
-        draw_chart(g, chart_box);
+    if (g->screen == SCREEN_SETUP) {
+        form_update(g);
+        draw_form(g);
     } else {
-        draw_start_panel(g, chart_box, SDL_PointInRect(&mouse, &START_BUTTON));
+        draw_dashboard(g);
     }
-
-    SDL_Rect digit_box = {830, 130, 300, 230};
-    if (g->has_record) {
-        draw_digit(g, digit_box, rec->pixels, rec->true_label, rec->pred_label);
-    } else {
-        draw_panel(g->ren, digit_box);
-    }
-
-    draw_weights_button(g, WEIGHTS_BUTTON, SDL_PointInRect(&mouse, &WEIGHTS_BUTTON));
-    if (g->has_record) render_weights_window(g, rec);
-
-    SDL_Rect info_box = {830, 530, 300, 150};
-    draw_panel(g->ren, info_box);
-    char line[96];
-    if (g->has_record) {
-        snprintf(line, sizeof(line), "epoch   %d / %d", rec->epoch, rec->epochs);
-        draw_text(g->ren, &g->label_tex[LBL_EPOCH], g->font_big, line, info_box.x + 14, info_box.y + 12,
-                  (SDL_Color){COL_TEXT});
-        snprintf(line, sizeof(line), "batch   %d / %d", rec->batch, rec->batch_count);
-        draw_text(g->ren, &g->label_tex[LBL_BATCH], g->font, line, info_box.x + 14, info_box.y + 46,
-                  (SDL_Color){COL_TEXT_DIM});
-        snprintf(line, sizeof(line), "loss %.4f   acc %.1f%%", rec->loss, rec->acc * 100.0f);
-        draw_text(g->ren, &g->label_tex[LBL_LOSS], g->font, line, info_box.x + 14, info_box.y + 68,
-                  (SDL_Color){COL_LOSS});
-        snprintf(line, sizeof(line), "elapsed %.1fs", rec->elapsed);
-        draw_text(g->ren, &g->label_tex[LBL_ELAPSED], g->font, line, info_box.x + 14, info_box.y + 96,
-                  (SDL_Color){COL_TEXT_DIM});
-    } else {
-        draw_text(g->ren, &g->label_tex[LBL_EPOCH], g->font_big, "not started", info_box.x + 14, info_box.y + 12,
-                  (SDL_Color){COL_TEXT_DIM});
-    }
-    if (g->started) draw_restart_button(g, SDL_PointInRect(&mouse, &RESTART_BUTTON));
-
     SDL_RenderPresent(g->ren);
+
+    render_weights_window(g);
 }
 
 int main(void) {
-    Gui gui = {0}; /* label_tex[]/digit_tex etc. must start NULL - see the lazy-create checks in draw_text() */
+    /* The viewer writes to the command FIFO; if train_worker has died, that
+     * write would raise SIGPIPE and kill the window instead of failing. */
+    signal(SIGPIPE, SIG_IGN);
+
+    Gui gui;
+    memset(&gui, 0, sizeof(gui)); /* label_tex[]/digit_tex etc. must start NULL - see the lazy-create checks in draw_text() */
+    gui.cmd_fd = -1;
+    gui.yaw = 0.6f;
+    gui.pitch = 0.75f;
+    gui.zoom3d = 1.0f;
+    form_defaults(&gui);
     if (gui_init(&gui) != 0) return 1;
+    SDL_StartTextInput();
 
     if (mkfifo(TRAIN_FIFO_PATH, 0600) != 0 && errno != EEXIST) {
         fprintf(stderr, "train_viewer: mkfifo(%s) failed: %s\n", TRAIN_FIFO_PATH, strerror(errno));
@@ -882,70 +2780,46 @@ int main(void) {
         return 1;
     }
     fprintf(stderr, "train_viewer: waiting for train_worker to connect to %s ...\n", TRAIN_FIFO_PATH);
-    FILE *fifo = fopen(TRAIN_FIFO_PATH, "rb"); /* blocks until the worker opens it for writing */
-    if (!fifo) {
+    int data_fd = open(TRAIN_FIFO_PATH, O_RDONLY); /* blocks until the worker opens it for writing */
+    if (data_fd < 0) {
         fprintf(stderr, "train_viewer: could not open fifo for reading: %s\n", strerror(errno));
         gui_shutdown(&gui);
         return 1;
     }
-    int data_fd = fileno(fifo);
-    /* Training doesn't start until the user clicks Start, so there's nothing
-     * to read yet - non-blocking lets the loop below keep pumping events and
-     * rendering the idle UI instead of stalling on the first record. */
+    /* Nothing is streamed until the user clicks Start, so there's nothing to
+     * read yet - non-blocking lets the loop below keep pumping events and
+     * rendering the idle UI instead of stalling on the first message. */
     fcntl(data_fd, F_SETFL, O_NONBLOCK);
 
-    /* Second FIFO, this direction viewer->worker - see the comment on
-     * TRAIN_CMD_FIFO_PATH in train_record.h. open() blocks until the
-     * worker's read end is open, which by this point it already is (the
-     * worker opens it right after the data FIFO handshake above, before
-     * doing anything else). */
+    /* Second FIFO, viewer->worker. open() blocks until the worker's read end
+     * is open, which by this point it already is (the worker opens it right
+     * after the data FIFO handshake above, before doing anything else). */
     if (mkfifo(TRAIN_CMD_FIFO_PATH, 0600) != 0 && errno != EEXIST) {
         fprintf(stderr, "train_viewer: mkfifo(%s) failed: %s\n", TRAIN_CMD_FIFO_PATH, strerror(errno));
-        fclose(fifo);
+        close(data_fd);
         gui_shutdown(&gui);
         return 1;
     }
     gui.cmd_fd = open(TRAIN_CMD_FIFO_PATH, O_WRONLY);
     if (gui.cmd_fd < 0) {
         fprintf(stderr, "train_viewer: could not open command fifo for writing: %s\n", strerror(errno));
-        fclose(fifo);
+        close(data_fd);
         gui_shutdown(&gui);
         return 1;
     }
-    fprintf(stderr, "train_viewer: worker connected. Click Start to begin training.\n");
+    fprintf(stderr, "train_viewer: worker connected. Fill in the settings and click Start.\n");
 
-    TrainRecord rec;
-    unsigned char assemble[sizeof(TrainRecord)];
-    size_t have = 0;
-    int running = 1;
-
-    while (running) {
+    Rx rx;
+    memset(&rx, 0, sizeof(rx));
+    for (;;) {
         if (!pump_events(&gui)) break;
-
-        /* A TrainRecord (now over 100KB with the weight-visualization
-         * fields) doesn't necessarily arrive in one read() even though the
-         * worker writes it in one fwrite() - the pipe can hand it over in
-         * pieces - so this accumulates into `assemble` across frames until a
-         * full record's worth of bytes has shown up. */
-        ssize_t n = read(data_fd, assemble + have, sizeof(TrainRecord) - have);
-        if (n > 0) {
-            have += (size_t)n;
-            if (have == sizeof(TrainRecord)) {
-                memcpy(&rec, assemble, sizeof(TrainRecord));
-                have = 0;
-                gui.has_record = 1;
-                gui_push_point(&gui, rec.loss);
-            }
-        }
-        /* n == 0 (worker closed its end) or n < 0 with EAGAIN (nothing
-         * available yet) both just mean "no new record this frame" - either
-         * way the last-known `rec` (if any) is still fine to keep showing. */
-
-        render_frame(&gui, &rec);
+        rx_pump(&rx, data_fd, &gui);
+        render_frame(&gui);
         SDL_Delay(8); /* avoid busy-spinning the CPU now that nothing blocks this loop */
     }
 
-    fclose(fifo);
+    free(rx.buf);
+    close(data_fd);
     if (gui.cmd_fd >= 0) close(gui.cmd_fd);
     gui_shutdown(&gui);
     return 0;
