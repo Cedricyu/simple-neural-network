@@ -1,6 +1,8 @@
 #ifndef CONVKERNELS_H
 #define CONVKERNELS_H
 
+#define CONV_WGRAD_THREADS 256 /* block size of the weight- and bias-gradient reductions */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
