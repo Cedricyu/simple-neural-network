@@ -171,9 +171,11 @@ Tensor *conv2d_backward_weight(Tensor *weight, Tensor *x, Tensor *grad_out) {
     int shape[4] = {C_out, C_in, K, K};
     Tensor *grad_w = tensor_create(4, shape, 0);
 
-    dim3 block(K, K);
-    dim3 grid(1, 1, C_out * C_in);
-    conv2d_backward_weight_kernel<<<grid, block>>>(x->data, grad_out->data, grad_w->data, B, C_in, H, W, K, C_out,
+    if (K * K > 49) {
+        printf("conv2d_backward_weight: kernel %d is larger than the supported 7x7\n", K);
+        return grad_w;
+    }
+    conv2d_backward_weight_kernel<<<C_out * C_in, CONV_WGRAD_THREADS>>>(x->data, grad_out->data, grad_w->data, B, C_in, H, W, K, C_out,
                                                      H_out, W_out, meta->padding, meta->stride);
     CUDA_CHECK(cudaDeviceSynchronize());
     return grad_w;
@@ -190,9 +192,7 @@ Tensor *conv2d_backward_bias(Tensor *bias, Tensor *ctx, Tensor *grad_out) {
     int shape[1] = {C_out};
     Tensor *grad_b = tensor_create(1, shape, 0);
 
-    int block = 256;
-    int grid = (C_out + block - 1) / block;
-    conv2d_bias_grad_kernel<<<grid, block>>>(grad_out->data, grad_b->data, B, C_out, H_out, W_out);
+    conv2d_bias_grad_kernel<<<C_out, CONV_WGRAD_THREADS>>>(grad_out->data, grad_b->data, B, C_out, H_out, W_out);
     CUDA_CHECK(cudaDeviceSynchronize());
     return grad_b;
 }

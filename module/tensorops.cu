@@ -229,6 +229,42 @@ Tensor *tensor_flatten_backward(Tensor *x, Tensor *ctx, Tensor *grad_out) {
     return grad_x;
 }
 
+static __global__ void tensor_add_kernel(const float *a, const float *b, float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+}
+
+Tensor *tensor_add(Tensor *a, Tensor *b) {
+    if (a->ndim != b->ndim) {
+        printf("tensor_add: rank mismatch (%d vs %d).\n", a->ndim, b->ndim);
+        return NULL;
+    }
+    for (int i = 0; i < a->ndim; ++i) {
+        if (a->shape[i] != b->shape[i]) {
+            printf("tensor_add: shape mismatch in dimension %d (%d vs %d).\n", i, a->shape[i], b->shape[i]);
+            return NULL;
+        }
+    }
+    int n = tensor_numel(a->ndim, a->shape);
+    Tensor *out = tensor_create(a->ndim, a->shape, a->requires_grad || b->requires_grad);
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    tensor_add_kernel<<<grid, block>>>(a->data, b->data, out->data, n);
+    cudaDeviceSynchronize();
+
+    if (a->requires_grad) tensor_add_dependency(out, a, tensor_add_backward);
+    if (b->requires_grad) tensor_add_dependency(out, b, tensor_add_backward);
+    return out;
+}
+
+Tensor *tensor_add_backward(Tensor *x, Tensor *ctx, Tensor *grad_out) {
+    (void)ctx;
+    int n = tensor_numel(x->ndim, x->shape);
+    Tensor *grad_x = tensor_create(x->ndim, x->shape, 0);
+    cudaMemcpy(grad_x->data, grad_out->data, sizeof(float) * n, cudaMemcpyDeviceToDevice);
+    return grad_x;
+}
+
 static void tensor_print_graph_dot_rec(Tensor *self) {
     if (!self) return;
     printf("  \"%p\" [label=\"Tensor %p\"];\n", self, self);

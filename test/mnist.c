@@ -11,7 +11,7 @@ static unsigned int read_be_u32(FILE *f) {
 
 int mnist_load(const char *images_path, const char *labels_path, MnistData *out) {
     FILE *f_img = NULL, *f_lbl = NULL;
-    unsigned int magic, n_images, rows, cols, n_labels;
+    unsigned int magic, n_images, rows, cols, channels = 1, n_labels;
     unsigned char *raw_pixels = NULL, *raw_labels = NULL;
     long n;
     int i;
@@ -33,13 +33,20 @@ int mnist_load(const char *images_path, const char *labels_path, MnistData *out)
     }
 
     magic = read_be_u32(f_img);
-    if (magic != 0x00000803u) {
+    /* 0x803: the classic 3-dim IDX (count, rows, cols). 0x804: this project's colour variant, 4 dims
+     * (count, channels, rows, cols), each image stored channel by channel. */
+    if (magic != 0x00000803u && magic != 0x00000804u) {
         fprintf(stderr, "mnist_load: bad image magic 0x%08x in %s\n", magic, images_path);
         goto fail;
     }
     n_images = read_be_u32(f_img);
+    if (magic == 0x00000804u) channels = read_be_u32(f_img);
     rows = read_be_u32(f_img);
     cols = read_be_u32(f_img);
+    if (channels < 1 || channels > 3 || rows < 1 || cols < 1 || rows > 4096 || cols > 4096) {
+        fprintf(stderr, "mnist_load: unsupported image dimensions in %s\n", images_path);
+        goto fail;
+    }
 
     magic = read_be_u32(f_lbl);
     if (magic != 0x00000801u) {
@@ -53,7 +60,7 @@ int mnist_load(const char *images_path, const char *labels_path, MnistData *out)
         goto fail;
     }
 
-    n = (long)n_images * (long)rows * (long)cols;
+    n = (long)n_images * (long)channels * (long)rows * (long)cols;
     raw_pixels = (unsigned char *)malloc((size_t)n);
     raw_labels = (unsigned char *)malloc((size_t)n_images);
     if (!raw_pixels || !raw_labels) {
@@ -87,6 +94,7 @@ int mnist_load(const char *images_path, const char *labels_path, MnistData *out)
     out->count = (int)n_images;
     out->rows = (int)rows;
     out->cols = (int)cols;
+    out->channels = (int)channels;
 
     free(raw_pixels);
     free(raw_labels);

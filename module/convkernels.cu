@@ -62,34 +62,50 @@ __global__ void conv2d_backward_input_kernel(const float *grad_y, const float *w
     grad_x[x_idx] = acc;
 }
 
+/* One block per (c_out, c_in) pair, CONV_WGRAD_THREADS threads: every thread walks a strided share
+ * of the (b, out_y, out_x) positions - consecutive threads on consecutive out_x, so the loads
+ * coalesce - and keeps one partial sum per kernel tap; the partials are then reduced across the
+ * block. (The first version used K*K threads per block, each walking every position serially.) */
+#define CONV_WGRAD_MAX_TAPS 49
 __global__ void conv2d_backward_weight_kernel(const float *x, const float *grad_y, float *grad_w, int B, int C_in,
                                                int H, int W, int K, int C_out, int H_out, int W_out, int padding,
                                                int stride) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int co_ci = blockIdx.z;  // flattened (c_out, c_in)
-    if (j >= K || i >= K) return;
-
+    __shared__ float sh[CONV_WGRAD_THREADS];
+    int co_ci = blockIdx.x;  // flattened (c_out, c_in)
     int c_out = co_ci / C_in;
     int c_in = co_ci % C_in;
+    int taps = K * K;
+    int positions = B * H_out * W_out;
 
-    float acc = 0.0f;
-    for (int b = 0; b < B; ++b) {
-        for (int out_y = 0; out_y < H_out; ++out_y) {
-            for (int out_x = 0; out_x < W_out; ++out_x) {
-                int in_y = out_y * stride - padding + i;
+    float acc[CONV_WGRAD_MAX_TAPS];
+    for (int t = 0; t < taps; ++t) acc[t] = 0.0f;
+
+    for (int p = threadIdx.x; p < positions; p += blockDim.x) {
+        int out_x = p % W_out;
+        int out_y = (p / W_out) % H_out;
+        int b = p / (W_out * H_out);
+        float gy = grad_y[((b * C_out + c_out) * H_out + out_y) * W_out + out_x];
+        const float *xp = x + (size_t)(b * C_in + c_in) * H * W;
+        for (int i = 0; i < K; ++i) {
+            int in_y = out_y * stride - padding + i;
+            if (in_y < 0 || in_y >= H) continue;
+            for (int j = 0; j < K; ++j) {
                 int in_x = out_x * stride - padding + j;
-                if (in_y >= 0 && in_y < H && in_x >= 0 && in_x < W) {
-                    int x_idx = ((b * C_in + c_in) * H + in_y) * W + in_x;
-                    int gy_idx = ((b * C_out + c_out) * H_out + out_y) * W_out + out_x;
-                    acc += x[x_idx] * grad_y[gy_idx];
-                }
+                if (in_x >= 0 && in_x < W) acc[i * K + j] += xp[in_y * W + in_x] * gy;
             }
         }
     }
 
-    int w_idx = ((c_out * C_in + c_in) * K + i) * K + j;
-    grad_w[w_idx] = acc;
+    for (int t = 0; t < taps; ++t) {
+        sh[threadIdx.x] = acc[t];
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) grad_w[(size_t)co_ci * taps + t] = sh[0];
+        __syncthreads();
+    }
 }
 
 __global__ void conv2d_add_bias_kernel(float *y, const float *bias, int B, int C_out, int H_out, int W_out) {
@@ -102,17 +118,22 @@ __global__ void conv2d_add_bias_kernel(float *y, const float *bias, int B, int C
     y[idx] += bias[c];
 }
 
+/* One block per output channel; the block's threads split the B * H_out * W_out values and reduce. */
 __global__ void conv2d_bias_grad_kernel(const float *grad_y, float *grad_bias, int B, int C_out, int H_out,
                                          int W_out) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= C_out) return;
-
+    __shared__ float sh[CONV_WGRAD_THREADS];
+    int c = blockIdx.x;
     int hw = H_out * W_out;
     float sum = 0.0f;
-    for (int b = 0; b < B; ++b) {
-        for (int k = 0; k < hw; ++k) {
-            sum += grad_y[(b * C_out + c) * hw + k];
-        }
+    for (int i = threadIdx.x; i < B * hw; i += blockDim.x) {
+        int b = i / hw, k = i % hw;
+        sum += grad_y[((size_t)b * C_out + c) * hw + k];
     }
-    grad_bias[c] = sum;
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_bias[c] = sh[0];
 }
