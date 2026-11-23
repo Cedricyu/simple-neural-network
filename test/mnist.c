@@ -18,6 +18,7 @@ int mnist_load(const char *images_path, const char *labels_path, MnistData *out)
 
     out->images = NULL;
     out->labels = NULL;
+    out->masks = NULL;
     out->count = 0;
 
     f_img = fopen(images_path, "rb");
@@ -110,10 +111,33 @@ fail:
     return -1;
 }
 
+int mnist_load_masks(const char *masks_path, MnistData *data) {
+    FILE *f = fopen(masks_path, "rb");
+    if (!f) return -1;
+    unsigned int magic = read_be_u32(f), n = read_be_u32(f), rows = read_be_u32(f), cols = read_be_u32(f);
+    if (magic != 0x00000803u || (int)n != data->count || (int)rows != data->rows || (int)cols != data->cols) {
+        fclose(f);
+        return -1;
+    }
+    size_t bytes = (size_t)n * rows * cols;
+    unsigned char *m = (unsigned char *)malloc(bytes);
+    if (!m || fread(m, 1, bytes, f) != bytes) {
+        free(m);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    free(data->masks);
+    data->masks = m;
+    return 0;
+}
+
 void mnist_free(MnistData *data) {
     if (!data) return;
     free(data->images);
     free(data->labels);
+    free(data->masks);
+    data->masks = NULL;
     data->images = NULL;
     data->labels = NULL;
     data->count = 0;

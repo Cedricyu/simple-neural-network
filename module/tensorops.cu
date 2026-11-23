@@ -221,6 +221,18 @@ Tensor *tensor_flatten(Tensor *x) {
     return out;
 }
 
+Tensor *tensor_reshape4(Tensor *x, int c, int h, int w) {
+    int batch = x->shape[0];
+    if (tensor_numel(x->ndim, x->shape) / batch != c * h * w) {
+        printf("tensor_reshape4: %d values per sample do not fit %dx%dx%d.\n", tensor_numel(x->ndim, x->shape) / batch, c, h, w);
+        return NULL;
+    }
+    int shape[4] = {batch, c, h, w};
+    Tensor *out = tensor_from_device(x->data, 4, shape, x->requires_grad);
+    if (x->requires_grad) tensor_add_dependency(out, x, tensor_flatten_backward); /* same copy-back as flatten */
+    return out;
+}
+
 Tensor *tensor_flatten_backward(Tensor *x, Tensor *ctx, Tensor *grad_out) {
     (void)ctx;
     int n = tensor_numel(x->ndim, x->shape);
@@ -263,6 +275,54 @@ Tensor *tensor_add_backward(Tensor *x, Tensor *ctx, Tensor *grad_out) {
     Tensor *grad_x = tensor_create(x->ndim, x->shape, 0);
     cudaMemcpy(grad_x->data, grad_out->data, sizeof(float) * n, cudaMemcpyDeviceToDevice);
     return grad_x;
+}
+
+/* Copies `count` channels of a (B, src_c, HW) tensor starting at src_off into a (B, dst_c, HW) tensor at
+ * dst_off, for every batch item. */
+static __global__ void channel_copy_kernel(const float *src, float *dst, int B, int src_c, int src_off, int dst_c,
+                                           int dst_off, int count, int HW) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B * count * HW) return;
+    int p = i % HW, c = (i / HW) % count, b = i / (HW * count);
+    dst[((size_t)b * dst_c + dst_off + c) * HW + p] = src[((size_t)b * src_c + src_off + c) * HW + p];
+}
+
+static void channel_copy(const Tensor *src, int src_off, Tensor *dst, int dst_off, int count) {
+    int B = src->shape[0], HW = src->shape[2] * src->shape[3];
+    int n = B * count * HW;
+    channel_copy_kernel<<<(n + 255) / 256, 256>>>(src->data, dst->data, B, src->shape[1], src_off, dst->shape[1],
+                                                  dst_off, count, HW);
+}
+
+Tensor *tensor_concat_channels(Tensor *a, Tensor *b) {
+    if (a->ndim != 4 || b->ndim != 4 || a->shape[0] != b->shape[0] || a->shape[2] != b->shape[2] ||
+        a->shape[3] != b->shape[3]) {
+        printf("tensor_concat_channels: need two (B, C, H, W) tensors with the same B, H and W.\n");
+        return NULL;
+    }
+    int shape[4] = {a->shape[0], a->shape[1] + b->shape[1], a->shape[2], a->shape[3]};
+    Tensor *out = tensor_create(4, shape, a->requires_grad || b->requires_grad);
+    channel_copy(a, 0, out, 0, a->shape[1]);
+    channel_copy(b, 0, out, a->shape[1], b->shape[1]);
+    cudaDeviceSynchronize();
+    if (a->requires_grad) tensor_add_dependency_with_ctx(out, a, b, tensor_concat_backward_first);
+    if (b->requires_grad) tensor_add_dependency_with_ctx(out, b, a, tensor_concat_backward_second);
+    return out;
+}
+
+Tensor *tensor_concat_backward_first(Tensor *a, Tensor *b, Tensor *grad_out) {
+    (void)b;
+    Tensor *grad_a = tensor_create(a->ndim, a->shape, 0);
+    channel_copy(grad_out, 0, grad_a, 0, a->shape[1]);
+    cudaDeviceSynchronize();
+    return grad_a;
+}
+
+Tensor *tensor_concat_backward_second(Tensor *b, Tensor *a, Tensor *grad_out) {
+    Tensor *grad_b = tensor_create(b->ndim, b->shape, 0);
+    channel_copy(grad_out, a->shape[1], grad_b, 0, b->shape[1]);
+    cudaDeviceSynchronize();
+    return grad_b;
 }
 
 static void tensor_print_graph_dot_rec(Tensor *self) {

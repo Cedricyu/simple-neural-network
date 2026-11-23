@@ -41,6 +41,9 @@ struct Tensor {
 
     // Momentum buffer for tensor_update_momentum (device memory, lazily allocated, freed by tensor_free).
     float_t *velocity;
+
+    // Adam's second-moment buffer (the first moment lives in `velocity`); lazily allocated, freed by tensor_free.
+    float_t *adam_v;
 };
 
 // Device memory pool. Every op allocates its output (and every backward its gradient) afresh each
@@ -71,6 +74,9 @@ void tensor_grad(Tensor *t, Tensor *grad);
 void tensor_update(Tensor *t, float lr);
 // SGD with classical momentum: v = momentum*v + grad; w -= lr*v. momentum <= 0 is plain tensor_update.
 void tensor_update_momentum(Tensor *t, float lr, float momentum);
+// Adam (Kingma & Ba): m = b1*m + (1-b1)*g; v = b2*v + (1-b2)*g^2; w -= lr * (m/(1-b1^step)) / (sqrt(v/(1-b2^step)) + eps).
+// `step` counts optimizer steps from 1 (it drives the bias correction), shared by every tensor of a model.
+void tensor_update_adam(Tensor *t, float lr, float beta1, float beta2, float eps, int step);
 
 #ifdef __cplusplus
 }

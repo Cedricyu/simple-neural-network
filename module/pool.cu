@@ -74,11 +74,63 @@ __global__ void gap_backward_kernel(const float *dy, float *dx, int BC, int HW) 
     dx[i] = dy[i / HW] / (float)HW;
 }
 
+/* one thread per output value */
+__global__ void upsample_forward_kernel(const float *x, float *y, int BC, int H, int W, int f) {
+    int Ho = H * f, Wo = W * f;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= BC * Ho * Wo) return;
+    int wo = i % Wo, ho = (i / Wo) % Ho, bc = i / (Wo * Ho);
+    y[i] = x[(bc * H + ho / f) * W + wo / f];
+}
+
+/* one thread per INPUT value: sums its f x f block of the gradient, so no atomics are needed */
+__global__ void upsample_backward_kernel(const float *dy, float *dx, int BC, int H, int W, int f) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= BC * H * W) return;
+    int w = i % W, h = (i / W) % H, bc = i / (W * H);
+    int Wo = W * f, Ho = H * f;
+    float sum = 0.0f;
+    for (int dy_ = 0; dy_ < f; ++dy_)
+        for (int dx_ = 0; dx_ < f; ++dx_) sum += dy[(bc * Ho + h * f + dy_) * Wo + w * f + dx_];
+    dx[i] = sum;
+}
+
 }  // namespace
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+Tensor *upsample_nearest_forward(Tensor *x, int factor) {
+    if (x->ndim != 4 || factor < 1) {
+        printf("upsample_nearest_forward needs a 4D tensor and factor >= 1.\n");
+        return NULL;
+    }
+    int B = x->shape[0], C = x->shape[1], H = x->shape[2], W = x->shape[3];
+    int shape[4] = {B, C, H * factor, W * factor};
+    Tensor *y = tensor_create(4, shape, x->requires_grad);
+    int n = B * C * H * factor * W * factor;
+    upsample_forward_kernel<<<(n + 255) / 256, 256>>>(x->data, y->data, B * C, H, W, factor);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (x->requires_grad) {
+        PoolMeta *meta = (PoolMeta *)malloc(sizeof(PoolMeta));
+        meta->kernel = factor;
+        meta->stride = factor;
+        y->meta = meta;
+        tensor_add_dependency_with_ctx(y, x, y, upsample_nearest_backward);
+    }
+    return y;
+}
+
+Tensor *upsample_nearest_backward(Tensor *x, Tensor *out, Tensor *grad_out) {
+    PoolMeta *meta = (PoolMeta *)out->meta;
+    int B = x->shape[0], C = x->shape[1], H = x->shape[2], W = x->shape[3];
+    Tensor *grad_x = tensor_create(4, x->shape, 0);
+    int n = B * C * H * W;
+    upsample_backward_kernel<<<(n + 255) / 256, 256>>>(grad_out->data, grad_x->data, B * C, H, W, meta->kernel);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return grad_x;
+}
 
 Tensor *maxpool2d_forward(Tensor *x, int kernel, int stride) {
     if (x->ndim != 4) {

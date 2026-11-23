@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 #include "tensor.cuh"
@@ -79,6 +80,19 @@ __global__ void tensor_momentum_step_kernel(float *w, const float *g, float *v, 
     }
 }
 
+__global__ void tensor_adam_step_kernel(float *w, const float *g, float *m, float *v, float lr, float b1, float b2, float eps,
+                                        float corr1, float corr2, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float gi = g[i];
+        float mi = b1 * m[i] + (1.0f - b1) * gi;
+        float vi = b2 * v[i] + (1.0f - b2) * gi * gi;
+        m[i] = mi;
+        v[i] = vi;
+        w[i] -= lr * (mi / corr1) / (sqrtf(vi / corr2) + eps);
+    }
+}
+
 __global__ void tensor_sgd_step_kernel(float *w, const float *g, float lr, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) w[i] -= lr * g[i];
@@ -102,6 +116,7 @@ Tensor *tensor_create(int ndim, int *shape, int requires_grad) {
     t->num_deps = 0;
     t->meta = NULL;
     t->velocity = NULL;
+    t->adam_v = NULL;
 
     t->shape = (int *)malloc(sizeof(int) * ndim);
     memcpy(t->shape, shape, sizeof(int) * ndim);
@@ -145,6 +160,7 @@ Tensor *tensor_from_device(float *device_data, int ndim, int *shape, int require
     t->num_deps = 0;
     t->meta = NULL;
     t->velocity = NULL;
+    t->adam_v = NULL;
 
     t->shape = (int *)malloc(sizeof(int) * ndim);
     memcpy(t->shape, shape, sizeof(int) * ndim);
@@ -308,10 +324,31 @@ void tensor_update_momentum(Tensor *t, float lr, float momentum) {
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+void tensor_update_adam(Tensor *t, float lr, float beta1, float beta2, float eps, int step) {
+    if (!t || !t->requires_grad || !t->grad) return;
+    int n = tensor_numel(t->ndim, t->shape);
+    if (!t->velocity) {
+        t->velocity = (float_t *)tensor_pool_alloc(n * sizeof(float_t));
+        CUDA_CHECK(cudaMemset(t->velocity, 0, n * sizeof(float_t)));
+    }
+    if (!t->adam_v) {
+        t->adam_v = (float_t *)tensor_pool_alloc(n * sizeof(float_t));
+        CUDA_CHECK(cudaMemset(t->adam_v, 0, n * sizeof(float_t)));
+    }
+    if (step < 1) step = 1;
+    float corr1 = (float)(1.0 - pow((double)beta1, (double)step));
+    float corr2 = (float)(1.0 - pow((double)beta2, (double)step));
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    tensor_adam_step_kernel<<<grid, block>>>(t->data, t->grad, t->velocity, t->adam_v, lr, beta1, beta2, eps, corr1, corr2, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 void tensor_free(Tensor *t) {
     if (!t) return;
     size_t bytes = (size_t)tensor_numel(t->ndim, t->shape) * sizeof(float_t);
     if (t->velocity) tensor_pool_free(t->velocity, bytes);
+    if (t->adam_v) tensor_pool_free(t->adam_v, bytes);
     if (t->owns_grad && t->grad) tensor_pool_free(t->grad, bytes);
     if (t->owns_data && t->data) tensor_pool_free(t->data, bytes);
     if (t->shape) free(t->shape);
