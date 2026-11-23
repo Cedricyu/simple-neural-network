@@ -1,8 +1,10 @@
 # === Config ===
 NVCC      = nvcc
 CC        = gcc
-CFLAGS    = -I./module -I./optimizer -I./tool -I./test
-NVCCFLAGS = -I./module -I./optimizer -I./tool -I./test
+# -MMD writes a .d file next to every object listing the headers it included, so changing a header
+# (a struct layout, say) rebuilds everything that uses it instead of silently mixing old and new objects.
+CFLAGS    = -I./module -I./optimizer -I./tool -I./test -MMD -MP
+NVCCFLAGS = -I./module -I./optimizer -I./tool -I./test -MMD
 LDFLAGS   = -lm
 
 # === Directories ===
@@ -93,6 +95,8 @@ train_gui: $(WORKER_EXEC) $(VIEWER_EXEC)
 
 format:
 	clang-format -i $(MODULE_SRC) $(OPT_SRC) $(TOOL_CU_SRC) $(ALL_TEST_SRC)
+
+-include $(wildcard $(OBJ_DIR)/*.d)
 
 clean:
 	rm -rf $(OBJ_DIR) $(EXEC) $(WORKER_EXEC) $(VIEWER_EXEC) $(TEST_DIR)/*.o

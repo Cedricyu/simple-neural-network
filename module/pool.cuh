@@ -17,6 +17,11 @@ Tensor *maxpool2d_backward(Tensor *x, Tensor *out, Tensor *grad_out);
 Tensor *global_avg_pool_forward(Tensor *x);
 Tensor *global_avg_pool_backward(Tensor *x, Tensor *ctx, Tensor *grad_out);
 
+/* (B, C, H, W) -> (B, C, H*factor, W*factor): every value is repeated into a factor x factor block.
+ * Backward sums each block, which is the gradient of repeating. */
+Tensor *upsample_nearest_forward(Tensor *x, int factor);
+Tensor *upsample_nearest_backward(Tensor *x, Tensor *out, Tensor *grad_out);
+
 #ifdef __cplusplus
 }
 #endif
