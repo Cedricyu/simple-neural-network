@@ -36,14 +36,14 @@
  * framework's CUDA_CHECK() exits the whole process on any CUDA failure
  * (including out-of-memory), so a config that can't fit must be rejected up
  * front with a readable message rather than discovered mid-run. */
-#define MAX_BLOCKS 32
+#define MAX_BLOCKS 48
 #define MAX_VIZ_LAYERS 16 /* conv + linear blocks: the layers that have weights to show */
 #define MAX_CONV_CHANNELS 64
 #define MAX_KERNEL 7
 #define MAX_STRIDE 4
 #define MAX_PADDING 3
 #define MAX_POOL 4 /* max-pool kernel and stride */
-#define MAX_FC_WIDTH 1024
+#define MAX_FC_WIDTH 4096
 #define MAX_BATCH 512
 #define MAX_EPOCHS 1000
 #define MAX_FC_WEIGHTS 4194304         /* in*out floats per Linear (16MB) */
@@ -63,11 +63,23 @@
 #define BLK_BATCHNORM 6 /* per-channel normalization with learned scale and shift; any shape */
 #define BLK_MAXPOOL 7   /* a = window, b = stride; needs an image */
 #define BLK_GAP 8       /* global average pool: (C,H,W) -> C values (already flat); needs an image */
+#define BLK_UPSAMPLE 9  /* a = factor 1-4: repeats every pixel into a factor x factor block; needs an image */
+#define BLK_CONCAT 10   /* in[0] and in[1] joined along the channels: same height and width, channels add up */
+#define BLK_RESHAPE 11  /* a,b,c = channels, height, width: a flat input of exactly a*b*c values becomes a feature map */
+#define BLK_REPARAM 12  /* the VAE sampling step: a flat input of 2*Z values (mu, logvar) -> Z values; f = KL weight */
+
+#define OPT_SGD 0
+#define OPT_ADAM 1
+
+#define TASK_CLASSIFY 0
+#define TASK_SEGMENT 1
+#define TASK_GENERATE 2 /* a VAE: reconstruct the input (labels are not used); chosen by having a reparam block */
 
 typedef struct Block {
     int type;
     int a, b, c, d;
-    int in[2]; /* tensor ids this block reads; in[1] is only used by BLK_ADD (else -1) */
+    int in[2]; /* tensor ids this block reads; in[1] is only used by BLK_ADD / BLK_CONCAT (else -1) */
+    float f;   /* BLK_REPARAM: weight of the KL term in the loss (the "beta" of a beta-VAE) */
 } Block;
 
 typedef struct TrainConfig {
@@ -84,6 +96,8 @@ typedef struct TrainConfig {
     float momentum;   /* SGD momentum, 0 = plain SGD */
     int normalize;    /* 1 = standardize pixels to zero mean / unit variance (dataset statistics) */
     int augment;      /* 0 = none, 1 = random horizontal + vertical flips, 2 = random horizontal flip + shift by up to 4 px */
+    int optimizer;    /* OPT_SGD (momentum applies) or OPT_ADAM (betas 0.9 / 0.999; momentum is ignored) */
+    int task;         /* TASK_CLASSIFY: one label per image | TASK_SEGMENT: one class per pixel (the dataset has masks) */
     int n_blocks;
     Block blocks[MAX_BLOCKS];
 } TrainConfig;
@@ -125,6 +139,10 @@ static inline const char *train_block_type_name(int type) {
     case BLK_BATCHNORM: return "batchnorm";
     case BLK_MAXPOOL: return "maxpool";
     case BLK_GAP: return "gap";
+    case BLK_UPSAMPLE: return "upsample";
+    case BLK_CONCAT: return "concat";
+    case BLK_RESHAPE: return "reshape";
+    case BLK_REPARAM: return "reparam";
     default: return "?";
     }
 }
@@ -174,10 +192,14 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
         return train_cfg_fail(err, errsz, "the dataset must have 2-%d classes", MAX_CLASSES, 0);
     if (!(c->momentum >= 0.0f) || c->momentum > 0.99f || !isfinite(c->momentum))
         return train_cfg_fail(err, errsz, "momentum must be a number in [0, 0.99]", 0, 0);
+    if (c->optimizer != OPT_SGD && c->optimizer != OPT_ADAM)
+        return train_cfg_fail(err, errsz, "optimizer must be 0 (SGD) or 1 (Adam)", 0, 0);
     if (c->normalize != 0 && c->normalize != 1)
         return train_cfg_fail(err, errsz, "normalize must be 0 or 1", 0, 0);
     if (c->augment < 0 || c->augment > 2)
         return train_cfg_fail(err, errsz, "augment must be 0, 1 or 2", 0, 0);
+    if (c->task != TASK_CLASSIFY && c->task != TASK_SEGMENT && c->task != TASK_GENERATE)
+        return train_cfg_fail(err, errsz, "unknown task", 0, 0);
     if (c->img_c < 1 || c->img_c > MAX_IMG_CH)
         return train_cfg_fail(err, errsz, "image channels must be 1-%d", MAX_IMG_CH, 0);
     if (c->batch_size < 2) {
@@ -190,7 +212,7 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
 
     double act_floats = (double)c->img_h * c->img_w * c->img_c;
     LayerShape cur = s->input;
-    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0;
+    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0, n_rep = 0, rep_id = -1;
     int uses[MAX_BLOCKS + 1] = {0};
     for (int i = 0; i < c->n_blocks; ++i) {
         const Block *b = &c->blocks[i];
@@ -199,6 +221,10 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
             return train_cfg_fail(err, errsz, "block %d has no valid input wire", i + 1, 0);
         cur = train_node_shape(s, b->in[0]);
         uses[b->in[0]]++;
+        /* VAE: everything after the sampling step may only read the latent (so the decoder can be run on
+         * its own, from a random z) */
+        if (rep_id >= 0 && (b->in[0] < rep_id || ((b->type == BLK_ADD || b->type == BLK_CONCAT) && b->in[1] >= 0 && b->in[1] < rep_id)))
+            return train_cfg_fail(err, errsz, "block %d comes after the vae sampling step but reads the encoder", i + 1, 0);
         switch (b->type) {
         case BLK_CONV: {
             n_conv++;
@@ -293,6 +319,64 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
             act_floats += (double)cur.c * cur.h * cur.w;
             break;
         }
+        case BLK_UPSAMPLE:
+            n_up++;
+            if (cur.flat) return train_cfg_fail(err, errsz, "upsample%d: needs an image input", n_up, 0);
+            if (b->a < 1 || b->a > 4) return train_cfg_fail(err, errsz, "upsample%d: factor must be 1-4", n_up, 0);
+            cur.h *= b->a;
+            cur.w *= b->a;
+            if (cur.h > 4 * MAX_IMG_SIDE || cur.w > 4 * MAX_IMG_SIDE)
+                return train_cfg_fail(err, errsz, "upsample%d: the result is too large", n_up, 0);
+            act_floats += (double)cur.c * cur.h * cur.w;
+            break;
+        case BLK_CONCAT: {
+            n_cat++;
+            if (b->in[1] < 0 || b->in[1] > i)
+                return train_cfg_fail(err, errsz, "concat%d: wire both inputs", n_cat, 0);
+            if (b->in[1] == b->in[0])
+                return train_cfg_fail(err, errsz, "concat%d: both inputs are the same tensor", n_cat, 0);
+            uses[b->in[1]]++;
+            LayerShape other = train_node_shape(s, b->in[1]);
+            if (cur.flat || other.flat)
+                return train_cfg_fail(err, errsz, "concat%d: needs two images", n_cat, 0);
+            if (cur.h != other.h || cur.w != other.w) {
+                if (err && errsz)
+                    snprintf(err, errsz, "concat%d: sizes differ (%dx%d vs %dx%d) - upsample or pool one of them", n_cat,
+                             cur.h, cur.w, other.h, other.w);
+                return -1;
+            }
+            cur.c += other.c;
+            act_floats += (double)cur.c * cur.h * cur.w;
+            break;
+        }
+        case BLK_RESHAPE:
+            if (!cur.flat) return train_cfg_fail(err, errsz, "reshape: needs a flat input (an fc output)", 0, 0);
+            if (b->a < 1 || b->b < 1 || b->c < 1 || b->a > 256 || b->b > 4 * MAX_IMG_SIDE || b->c > 4 * MAX_IMG_SIDE)
+                return train_cfg_fail(err, errsz, "reshape: channels / height / width out of range", 0, 0);
+            if ((double)b->a * b->b * b->c != (double)cur.c) {
+                if (err && errsz)
+                    snprintf(err, errsz, "reshape: %d values cannot become %dx%dx%d (= %d)", cur.c, b->b, b->c, b->a,
+                             b->a * b->b * b->c);
+                return -1;
+            }
+            cur.c = b->a;
+            cur.h = b->b;
+            cur.w = b->c;
+            cur.flat = 0;
+            act_floats += (double)cur.c * cur.h * cur.w;
+            break;
+        case BLK_REPARAM:
+            n_rep++;
+            rep_id = i + 1;
+            if (!cur.flat || cur.c % 2 != 0 || cur.c < 2)
+                return train_cfg_fail(err, errsz, "reparam: needs a flat input of 2*Z values (mean and log-variance)", 0, 0);
+            if (cur.c / 2 > 256) return train_cfg_fail(err, errsz, "reparam: the latent can have at most %d values", 256, 0);
+            if (!(b->f >= 0.0f) || b->f > 1000.0f || !isfinite(b->f))
+                return train_cfg_fail(err, errsz, "reparam: the KL weight must be a number in [0, 1000]", 0, 0);
+            if (n_rep > 1) return train_cfg_fail(err, errsz, "a model can have only one reparam block", 0, 0);
+            cur.c /= 2;
+            act_floats += (double)cur.c * 3;
+            break;
         case BLK_GAP:
             if (cur.flat) return train_cfg_fail(err, errsz, "gap: needs an image input", 0, 0);
             cur.h = cur.w = 1;
@@ -317,7 +401,24 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
         }
     }
     s->err_block = c->n_blocks > 0 ? c->n_blocks - 1 : -1;
-    if (c->n_blocks == 0 || !cur.flat || cur.c != c->num_classes)
+    if (n_rep > 0 && c->task != TASK_GENERATE)
+        return train_cfg_fail(err, errsz, "a vae block makes this a generation problem - switch the problem (top left) to Generation, or remove the block", 0, 0);
+    if (c->task == TASK_GENERATE) {
+        if (n_rep != 1) return train_cfg_fail(err, errsz, "a generation problem needs exactly one vae block", 0, 0);
+        if (cur.flat || cur.c != s->input.c || cur.h != s->input.h || cur.w != s->input.w) {
+            if (err && errsz)
+                snprintf(err, errsz, "the decoder must end with a %dx%dx%d image (the input's size) to reconstruct it",
+                         s->input.h, s->input.w, s->input.c);
+            return -1;
+        }
+    } else if (c->task == TASK_SEGMENT) {
+        if (c->n_blocks == 0 || cur.flat || cur.c != c->num_classes || cur.h != c->img_h || cur.w != c->img_w) {
+            if (err && errsz)
+                snprintf(err, errsz, "segmentation: the model must end with a %dx%dx%d map (one score per class per pixel)",
+                         c->img_h, c->img_w, c->num_classes);
+            return -1;
+        }
+    } else if (c->n_blocks == 0 || !cur.flat || cur.c != c->num_classes)
         return train_cfg_fail(err, errsz, "the model must end with a Linear block with out=%d (one value per class)",
                               c->num_classes, 0);
     s->err_block = -1;
@@ -341,9 +442,54 @@ typedef struct MsgHeader {
 } MsgHeader;
 
 #define MSG_MODEL 1    /* ModelInfo - sent once at the start of every run */
-#define MSG_PROGRESS 2 /* Progress, then img_h*img_w pixel bytes, then (if has_weights) info.total_floats floats */
+#define MSG_PROGRESS 2 /* Progress, then train_sample_bytes() of sample pixels, then (if has_weights) info.total_floats floats */
 #define MSG_ERROR 3    /* char[]: a NUL-terminated human-readable reason */
+#define MSG_GENERATED 5 /* GenHeader, then the images listed there (img_c*img_h*img_w bytes each); sent after every epoch */
+#define MSG_PREDICTIONS 4 /* PredHeader, then n x (PredSample + train_sample_bytes() of pixels / masks); sent after every epoch */
 #define MSG_MAX_BYTES (16u * 1024u * 1024u)
+
+/* The picture sent with every progress message: the sample's pixels (img_c planes of img_h x img_w), and for
+ * segmentation also its true mask and the model's predicted mask (class index per pixel, one byte each). */
+static inline size_t train_sample_bytes(const TrainConfig *c) {
+    size_t px = (size_t)c->img_h * c->img_w;
+    if (c->task == TASK_GENERATE) return 2 * px * (size_t)c->img_c; /* the input, then its reconstruction */
+    return px * (size_t)c->img_c + (c->task == TASK_SEGMENT ? 2 * px : 0);
+}
+
+/* What the generative page shows, all drawn with the weights of the epoch that just finished:
+ *   n_recon test images, each followed by its reconstruction (z = mu);
+ *   n_samples images decoded from fixed random z ~ N(0, 1) (the same z every epoch, so you watch them sharpen);
+ *   n_rows interpolations of n_steps images each, between the latents of two test images. */
+#define GEN_RECON 14
+#define GEN_SAMPLES 28
+#define GEN_ROWS 2
+#define GEN_STEPS 14
+typedef struct GenHeader {
+    int epoch;
+    int n_recon, n_samples, n_rows, n_steps;
+    int z_dim;
+    int reserved[2];
+} GenHeader;
+
+/* A fixed set of samples (spread over the test split, or the training split if there is none) that the
+ * worker predicts after every epoch, so the viewer can show "what does the model say about these" at any
+ * time, including after training has finished. */
+#define PRED_MAX_SAMPLES 48 /* classification: 2 pages of 24; segmentation sends 36 (4 pages of 9) */
+typedef struct PredHeader {
+    int n;         /* samples that follow */
+    int epoch;     /* the model that made these predictions had finished this epoch */
+    int from_test; /* 1 = test split, 0 = training split (no test split available) */
+    int reserved;
+} PredHeader;
+
+/* classification: a = true label, b = predicted label, f = confidence of the prediction.
+ * segmentation: a = true foreground pixels, b = predicted foreground pixels, f = this sample's dice
+ * (or -1 when the sample has no foreground and none was predicted). */
+typedef struct PredSample {
+    int a, b;
+    float f;
+    int reserved;
+} PredSample;
 
 /* How the weights viewer draws one layer. conv layers with a single input
  * channel are sent in full; conv layers mixing several input channels send
@@ -384,7 +530,9 @@ typedef struct Progress {
     int pred_label;
     float elapsed;
     int has_weights;
-    float test_acc; /* accuracy on the held-out test split after the latest finished epoch, or -1 if not evaluated yet */
+    float test_acc; /* accuracy on the held-out test split after the latest finished epoch, or -1 if not evaluated yet
+                       (segmentation: the foreground dice instead; acc is the batch's dice) */
+    float test_iou; /* segmentation only: foreground IoU on the test split, or -1 */
 } Progress;
 
 #endif

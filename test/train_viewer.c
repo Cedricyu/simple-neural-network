@@ -31,30 +31,50 @@
 #define LOSS_CLIP 2.5f
 #define MAX_LABEL_W 440
 #define MAX_LABEL_H 32
-#define NUM_LABEL_SLOTS 400  /* main window text, one slot per draw call per frame */
+#define NUM_LABEL_SLOTS 800  /* main window text, one slot per draw call per frame */
 #define NUM_WLABEL_SLOTS 64  /* weights window text */
 
 #define SCREEN_SETUP 0
 #define SCREEN_RUN 1
+#define SCREEN_PRED 2 /* the predictions page */
 
 /* Hit-tested by pump_events() and drawn by the render functions from the same
  * constants so the two can never drift apart. */
-static const SDL_Rect WEIGHTS_BUTTON = {830, 370, 300, 150};
+static const SDL_Rect WEIGHTS_BUTTON = {830, 370, 300, 70};
+static const SDL_Rect PRED_BUTTON = {830, 450, 300, 70};
+static const SDL_Rect BTN_PRED_BACK = {20, 20, 110, 36};
+static const SDL_Rect BTN_PRED_PREV = {1018, 20, 54, 36};
+static const SDL_Rect BTN_PRED_NEXT = {1076, 20, 54, 36};
+static const SDL_Rect BTN_VIEW_PRED = {648, 646, 200, 34}; /* settings screen: jump to the predictions page */
 static const SDL_Rect RESTART_BUTTON = {830, 644, 146, 36};
 static const SDL_Rect SETTINGS_BUTTON = {984, 644, 146, 36};
 
 static const SDL_Rect PANEL_TRAIN = {20, 20, 370, 660};
 static const SDL_Rect PANEL_GRAPH = {410, 20, 720, 546};
 static const SDL_Rect GRAPH_VIEW = {411, 66, 718, 499}; /* the node canvas, below the palette row */
-static const SDL_Rect BTN_ARRANGE = {900, 28, 70, 30};
-static const SDL_Rect BTN_RESET = {976, 28, 50, 30};   /* the plain CNN preset */
-static const SDL_Rect BTN_RESNET = {1032, 28, 88, 30}; /* the mini-ResNet preset */
-#define NUM_PALETTE 8
-static const int PALETTE_TYPES[NUM_PALETTE] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR,
-                                               BLK_ADD,  BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP};
+static const SDL_Rect BTN_ARRANGE = {976, 28, 64, 30};
+static const SDL_Rect BTN_PRESETS = {1046, 28, 76, 30}; /* opens the preset menu below it */
+/* The problem comes first, and is always the user's choice: every decision below it (the task, the blocks on
+ * offer, the presets, the datasets that fit, the training defaults) follows from it. */
+#define PROBLEM_CLASSIFY 0 /* one class per image */
+#define PROBLEM_SEGMENT 1  /* one class per pixel: needs a dataset with masks */
+#define PROBLEM_GENERATE 2 /* a VAE: reconstruct and generate images; needs no labels */
+#define NUM_PRESETS 4      /* ids: 0 cnn, 1 resnet (classification) | 2 unet (segmentation) | 3 vae (generation) */
+static const char *PRESET_NAMES[NUM_PRESETS] = {"cnn", "resnet", "unet", "vae"};
+static const SDL_Rect PROBLEM_BTN[3] = {{36, 21, 107, 31}, {149, 21, 107, 31}, {262, 21, 104, 31}};
+static SDL_Rect preset_rect(int i) {
+    SDL_Rect r = {BTN_PRESETS.x - 54, BTN_PRESETS.y + BTN_PRESETS.h + 4 + i * 30, BTN_PRESETS.w + 54, 28};
+    return r;
+}
+/* Blocks offered per problem: the VAE's view / vae blocks make no sense for classification, and a generator
+ * has no use for global average pooling. */
+static const int PALETTE_CLS[8] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP};
+static const int PALETTE_SEG[7] = {BLK_CONV, BLK_RELU, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT};
+static const int PALETTE_GEN[11] = {BLK_CONV,    BLK_RELU,   BLK_FLATTEN,  BLK_LINEAR,   BLK_ADD,     BLK_BATCHNORM,
+                                    BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT, BLK_RESHAPE, BLK_REPARAM};
 
 static SDL_Rect palette_rect(int i) {
-    SDL_Rect r = {418 + i * 60, 28, 56, 30};
+    SDL_Rect r = {418 + i * 46, 28, 43, 30};
     return r;
 }
 static const SDL_Rect BTN_START = {880, 582, 250, 98};
@@ -86,13 +106,14 @@ typedef struct Field {
     int visible;
 } Field;
 
-enum { F_DATASET, F_EPOCHS, F_BATCH, F_LR, F_MOMENTUM, F_NORMALIZE, F_AUGMENT, F_SEED, F_POOL, F_VIZ, NUM_GENERAL_FIELDS };
+enum { F_DATASET, F_EPOCHS, F_BATCH, F_LR, F_OPT, F_MOMENTUM, F_NORMALIZE, F_AUGMENT, F_SEED, F_POOL, F_VIZ, NUM_GENERAL_FIELDS };
+#define FIELD_PITCH 36 /* vertical distance between the general fields */
 
 /* The model editor: every node may carry up to 4 parameter fields, which live
  * in the same fields[] array as the general ones (index F_NODE(node, j)). A
  * conv node uses j = 0 out channels, 1 kernel, 2 stride, 3 padding; fc: j = 0 out;
  * maxpool: j = 0 window, 1 stride. */
-#define MAX_NODES 40
+#define MAX_NODES 56
 #define F_NODE(i, j) (NUM_GENERAL_FIELDS + (i)*4 + (j))
 #define NUM_FIELDS (NUM_GENERAL_FIELDS + MAX_NODES * 4)
 #define NODE_INPUT 0
@@ -124,6 +145,7 @@ typedef struct Node {
 typedef struct DatasetInfo {
     char name[32]; /* must stay first: the list is sorted with a plain strcmp */
     int count, rows, cols, channels, n_classes;
+    int task; /* TASK_SEGMENT if the folder has train-masks-idx3-ubyte, else TASK_CLASSIFY */
     int has_names;
     char class_names[MAX_CLASSES][CLASS_NAME_LEN];
     int def_epochs, def_batch, def_normalize, def_augment; /* -1 = not given */
@@ -133,12 +155,26 @@ typedef struct DatasetInfo {
 typedef struct Gui {
     SDL_Window *win;
     SDL_Renderer *ren;
+    SDL_Texture *frame_tex; /* the whole UI is drawn here at WIN_W x WIN_H, then scaled once to the window */
     TTF_Font *font;
     TTF_Font *font_big;
     TTF_Font *font_med; /* same size as font, heavier weight: titles */
     TTF_Font *font_small;
     SDL_Texture *digit_tex; /* the current training sample, digit_w x digit_h */
     int digit_w, digit_h, digit_c;
+    SDL_Texture *mask_tex[2]; /* segmentation: true / predicted mask of the shown sample, RGBA, digit_w x digit_h */
+    int preset_open;          /* the preset menu under the presets button is showing */
+    int problem;              /* PROBLEM_CLASSIFY or PROBLEM_GENERATE: chosen first, decides the task, palette and presets */
+
+    /* the latest MSG_PREDICTIONS: a header followed by n records, kept so the page can be opened any time */
+    PredHeader pred_hdr;
+    unsigned char *pred_data;
+    int pred_page;
+    int pred_return; /* screen the predictions page's back button goes to */
+    SDL_Texture *pred_tex[96];
+    GenHeader gen_hdr; /* the latest MSG_GENERATED (a VAE run): n_recon == 0 until the first epoch ends */
+    unsigned char *gen_data;
+    int pred_tex_w, pred_tex_h;
     SDL_Texture *label_tex[NUM_LABEL_SLOTS];
     int slot; /* next free label_tex slot this frame */
     float loss_hist[HISTORY_LEN];
@@ -156,7 +192,12 @@ typedef struct Gui {
     Field fields[NUM_FIELDS];
     int focus; /* index into fields, or -1 */
     Node nodes[MAX_NODES];
-    int pan_x, pan_y;
+    /* The node canvas has its own coordinate space ("view space"): view = (screen - canvas origin) / zoom, and a
+     * node at (x, y) sits at (pan + x, pan + y) in it. The canvas is drawn at native size into canvas_tex and then
+     * scaled to the screen, so zooming scales text, wires and fields together. */
+    float pan_x, pan_y, zoom;
+    float drag_fx, drag_fy; /* sub-pixel remainders while dragging at a zoom other than 1 */
+    SDL_Texture *canvas_tex;
     int drag, drag_node, drag_type, drag_moved, press_x, press_y;
     int chain[MAX_BLOCKS];     /* the node behind each block of form_cfg, in block (evaluation) order */
     int chain_len;
@@ -197,9 +238,45 @@ typedef struct Gui {
     float zoom3d;
 } Gui;
 
+#define ZOOM_MIN 0.35f
+#define ZOOM_MAX 2.0f
+#define CANVAS_TEX_W 2060 /* GRAPH_VIEW.w / ZOOM_MIN, rounded up */
+#define CANVAS_TEX_H 1430
+
+/* Screen position -> canvas view space. */
+static SDL_Point to_view(const Gui *g, int sx, int sy) {
+    SDL_Point v = {(int)floorf((float)(sx - GRAPH_VIEW.x) / g->zoom), (int)floorf((float)(sy - GRAPH_VIEW.y) / g->zoom)};
+    return v;
+}
+/* The part of view space that is on screen: (0,0) to the canvas size / zoom. */
+static SDL_Rect view_rect(const Gui *g) {
+    SDL_Rect r = {0, 0, (int)ceilf((float)GRAPH_VIEW.w / g->zoom), (int)ceilf((float)GRAPH_VIEW.h / g->zoom)};
+    return r;
+}
+
+static int palette_count(const Gui *g) { return g->problem == PROBLEM_GENERATE ? 11 : (g->problem == PROBLEM_SEGMENT ? 7 : 8); }
+static int palette_type(const Gui *g, int i) {
+    return g->problem == PROBLEM_GENERATE ? PALETTE_GEN[i] : (g->problem == PROBLEM_SEGMENT ? PALETTE_SEG[i] : PALETTE_CLS[i]);
+}
+static int preset_count(const Gui *g) { return g->problem == PROBLEM_CLASSIFY ? 2 : 1; }
+static int preset_at(const Gui *g, int i) { return g->problem == PROBLEM_CLASSIFY ? i : (g->problem == PROBLEM_SEGMENT ? 2 : 3); }
+
+/* Segmentation needs masks, so only datasets that have them are offered under that problem. */
+static int ds_fits(const Gui *g, const DatasetInfo *d) { return g->problem != PROBLEM_SEGMENT || d->task == TASK_SEGMENT; }
+/* Indices into g->ds of the datasets the dropdown offers; returns how many. */
+static int ds_visible(const Gui *g, int *idx) {
+    int n = 0;
+    for (int i = 0; i < g->n_datasets; ++i)
+        if (ds_fits(g, &g->ds[i])) idx[n++] = i;
+    return n;
+}
+
 static void close_weights_window(Gui *g);
 
-static int gui_init(Gui *g) {
+/* The UI is laid out for WIN_W x WIN_H. SDL's logical size scales that picture to fit whatever the window or
+ * screen is (keeping the proportions, black bars at the sides) and converts mouse positions back, so the same
+ * layout works windowed, resized and fullscreen. fullscreen = start covering the whole screen. */
+static int gui_init(Gui *g, int fullscreen) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return -1;
@@ -208,14 +285,20 @@ static int gui_init(Gui *g) {
         fprintf(stderr, "TTF_Init failed: %s\n", TTF_GetError());
         return -1;
     }
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear"); /* smooth text when the picture is scaled up */
     g->win = SDL_CreateWindow("tinyDL - training", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIN_W, WIN_H,
-                               SDL_WINDOW_SHOWN);
+                               SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     if (!g->win) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return -1;
     }
     g->ren = SDL_CreateRenderer(g->win, -1, SDL_RENDERER_SOFTWARE);
+    SDL_RenderSetLogicalSize(g->ren, WIN_W, WIN_H);
     SDL_SetRenderDrawBlendMode(g->ren, SDL_BLENDMODE_BLEND);
+    /* Drawing the 1-pixel lines and shadows directly at a non-integer scale leaves them striped; drawing at the
+     * native size into a texture and scaling that with a bilinear filter keeps them smooth. */
+    g->frame_tex = SDL_CreateTexture(g->ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, WIN_W, WIN_H);
+    if (g->frame_tex) SDL_SetTextureScaleMode(g->frame_tex, SDL_ScaleModeLinear);
 
     /* A proportional UI font reads more modern than a monospace one; the first of each list that
      * exists is used (Ubuntu ships with most desktops here, DejaVu nearly everywhere). */
@@ -249,16 +332,24 @@ static int gui_init(Gui *g) {
 static void gui_shutdown(Gui *g) {
     close_weights_window(g);
     if (g->digit_tex) SDL_DestroyTexture(g->digit_tex);
+    for (int k = 0; k < 2; ++k)
+        if (g->mask_tex[k]) SDL_DestroyTexture(g->mask_tex[k]);
     for (int i = 0; i < NUM_LABEL_SLOTS; ++i)
         if (g->label_tex[i]) SDL_DestroyTexture(g->label_tex[i]);
     if (g->font) TTF_CloseFont(g->font);
     if (g->font_big) TTF_CloseFont(g->font_big);
     if (g->font_med) TTF_CloseFont(g->font_med);
     if (g->font_small) TTF_CloseFont(g->font_small);
+    if (g->canvas_tex) SDL_DestroyTexture(g->canvas_tex);
+    if (g->frame_tex) SDL_DestroyTexture(g->frame_tex);
     if (g->ren) SDL_DestroyRenderer(g->ren);
     if (g->win) SDL_DestroyWindow(g->win);
     free(g->weights);
     free(g->sample);
+    free(g->pred_data);
+    free(g->gen_data);
+    for (int i = 0; i < 96; ++i)
+        if (g->pred_tex[i]) SDL_DestroyTexture(g->pred_tex[i]);
     TTF_Quit();
     SDL_Quit();
 }
@@ -511,6 +602,8 @@ static int dataset_probe(const char *name, DatasetInfo *d) {
             if (buf[i] > max_label) max_label = buf[i];
     fclose(f);
     d->n_classes = max_label + 1;
+    snprintf(path, sizeof(path), "data/%s/train-masks-idx3-ubyte", name);
+    d->task = access(path, R_OK) == 0 ? TASK_SEGMENT : TASK_CLASSIFY;
 
     snprintf(path, sizeof(path), "data/%s/classes.txt", name);
     f = fopen(path, "r");
@@ -580,8 +673,12 @@ static int node_height(int type) {
     switch (type) {
     case BLK_CONV: return 100;
     case BLK_LINEAR:
+    case BLK_UPSAMPLE:
     case BLK_MAXPOOL: return 72;
-    case BLK_ADD: return 62;
+    case BLK_ADD:
+    case BLK_CONCAT: return 62;
+    case BLK_RESHAPE: return 84;
+    case BLK_REPARAM: return 72;
     default: return 46;
     }
 }
@@ -591,10 +688,13 @@ static int node_nparams(int type) {
     case BLK_CONV: return 4;
     case BLK_LINEAR: return 1;
     case BLK_MAXPOOL: return 2;
+    case BLK_UPSAMPLE: return 1;
+    case BLK_RESHAPE: return 3;
+    case BLK_REPARAM: return 1;
     default: return 0;
     }
 }
-static int node_nin(int type) { return type == NODE_INPUT ? 0 : (type == BLK_ADD ? 2 : 1); }
+static int node_nin(int type) { return type == NODE_INPUT ? 0 : (type == BLK_ADD || type == BLK_CONCAT ? 2 : 1); }
 static int node_deletable(int type) { return type != NODE_INPUT && type != NODE_OUTPUT; }
 
 static const char *node_type_title(int type) {
@@ -608,6 +708,10 @@ static const char *node_type_title(int type) {
     case BLK_BATCHNORM: return "bn";
     case BLK_MAXPOOL: return "pool";
     case BLK_GAP: return "gap";
+    case BLK_UPSAMPLE: return "up";
+    case BLK_CONCAT: return "concat";
+    case BLK_RESHAPE: return "reshape";
+    case BLK_REPARAM: return "reparam";
     default: return "fc";
     }
 }
@@ -622,13 +726,17 @@ static SDL_Color node_accent(int type) {
     case BLK_BATCHNORM: return (SDL_Color){64, 196, 200, 255};
     case BLK_MAXPOOL: return (SDL_Color){214, 200, 90, 255};
     case BLK_GAP: return (SDL_Color){150, 206, 84, 255};
+    case BLK_UPSAMPLE: return (SDL_Color){255, 150, 110, 255};
+    case BLK_CONCAT: return (SDL_Color){190, 120, 240, 255};
+    case BLK_RESHAPE: return (SDL_Color){140, 170, 255, 255};
+    case BLK_REPARAM: return (SDL_Color){240, 236, 160, 255};
     default: return (SDL_Color){150, 156, 168, 255};
     }
 }
 
 static SDL_Rect node_rect(const Gui *g, int i) {
     const Node *n = &g->nodes[i];
-    SDL_Rect r = {GRAPH_VIEW.x + g->pan_x + n->x, GRAPH_VIEW.y + g->pan_y + n->y, NODE_W, node_height(n->type)};
+    SDL_Rect r = {(int)floorf(g->pan_x) + n->x, (int)floorf(g->pan_y) + n->y, NODE_W, node_height(n->type)};
     return r;
 }
 
@@ -650,9 +758,9 @@ static SDL_Rect node_del_rect(SDL_Rect r) {
     return d;
 }
 
-static int near_port(SDL_Point port, SDL_Point p) {
+static int near_port(SDL_Point port, SDL_Point p, int rad) {
     int dx = port.x - p.x, dy = port.y - p.y;
-    return dx * dx + dy * dy <= 10 * 10;
+    return dx * dx + dy * dy <= rad * rad;
 }
 
 static int graph_find(const Gui *g, int type) {
@@ -703,7 +811,12 @@ static void node_set_defaults(Gui *g, int i) {
     else if (t == BLK_MAXPOOL) {
         field_set(g, F_NODE(i, 0), "2", FK_INT);
         field_set(g, F_NODE(i, 1), "2", FK_INT);
-    }
+    } else if (t == BLK_UPSAMPLE) field_set(g, F_NODE(i, 0), "2", FK_INT);
+    else if (t == BLK_RESHAPE) {
+        field_set(g, F_NODE(i, 0), "32", FK_INT);
+        field_set(g, F_NODE(i, 1), "7", FK_INT);
+        field_set(g, F_NODE(i, 2), "7", FK_INT);
+    } else if (t == BLK_REPARAM) field_set(g, F_NODE(i, 0), "1", FK_FLOAT);
 }
 
 static int graph_add(Gui *g, int type, int x, int y) {
@@ -765,12 +878,12 @@ static void graph_free_spot(const Gui *g, int ignore, int type, int *x, int *y) 
 
 /* Pans the canvas just far enough that node i is on screen, clear of the hint text at the bottom. */
 static void graph_reveal(Gui *g, int i) {
-    SDL_Rect r = node_rect(g, i);
-    int bottom = GRAPH_VIEW.y + GRAPH_VIEW.h - 60, right = GRAPH_VIEW.x + GRAPH_VIEW.w - 8;
-    if (r.y + r.h > bottom) g->pan_y -= r.y + r.h - bottom;
-    if (r.y < GRAPH_VIEW.y + 8) g->pan_y += GRAPH_VIEW.y + 8 - (r.y);
-    if (r.x + r.w > right) g->pan_x -= r.x + r.w - right;
-    if (r.x < GRAPH_VIEW.x + 8) g->pan_x += GRAPH_VIEW.x + 8 - r.x;
+    SDL_Rect r = node_rect(g, i), v = view_rect(g);
+    int bottom = v.h - (int)(60.0f / g->zoom), right = v.w - 8;
+    if (r.y + r.h > bottom) g->pan_y -= (float)(r.y + r.h - bottom);
+    if (r.y < 8) g->pan_y += (float)(8 - r.y);
+    if (r.x + r.w > right) g->pan_x -= (float)(r.x + r.w - right);
+    if (r.x < 8) g->pan_x += (float)(8 - r.x);
 }
 
 /* Clicking a palette block appends it after the block that feeds the output node (an add block gets
@@ -820,6 +933,52 @@ static int graph_visit(const Gui *g, int node, int *state, int *order, int *n, i
     return 0;
 }
 
+/* The zoom at which every node fits the canvas (never past 100%), and the bounding box that was measured. */
+static float graph_fit_zoom(const Gui *g, int *minx_o, int *miny_o) {
+    int minx = 1 << 30, miny = 1 << 30, maxx = -(1 << 30), maxy = -(1 << 30), any = 0;
+    for (int i = 0; i < MAX_NODES; ++i) {
+        if (!g->nodes[i].used) continue;
+        any = 1;
+        if (g->nodes[i].x < minx) minx = g->nodes[i].x;
+        if (g->nodes[i].y < miny) miny = g->nodes[i].y;
+        if (g->nodes[i].x + NODE_W > maxx) maxx = g->nodes[i].x + NODE_W;
+        if (g->nodes[i].y + node_height(g->nodes[i].type) > maxy) maxy = g->nodes[i].y + node_height(g->nodes[i].type);
+    }
+    if (minx_o) *minx_o = any ? minx : 0;
+    if (miny_o) *miny_o = any ? miny : 0;
+    if (!any) return 1.0f;
+    float zx = (float)GRAPH_VIEW.w / (float)(maxx - minx + 48), zy = (float)(GRAPH_VIEW.h - 70) / (float)(maxy - miny + 48);
+    float z = fminf(1.0f, fminf(zx, zy));
+    return z < ZOOM_MIN ? ZOOM_MIN : z;
+}
+
+/* Zooms out (never in past 100%) and pans so that every node is on screen, top-left aligned. */
+static void graph_fit(Gui *g) {
+    int minx, miny;
+    float z = graph_fit_zoom(g, &minx, &miny);
+    g->zoom = z;
+    g->pan_x = 14.0f / z - (float)minx + 10.0f;
+    g->pan_y = 14.0f / z - (float)miny + 10.0f;
+}
+
+/* Places the nodes in order left to right, wrapping into rows `wrap` pixels wide. */
+static void graph_layout_rows(Gui *g, const int *order, int n, int wrap) {
+    int x = 14, y = 14, row_h = 0;
+    for (int k = 0; k < n; ++k) {
+        Node *nd = &g->nodes[order[k]];
+        int h = node_height(nd->type);
+        if (x + NODE_W > wrap - 8) {
+            x = 14;
+            y += row_h + 34;
+            row_h = 0;
+        }
+        nd->x = x;
+        nd->y = y;
+        x += NODE_W + NODE_GAP;
+        if (h > row_h) row_h = h;
+    }
+}
+
 /* Lays the nodes out left to right in evaluation order, wrapping into rows; anything not connected
  * to the output goes last. */
 static void graph_arrange(Gui *g) {
@@ -834,28 +993,38 @@ static void graph_arrange(Gui *g) {
     for (int i = 0; i < MAX_NODES; ++i)
         if (g->nodes[i].used && !placed[i]) order[n++] = i;
 
-    int x = 14, y = 14, row_h = 0;
-    for (int k = 0; k < n; ++k) {
-        Node *nd = &g->nodes[order[k]];
-        int h = node_height(nd->type);
-        if (x + NODE_W > GRAPH_VIEW.w - 8) {
-            x = 14;
-            y += row_h + 34;
-            row_h = 0;
+    /* A tall, narrow layout needs a small zoom to fit; a wider one may fit at a larger zoom. Try a few row widths
+     * (1x to 2.5x the canvas width) and keep the one that can be shown biggest; a graph that already fits at
+     * 100% keeps the plain canvas width. */
+    int best_wrap = GRAPH_VIEW.w;
+    float best_z = -1.0f;
+    for (int step = 0; step < 6; ++step) {
+        int wrap = GRAPH_VIEW.w + step * GRAPH_VIEW.w / 4;
+        graph_layout_rows(g, order, n, wrap);
+        float z = graph_fit_zoom(g, NULL, NULL);
+        if (z > best_z + 0.01f) {
+            best_z = z;
+            best_wrap = wrap;
         }
-        nd->x = x;
-        nd->y = y;
-        x += NODE_W + NODE_GAP;
-        if (h > row_h) row_h = h;
+        if (z >= 1.0f) break;
     }
-    g->pan_x = g->pan_y = 0;
+    graph_layout_rows(g, order, n, best_wrap);
+    graph_fit(g); /* the view shows the whole graph, zoomed out if it is big */
 }
 
-/* Sets the last fc (the one feeding the output node) to the dataset's class count. */
+static int graph_has_type(const Gui *g, int type) {
+    for (int i = 0; i < MAX_NODES; ++i)
+        if (g->nodes[i].used && g->nodes[i].type == type) return 1;
+    return 0;
+}
+
+/* Sets the last fc (the one feeding the output node) to the dataset's class count. A VAE's last layer is
+ * the reconstructed image, whose channels come from the dataset, so it is left alone. */
 static void graph_fit_classes(Gui *g, int n_classes) {
+    if (graph_has_type(g, BLK_REPARAM)) return;
     int out = graph_find(g, NODE_OUTPUT);
     int last = out >= 0 ? g->nodes[out].in[0] : -1;
-    if (last >= 0 && g->nodes[last].type == BLK_LINEAR) {
+    if (last >= 0 && (g->nodes[last].type == BLK_LINEAR || g->nodes[last].type == BLK_CONV)) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", n_classes);
         field_set(g, F_NODE(last, 0), buf, FK_INT);
@@ -936,6 +1105,82 @@ static void graph_preset_resnet(Gui *g) {
     graph_finish(g, x);
 }
 
+/* conv-bn-relu */
+static int cbr(Gui *g, int x, int ch) {
+    x = gadd(g, BLK_CONV, ch, 3, 1, 1, x, -1);
+    x = gadd(g, BLK_BATCHNORM, 0, 0, 0, 0, x, -1);
+    return gadd(g, BLK_RELU, 0, 0, 0, 0, x, -1);
+}
+
+/* A two-level U-Net for segmentation: two conv-bn-relu pairs per level, max pool down, nearest
+ * upsample + concat with the matching encoder output on the way up, and a 1x1 conv to one score per
+ * class per pixel. */
+static void graph_preset_unet(Gui *g) {
+    graph_clear(g);
+    int x = graph_add(g, NODE_INPUT, 0, 0);
+    x = cbr(g, x, 16);
+    int e1 = cbr(g, x, 16);
+    x = gadd(g, BLK_MAXPOOL, 2, 2, 0, 0, e1, -1);
+    x = cbr(g, x, 32);
+    int e2 = cbr(g, x, 32);
+    x = gadd(g, BLK_MAXPOOL, 2, 2, 0, 0, e2, -1);
+    x = cbr(g, x, 64);
+    x = cbr(g, x, 64);
+    x = gadd(g, BLK_UPSAMPLE, 2, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_CONCAT, 0, 0, 0, 0, x, e2);
+    x = cbr(g, x, 32);
+    x = cbr(g, x, 32);
+    x = gadd(g, BLK_UPSAMPLE, 2, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_CONCAT, 0, 0, 0, 0, x, e1);
+    x = cbr(g, x, 16);
+    x = cbr(g, x, 16);
+    x = gadd(g, BLK_CONV, 2, 1, 1, 0, x, -1);
+    graph_finish(g, x);
+}
+
+/* What a VAE was tuned with here: Adam with a small learning rate (the loss sums over pixels), raw pixels. */
+static void vae_training_defaults(Gui *g) {
+    field_set(g, F_EPOCHS, "15", FK_INT);
+    field_set(g, F_BATCH, "64", FK_INT);
+    field_set(g, F_LR, "0.001", FK_FLOAT);
+    field_set(g, F_OPT, "1", FK_INT);
+    field_set(g, F_MOMENTUM, "0.9", FK_FLOAT);
+    field_set(g, F_NORMALIZE, "0", FK_INT);
+    field_set(g, F_AUGMENT, "0", FK_INT);
+}
+
+/* A convolutional VAE sized to the selected dataset: stride-2 convs halve the image until the feature map is at
+ * most 11 pixels across (28 -> 7, 64 -> 8, 128 -> 8; h and w should be multiples of 2^levels), an fc to the
+ * 2*16 means / log-variances, the sampling block, an fc back up to a 32-channel map, and the same number of
+ * upsample + conv stages back to the image. The last conv has the image's channels. */
+static void graph_preset_vae(Gui *g) {
+    graph_clear(g);
+    const DatasetInfo *d = form_dataset(g);
+    int h = d ? d->rows : 28, c = d ? d->channels : 1, z = 16;
+    int levels = 2;
+    while ((h >> levels) > 11) levels++;
+    int q = h >> levels > 0 ? h >> levels : 1;
+    int x = graph_add(g, NODE_INPUT, 0, 0);
+    for (int k = 0; k < levels; ++k) {
+        x = gadd(g, BLK_CONV, k == 0 ? 16 : 32, 3, 2, 1, x, -1);
+        x = gadd(g, BLK_RELU, 0, 0, 0, 0, x, -1);
+    }
+    x = gadd(g, BLK_FLATTEN, 0, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_LINEAR, 2 * z, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_REPARAM, 0, 0, 0, 0, x, -1);
+    field_set(g, F_NODE(x, 0), "1", FK_FLOAT); /* KL weight */
+    x = gadd(g, BLK_LINEAR, 32 * q * q, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_RELU, 0, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_RESHAPE, 32, q, q, 0, x, -1);
+    for (int k = 0; k < levels; ++k) {
+        x = gadd(g, BLK_UPSAMPLE, 2, 0, 0, 0, x, -1);
+        x = gadd(g, BLK_CONV, k == levels - 1 ? c : 16, 3, 1, 1, x, -1);
+        if (k != levels - 1) x = gadd(g, BLK_RELU, 0, 0, 0, 0, x, -1);
+    }
+    graph_finish(g, x);
+    vae_training_defaults(g);
+}
+
 /* -- form state ----------------------------------------------------------- */
 
 /* Picking a dataset loads the settings that suit it: its defaults.txt if it
@@ -961,15 +1206,66 @@ static void apply_dataset_defaults(Gui *g, const DatasetInfo *d) {
     field_set(g, F_NORMALIZE, buf, FK_INT);
     snprintf(buf, sizeof(buf), "%d", d->def_augment >= 0 ? d->def_augment : 0);
     field_set(g, F_AUGMENT, buf, FK_INT);
+    field_set(g, F_OPT, "0", FK_INT);
 
     graph_fit_classes(g, d->n_classes);
+}
+
+/* The first dataset that has masks, or NULL. */
+static const DatasetInfo *first_segmentation_dataset(const Gui *g) {
+    for (int i = 0; i < g->n_datasets; ++i)
+        if (g->ds[i].task == TASK_SEGMENT) return &g->ds[i];
+    return NULL;
+}
+
+/* A model that suits the problem and dataset, plus the training settings that go with it. */
+static void load_problem_defaults(Gui *g, const DatasetInfo *d) {
+    if (g->problem == PROBLEM_GENERATE) {
+        graph_preset_vae(g); /* sized to the dataset's images; sets the VAE training fields */
+        if (d) {
+            apply_dataset_defaults(g, d);
+            vae_training_defaults(g);
+        }
+    } else {
+        if (g->problem == PROBLEM_SEGMENT) graph_preset_unet(g);
+        else graph_reset(g);
+        if (d) apply_dataset_defaults(g, d);
+    }
+}
+
+/* Switching the problem swaps in that problem's default model and settings. Segmentation needs masks: if the
+ * selected dataset has none, the first dataset that does is selected instead. */
+static void set_problem(Gui *g, int problem) {
+    if (g->problem == problem) return;
+    g->problem = problem;
+    g->preset_open = 0;
+    const DatasetInfo *d = form_dataset(g);
+    if (problem == PROBLEM_SEGMENT && (!d || d->task != TASK_SEGMENT)) {
+        const DatasetInfo *seg = first_segmentation_dataset(g);
+        if (seg) {
+            field_set(g, F_DATASET, seg->name, FK_CHOICE);
+            d = seg;
+        }
+    }
+    load_problem_defaults(g, d);
 }
 
 static void dataset_choose(Gui *g, const char *name) {
     int changed = strcmp(g->fields[F_DATASET].text, name) != 0;
     field_set(g, F_DATASET, name, FK_CHOICE);
     const DatasetInfo *d = ds_find(g, name);
-    if (d && changed) apply_dataset_defaults(g, d);
+    if (!d || !changed) return;
+    if (g->problem == PROBLEM_CLASSIFY) {
+        /* keep a classification model the user has edited; only replace one that cannot classify */
+        int out = graph_find(g, NODE_OUTPUT);
+        int last = out >= 0 ? g->nodes[out].in[0] : -1;
+        int ends_in_fc = last >= 0 && g->nodes[last].type == BLK_LINEAR;
+        if (!ends_in_fc) graph_reset(g);
+        apply_dataset_defaults(g, d);
+    } else {
+        /* a U-Net / VAE is sized to the images it works on: rebuild it for the new dataset */
+        load_problem_defaults(g, d);
+    }
 }
 
 /* Starts out as the config the old hardcoded trainer used. */
@@ -981,6 +1277,7 @@ static void form_defaults(Gui *g) {
     if (!def[0] && g->n_datasets > 0) def = g->ds[0].name;
     field_set(g, F_DATASET, "", FK_CHOICE);
     field_set(g, F_SEED, "42", FK_INT);
+    field_set(g, F_OPT, "0", FK_INT);
     field_set(g, F_POOL, "8", FK_INT);
     field_set(g, F_VIZ, "1", FK_INT);
     g->focus = -1;
@@ -993,7 +1290,7 @@ static void form_defaults(Gui *g) {
 static void form_layout(Gui *g) {
     for (int i = 0; i < NUM_FIELDS; ++i) g->fields[i].visible = 0;
     for (int i = 0; i < NUM_GENERAL_FIELDS; ++i) {
-        g->fields[i].rect = (SDL_Rect){PANEL_TRAIN.x + 196, 60 + i * 40, 150, 28};
+        g->fields[i].rect = (SDL_Rect){PANEL_TRAIN.x + 196, 58 + i * FIELD_PITCH, 150, 28};
         g->fields[i].visible = 1;
     }
     for (int i = 0; i < MAX_NODES; ++i) {
@@ -1006,6 +1303,14 @@ static void form_layout(Gui *g) {
             g->fields[F_NODE(i, 3)].rect = (SDL_Rect){r.x + 66, r.y + 54, 28, 20};
         } else if (g->nodes[i].type == BLK_LINEAR) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 30, r.y + 28, 64, 20};
+        } else if (g->nodes[i].type == BLK_RESHAPE) {
+            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 8, r.y + 42, 30, 20};
+            g->fields[F_NODE(i, 1)].rect = (SDL_Rect){r.x + 41, r.y + 42, 30, 20};
+            g->fields[F_NODE(i, 2)].rect = (SDL_Rect){r.x + 74, r.y + 42, 30, 20};
+        } else if (g->nodes[i].type == BLK_REPARAM) {
+            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 56, r.y + 28, 48, 20};
+        } else if (g->nodes[i].type == BLK_UPSAMPLE) {
+            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 60, r.y + 28, 34, 20};
         } else if (g->nodes[i].type == BLK_MAXPOOL) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 22, r.y + 28, 28, 20};
             g->fields[F_NODE(i, 1)].rect = (SDL_Rect){r.x + 72, r.y + 28, 28, 20};
@@ -1047,7 +1352,7 @@ static int graph_compile(Gui *g) {
     if (r == 1) {
         int t = g->nodes[err_node].type;
         if (t == NODE_OUTPUT) snprintf(g->form_err, sizeof(g->form_err), "wire a block to the output node");
-        else if (t == BLK_ADD) snprintf(g->form_err, sizeof(g->form_err), "add: wire both of its inputs");
+        else if (t == BLK_ADD || t == BLK_CONCAT) snprintf(g->form_err, sizeof(g->form_err), "%s: wire both of its inputs", node_type_title(t));
         else snprintf(g->form_err, sizeof(g->form_err), "wire the input of the %s block", node_type_title(t));
         g->form_err_node = err_node;
         return -1;
@@ -1069,7 +1374,7 @@ static int graph_compile(Gui *g) {
     static const char *conv_cols[4] = {"out channels", "kernel", "stride", "padding"};
     static const char *pool_cols[2] = {"window", "stride"};
     int id_of_node[MAX_NODES];
-    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0;
+    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0;
     for (int k = 0; k < n_order; ++k) {
         int node = order[k], type = g->nodes[node].type;
         if (type == NODE_INPUT) {
@@ -1084,8 +1389,8 @@ static int graph_compile(Gui *g) {
         }
         int bi = g->chain_len++;
         id_of_node[node] = bi + 1;
-        Block b = {type, 0, 0, 0, 0, {id_of_node[g->nodes[node].in[0]], -1}};
-        if (type == BLK_ADD) b.in[1] = id_of_node[g->nodes[node].in[1]];
+        Block b = {type, 0, 0, 0, 0, {id_of_node[g->nodes[node].in[0]], -1}, 0.0f};
+        if (type == BLK_ADD || type == BLK_CONCAT) b.in[1] = id_of_node[g->nodes[node].in[1]];
         int *dst[4] = {&b.a, &b.b, &b.c, &b.d};
         char *nm = g->node_name[node];
         size_t nsz = sizeof(g->node_name[node]);
@@ -1094,10 +1399,24 @@ static int graph_compile(Gui *g) {
         else if (type == BLK_BATCHNORM) snprintf(nm, nsz, "bn%d", ++n_bn);
         else if (type == BLK_ADD) snprintf(nm, nsz, "add%d", ++n_add);
         else if (type == BLK_MAXPOOL) snprintf(nm, nsz, "pool%d", ++n_pool);
-        for (int j = 0; j < node_nparams(type); ++j) {
+        else if (type == BLK_UPSAMPLE) snprintf(nm, nsz, "up%d", ++n_up);
+        else if (type == BLK_CONCAT) snprintf(nm, nsz, "cat%d", ++n_cat);
+        if (type == BLK_REPARAM) {
+            char *end;
+            const char *t = g->fields[F_NODE(node, 0)].text;
+            float v = strtof(t, &end);
+            if (!t[0] || *end || !isfinite(v)) {
+                snprintf(g->form_err, sizeof(g->form_err), "reparam kl weight: enter a number like 1 or 0.5");
+                g->form_err_node = node;
+                g->form_err_field = F_NODE(node, 0);
+                return -1;
+            }
+            b.f = v;
+        }
+        for (int j = 0; j < node_nparams(type) && type != BLK_REPARAM; ++j) {
             if (parse_int(&g->fields[F_NODE(node, j)], dst[j])) {
                 char what[48];
-                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : "out features");
+                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : (type == BLK_UPSAMPLE ? "factor" : (type == BLK_RESHAPE ? (j == 0 ? "channels" : (j == 1 ? "height" : "width")) : "out features")));
                 snprintf(what, sizeof(what), "%s %s", nm, col);
                 g->form_err_node = node;
                 return form_fail(g, F_NODE(node, j), what);
@@ -1142,6 +1461,13 @@ static void form_update(Gui *g) {
     c->img_h = ds->rows;
     c->img_w = ds->cols;
     c->img_c = ds->channels;
+    c->task = g->problem == PROBLEM_GENERATE ? TASK_GENERATE : (g->problem == PROBLEM_SEGMENT ? TASK_SEGMENT : TASK_CLASSIFY);
+    if (g->problem == PROBLEM_SEGMENT && ds->task != TASK_SEGMENT) {
+        snprintf(g->form_err, sizeof(g->form_err),
+                 "segmentation needs a dataset with masks (train-masks-idx3-ubyte) - '%.20s' has none", ds->name);
+        g->form_err_field = F_DATASET;
+        return;
+    }
     c->num_classes = ds->n_classes;
     if (parse_int(&g->fields[F_EPOCHS], &c->epochs)) { form_fail(g, F_EPOCHS, "epochs"); return; }
     if (parse_int(&g->fields[F_BATCH], &c->batch_size)) { form_fail(g, F_BATCH, "batch size"); return; }
@@ -1167,6 +1493,7 @@ static void form_update(Gui *g) {
         }
         c->momentum = v;
     }
+    if (parse_int(&g->fields[F_OPT], &c->optimizer)) { form_fail(g, F_OPT, "optimizer"); return; }
     if (parse_int(&g->fields[F_NORMALIZE], &c->normalize)) { form_fail(g, F_NORMALIZE, "normalize"); return; }
     if (parse_int(&g->fields[F_AUGMENT], &c->augment)) { form_fail(g, F_AUGMENT, "augment"); return; }
     if (parse_int(&g->fields[F_SEED], &c->seed)) { form_fail(g, F_SEED, "seed"); return; }
@@ -1248,18 +1575,21 @@ static SDL_Rect dropdown_row_rect(const Gui *g, int i) {
 
 /* Drawn after everything else in the form so it floats over the fields below. */
 static void draw_dropdown(Gui *g) {
-    int rows = g->n_datasets > 0 ? g->n_datasets : 1;
+    int vis[MAX_DATASETS], nv = ds_visible(g, vis);
+    int rows = nv > 0 ? nv : 1;
     SDL_Rect first = dropdown_row_rect(g, 0);
     SDL_Rect bg = {first.x, first.y, first.w, rows * 28 + 8};
     bg.y -= 4;
     draw_shadow(g->ren, bg, 9);
     rrect_bordered(g->ren, bg, 9, (SDL_Color){COL_SURFACE2}, (SDL_Color){COL_LOSS});
     SDL_Point mouse = {g->mouse_x, g->mouse_y};
-    if (g->n_datasets == 0) {
-        txt(g, g->font_small, "no dataset in data/", first.x + 10, first.y + 8, (SDL_Color){COL_BAD});
+    if (nv == 0) {
+        txt(g, g->font_small, g->problem == PROBLEM_SEGMENT ? "no dataset with masks in data/" : "no dataset in data/", first.x + 10,
+            first.y + 8, (SDL_Color){COL_BAD});
     }
-    for (int i = 0; i < g->n_datasets; ++i) {
-        SDL_Rect r = dropdown_row_rect(g, i);
+    for (int k = 0; k < nv; ++k) {
+        int i = vis[k];
+        SDL_Rect r = dropdown_row_rect(g, k);
         int current = strcmp(g->ds[i].name, g->fields[F_DATASET].text) == 0;
         if (SDL_PointInRect(&mouse, &r)) {
             SDL_Rect hl = {r.x + 4, r.y + 1, r.w - 8, r.h - 2};
@@ -1313,7 +1643,8 @@ static void draw_port(Gui *g, SDL_Point p, int linked, SDL_Color col) {
 static void draw_node(Gui *g, int i, SDL_Point mouse) {
     const Node *n = &g->nodes[i];
     SDL_Rect r = node_rect(g, i);
-    if (!SDL_HasIntersection(&r, &GRAPH_VIEW)) return;
+    SDL_Rect view = view_rect(g);
+    if (!SDL_HasIntersection(&r, &view)) return;
 
     SDL_Color accent = node_accent(n->type);
     int err = g->form_err_node == i;
@@ -1362,8 +1693,16 @@ static void draw_node(Gui *g, int i, SDL_Point mouse) {
     } else if (n->type == BLK_MAXPOOL) {
         txt(g, g->font_small, "k", r.x + 8, r.y + 31, dim);
         txt(g, g->font_small, "s", r.x + 58, r.y + 31, dim);
+    } else if (n->type == BLK_UPSAMPLE) {
+        txt(g, g->font_small, "factor", r.x + 8, r.y + 31, dim);
+    } else if (n->type == BLK_RESHAPE) {
+        txt(g, g->font_small, "channels  h   w", r.x + 8, r.y + 27, dim);
+    } else if (n->type == BLK_REPARAM) {
+        txt(g, g->font_small, "kl weight", r.x + 8, r.y + 31, dim);
     } else if (n->type == BLK_ADD) {
         txt(g, g->font_small, "top + bottom", r.x + 14, r.y + 24, dim);
+    } else if (n->type == BLK_CONCAT) {
+        txt(g, g->font_small, "top | bottom", r.x + 14, r.y + 24, dim);
     }
     for (int j = 0; j < node_nparams(n->type); ++j) draw_field(g, F_NODE(i, j));
 
@@ -1391,12 +1730,18 @@ static void draw_node(Gui *g, int i, SDL_Point mouse) {
 typedef struct ArchGroup {
     char name[16];
     char l2[28];     /* output shape */
+    char l2c[16];    /* the same, short ("16@64"), for boxes too narrow for l2 */
     char params[20]; /* kernel / stride, shown when nothing was folded in */
     char fold[20];   /* e.g. "+bn +relu" */
     int type;        /* BLK_* or NODE_INPUT: picks the accent colour */
     int level, row;  /* layer = longest path from the input; row separates parallel branches */
     int src[2], nsrc;
 } ArchGroup;
+
+static void shape_str_compact(LayerShape l, char *buf, size_t n) {
+    if (l.flat) snprintf(buf, n, "%d", l.c);
+    else snprintf(buf, n, "%d@%d", l.c, l.h);
+}
 
 static void shape_str(LayerShape l, char *buf, size_t n) {
     if (l.flat) snprintf(buf, n, "%d", l.c);
@@ -1410,16 +1755,17 @@ static void arch_append(char *dst, size_t n, const char *add) {
 
 static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
     int n = 0, uses[MAX_BLOCKS + 1] = {0}, gid_of_id[MAX_BLOCKS + 1] = {0}, out_id[ARCH_MAX_GROUPS] = {0};
-    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0;
+    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0;
     int nb = c->n_blocks < s->n_ok ? c->n_blocks : s->n_ok;
     for (int i = 0; i < nb; ++i) {
         uses[c->blocks[i].in[0]]++;
-        if (c->blocks[i].type == BLK_ADD) uses[c->blocks[i].in[1]]++;
+        if (c->blocks[i].type == BLK_ADD || c->blocks[i].type == BLK_CONCAT) uses[c->blocks[i].in[1]]++;
     }
 
     memset(&gr[0], 0, sizeof(gr[0]));
     snprintf(gr[0].name, sizeof(gr[0].name), "input");
     shape_str(s->input, gr[0].l2, sizeof(gr[0].l2));
+    shape_str_compact(s->input, gr[0].l2c, sizeof(gr[0].l2c));
     gr[0].type = NODE_INPUT;
     n = 1;
 
@@ -1439,11 +1785,12 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
         q->type = k->type;
         q->src[0] = gid_of_id[in0];
         q->nsrc = 1;
-        if (k->type == BLK_ADD) {
+        if (k->type == BLK_ADD || k->type == BLK_CONCAT) {
             q->src[1] = gid_of_id[k->in[1]];
             q->nsrc = 2;
         }
         shape_str(s->out[i], q->l2, sizeof(q->l2));
+        shape_str_compact(s->out[i], q->l2c, sizeof(q->l2c));
         switch (k->type) {
         case BLK_CONV:
             snprintf(q->name, sizeof(q->name), "conv%d", ++n_conv);
@@ -1451,6 +1798,11 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
             break;
         case BLK_LINEAR: snprintf(q->name, sizeof(q->name), "fc%d", ++n_lin); break;
         case BLK_ADD: snprintf(q->name, sizeof(q->name), "add%d", ++n_add); break;
+        case BLK_UPSAMPLE:
+            snprintf(q->name, sizeof(q->name), "up%d", ++n_up);
+            snprintf(q->params, sizeof(q->params), "x%d", k->a);
+            break;
+        case BLK_CONCAT: snprintf(q->name, sizeof(q->name), "cat%d", ++n_cat); break;
         case BLK_BATCHNORM: snprintf(q->name, sizeof(q->name), "bn%d", ++n_bn); break;
         case BLK_MAXPOOL:
             snprintf(q->name, sizeof(q->name), "pool%d", ++n_pool);
@@ -1548,7 +1900,7 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
                 if (arc) {
                     float x0 = box[a].x + box[a].w * 0.5f, x1 = box[i].x + box[i].w * 0.5f;
                     float y = (float)box[a].y;
-                    float lift = 14.0f + 6.0f * (gr[i].level - gr[a].level - 1);
+                    float lift = 12.0f + 2.0f * (gr[i].level - gr[a].level - 1);
                     if (lift > 24.0f) lift = 24.0f;
                     draw_curve(g, x0, y, x0, y - lift * 1.35f, x1, y - lift * 1.35f, x1, y - 1, col);
                     draw_arrow_head(g, x1, y - 1, 0.0f, 1.0f, col);
@@ -1571,50 +1923,82 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
         fill_rrect(g->ren, bar, 1, acc);
         if (i == hover) rrect_bordered(g->ren, box[i], 7, (SDL_Color){COL_SURFACE2}, (SDL_Color){250, 204, 96, 255});
         SDL_RenderSetClipRect(g->ren, &box[i]);
-        txt(g, g->font, gr[i].name, box[i].x + 6, box[i].y + 3, (SDL_Color){COL_TEXT});
-        txt(g, g->font_small, gr[i].l2, box[i].x + 6, box[i].y + 19, (SDL_Color){COL_TEXT_DIM});
-        const char *l3 = gr[i].fold[0] ? gr[i].fold : gr[i].params;
-        if (box_h >= 40) txt(g, g->font_small, l3, box[i].x + 6, box[i].y + 31, (SDL_Color){COL_TEXT_DIM});
+        int compact = box_w < 70; /* narrow boxes (deep graphs): smaller name, short shape, no spaces */
+        txt(g, compact ? g->font_small : g->font, gr[i].name, box[i].x + 5, box[i].y + (compact ? 5 : 3),
+            (SDL_Color){COL_TEXT});
+        txt(g, g->font_small, compact ? gr[i].l2c : gr[i].l2, box[i].x + 5, box[i].y + 19, (SDL_Color){COL_TEXT_DIM});
+        char l3[24];
+        snprintf(l3, sizeof(l3), "%s", gr[i].fold[0] ? gr[i].fold : gr[i].params);
+        if (compact) {
+            char *w = l3;
+            for (char *rd = l3[0] == '+' ? l3 + 1 : l3; *rd; ++rd)
+                if (*rd != ' ') *w++ = *rd;
+            *w = '\0';
+        }
+        if (box_h >= 40) txt(g, g->font_small, l3, box[i].x + 5, box[i].y + 31, (SDL_Color){COL_TEXT_DIM});
         SDL_RenderSetClipRect(g->ren, NULL);
     }
 }
 
-static const char *PALETTE_LABELS[NUM_PALETTE] = {"conv", "relu", "flat", "fc", "add", "bn", "pool", "gap"};
+static const char *palette_label(int type) {
+    switch (type) {
+    case BLK_CONV: return "conv";
+    case BLK_RELU: return "relu";
+    case BLK_FLATTEN: return "flat";
+    case BLK_LINEAR: return "fc";
+    case BLK_ADD: return "add";
+    case BLK_BATCHNORM: return "bn";
+    case BLK_MAXPOOL: return "pool";
+    case BLK_GAP: return "gap";
+    case BLK_UPSAMPLE: return "up";
+    case BLK_CONCAT: return "cat";
+    case BLK_RESHAPE: return "view";
+    default: return "vae";
+    }
+}
 
 /* A palette entry: the block's colour as a dot, then its name. */
 static void draw_chip(Gui *g, SDL_Rect r, const char *label, SDL_Color accent, int hovered) {
     SDL_Color fill = hovered ? col_mix((SDL_Color){COL_SURFACE2}, accent, 0.18f) : (SDL_Color){COL_SURFACE2};
     SDL_Color border = hovered ? accent : (SDL_Color){COL_BORDER_HI};
     rrect_bordered(g->ren, r, 8, fill, border);
-    fill_circle_aa(g->ren, r.x + 10, r.y + r.h / 2, 3, accent);
-    txt(g, g->font, label, r.x + 18, r.y + (r.h - TTF_FontHeight(g->font)) / 2, (SDL_Color){COL_TEXT});
+    fill_circle_aa(g->ren, r.x + 9, r.y + r.h / 2, 3, accent);
+    txt(g, g->font_small, label, r.x + 17, r.y + (r.h - TTF_FontHeight(g->font_small)) / 2, (SDL_Color){COL_TEXT});
 }
 
-static void draw_graph(Gui *g) {
-    SDL_Point mouse = {g->mouse_x, g->mouse_y};
-    draw_panel(g->ren, PANEL_GRAPH);
-    for (int i = 0; i < NUM_PALETTE; ++i) {
-        SDL_Rect pr = palette_rect(i);
-        draw_chip(g, pr, PALETTE_LABELS[i], node_accent(PALETTE_TYPES[i]), SDL_PointInRect(&mouse, &pr));
+/* The node canvas: grid, wires and nodes are drawn at native size into canvas_tex (so text and fields need no
+ * scaling logic) and the visible part is then scaled onto the screen. */
+static void draw_canvas(Gui *g, SDL_Point mouse_screen) {
+    SDL_Rect view = view_rect(g);
+    SDL_Point mouse = to_view(g, mouse_screen.x, mouse_screen.y); /* the cursor in view space */
+    SDL_Texture *prev = SDL_GetRenderTarget(g->ren);
+    if (!g->canvas_tex) {
+        g->canvas_tex = SDL_CreateTexture(g->ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, CANVAS_TEX_W, CANVAS_TEX_H);
+        if (g->canvas_tex) {
+            SDL_SetTextureBlendMode(g->canvas_tex, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(g->canvas_tex, SDL_ScaleModeLinear);
+        }
     }
-    draw_button(g, BTN_ARRANGE, "arrange", g->font, SDL_PointInRect(&mouse, &BTN_ARRANGE), 1);
-    draw_button(g, BTN_RESET, "cnn", g->font, SDL_PointInRect(&mouse, &BTN_RESET), 1);
-    draw_button(g, BTN_RESNET, "resnet", g->font, SDL_PointInRect(&mouse, &BTN_RESNET), 1);
+    if (!g->canvas_tex) return;
+    SDL_SetRenderTarget(g->ren, g->canvas_tex);
+    SDL_SetRenderDrawColor(g->ren, 0, 0, 0, 0);
+    SDL_RenderClear(g->ren);
+    fill_rrect(g->ren, view, (int)(10.0f / g->zoom), (SDL_Color){13, 15, 22, 255}); /* rounded like the panel, at any zoom */
+    SDL_RenderSetClipRect(g->ren, &view);
 
-    SDL_Rect canvas = {GRAPH_VIEW.x + 1, GRAPH_VIEW.y, GRAPH_VIEW.w - 2, GRAPH_VIEW.h};
-    fill_rrect(g->ren, canvas, 10, (SDL_Color){13, 15, 22, 255});
-    SDL_RenderSetClipRect(g->ren, &GRAPH_VIEW);
-
-    /* dot grid that scrolls with the canvas */
-    SDL_SetRenderDrawColor(g->ren, 44, 50, 68, 255);
-    int off_x = ((g->pan_x % 24) + 24) % 24, off_y = ((g->pan_y % 24) + 24) % 24;
-    for (int y = GRAPH_VIEW.y + off_y; y < GRAPH_VIEW.y + GRAPH_VIEW.h; y += 24)
-        for (int x = GRAPH_VIEW.x + off_x; x < GRAPH_VIEW.x + GRAPH_VIEW.w; x += 24) SDL_RenderDrawPoint(g->ren, x, y);
+    /* dot grid that moves with the canvas (skipped when zoomed out far enough that it would be noise) */
+    if (24.0f * g->zoom >= 8.0f) {
+        SDL_SetRenderDrawColor(g->ren, 44, 50, 68, 255);
+        int px = (int)floorf(g->pan_x), py = (int)floorf(g->pan_y);
+        int off_x = ((px % 24) + 24) % 24, off_y = ((py % 24) + 24) % 24;
+        for (int y = off_y; y < view.h; y += 24)
+            for (int x = off_x; x < view.w; x += 24) SDL_RenderDrawPoint(g->ren, x, y);
+    }
 
     /* The node under the cursor: its wires light up, which makes "what does this read, who reads it"
      * readable even where wires cross. */
     int hover = -1;
-    if (SDL_PointInRect(&mouse, &GRAPH_VIEW) && g->drag == DRAG_NONE) {
+    if (SDL_PointInRect(&mouse_screen, &GRAPH_VIEW) && g->drag == DRAG_NONE) {
         for (int i = MAX_NODES - 1; i >= 0 && hover < 0; --i) {
             SDL_Rect r = node_rect(g, i);
             if (g->nodes[i].used && SDL_PointInRect(&mouse, &r)) hover = i;
@@ -1648,8 +2032,55 @@ static void draw_graph(Gui *g) {
         if (g->nodes[i].used) draw_node(g, i, mouse);
 
     if (g->drag == DRAG_LINK) draw_wire(g, node_out_port(g, g->drag_node), mouse, (SDL_Color){250, 204, 96, 255});
+
+    SDL_RenderSetClipRect(g->ren, NULL);
+    SDL_SetRenderTarget(g->ren, prev);
+    SDL_Rect dst = {GRAPH_VIEW.x, GRAPH_VIEW.y, GRAPH_VIEW.w, GRAPH_VIEW.h};
+    SDL_RenderCopy(g->ren, g->canvas_tex, &view, &dst);
+}
+
+/* Bottom-right of the canvas: zoom out / in, the zoom level, and "fit" (show every node). */
+static const SDL_Rect ZOOM_BAR = {GRAPH_VIEW.x + GRAPH_VIEW.w - 200, GRAPH_VIEW.y + GRAPH_VIEW.h - 36, 192, 30};
+static SDL_Rect zoom_btn(int k) { /* 0 = minus, 1 = plus, 2 = fit */
+    static const int xs[3] = {4, 108, 140}, ws[3] = {28, 28, 48};
+    SDL_Rect r = {ZOOM_BAR.x + xs[k], ZOOM_BAR.y + 3, ws[k], 24};
+    return r;
+}
+
+static void draw_zoom_controls(Gui *g, SDL_Point mouse) {
+    rrect_bordered(g->ren, ZOOM_BAR, 9, (SDL_Color){20, 23, 32, 235}, (SDL_Color){COL_BORDER_HI});
+    static const char *lab[3] = {"-", "+", "fit"};
+    for (int k = 0; k < 3; ++k) {
+        SDL_Rect r = zoom_btn(k);
+        int hov = SDL_PointInRect(&mouse, &r);
+        fill_rrect(g->ren, r, 7, hov ? (SDL_Color){52, 62, 92, 255} : (SDL_Color){COL_SURFACE2});
+        int tw = 0;
+        TTF_SizeText(g->font, lab[k], &tw, NULL);
+        txt(g, g->font, lab[k], r.x + (r.w - tw) / 2, r.y + (r.h - TTF_FontHeight(g->font)) / 2, (SDL_Color){COL_TEXT});
+    }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d%%", (int)(g->zoom * 100.0f + 0.5f));
+    int tw = 0;
+    TTF_SizeText(g->font_small, buf, &tw, NULL);
+    txt(g, g->font_small, buf, ZOOM_BAR.x + 36 + (68 - tw) / 2, ZOOM_BAR.y + 8, (SDL_Color){COL_TEXT_DIM});
+}
+
+static void draw_graph(Gui *g) {
+    SDL_Point mouse = {g->mouse_x, g->mouse_y};
+    draw_panel(g->ren, PANEL_GRAPH);
+    for (int i = 0; i < palette_count(g); ++i) {
+        SDL_Rect pr = palette_rect(i);
+        draw_chip(g, pr, palette_label(palette_type(g, i)), node_accent(palette_type(g, i)), SDL_PointInRect(&mouse, &pr));
+    }
+    draw_button(g, BTN_ARRANGE, "arrange", g->font, SDL_PointInRect(&mouse, &BTN_ARRANGE), 1);
+    draw_button(g, BTN_PRESETS, g->preset_open ? "presets  ^" : "presets  v", g->font,
+                SDL_PointInRect(&mouse, &BTN_PRESETS) || g->preset_open, 1);
+
+    draw_canvas(g, mouse);
+    draw_zoom_controls(g, mouse);
     if (g->drag == DRAG_PAL && g->drag_moved) {
-        SDL_Rect ghost = {mouse.x - NODE_W / 2, mouse.y - 12, NODE_W, node_height(g->drag_type)};
+        SDL_Rect ghost = {mouse.x - (int)(NODE_W * g->zoom / 2), mouse.y - (int)(12 * g->zoom), (int)(NODE_W * g->zoom),
+                          (int)(node_height(g->drag_type) * g->zoom)};
         SDL_Color a = node_accent(g->drag_type);
         SDL_SetRenderDrawColor(g->ren, a.r, a.g, a.b, 90);
         SDL_RenderFillRect(g->ren, &ghost);
@@ -1657,6 +2088,7 @@ static void draw_graph(Gui *g) {
         SDL_RenderDrawRect(g->ren, &ghost);
     }
 
+    SDL_RenderSetClipRect(g->ren, &GRAPH_VIEW);
     SDL_Color dim = {128, 136, 156, 255};
     SDL_Rect hint_bg = {GRAPH_VIEW.x + 6, GRAPH_VIEW.y + GRAPH_VIEW.h - 58, 318, 50};
     fill_rrect(g->ren, hint_bg, 8, (SDL_Color){13, 15, 22, 215});
@@ -1664,9 +2096,28 @@ static void draw_graph(Gui *g) {
         GRAPH_VIEW.y + GRAPH_VIEW.h - 50, dim);
     txt(g, g->font_small, "wire: drag dot to dot; an output can feed many blocks", GRAPH_VIEW.x + 14,
         GRAPH_VIEW.y + GRAPH_VIEW.h - 34, dim);
-    txt(g, g->font_small, "pink = skip / branch; hover to trace; scroll = pan", GRAPH_VIEW.x + 14,
+    txt(g, g->font_small, "pink = skip / branch; hover to trace; scroll = zoom", GRAPH_VIEW.x + 14,
         GRAPH_VIEW.y + GRAPH_VIEW.h - 18, dim);
     SDL_RenderSetClipRect(g->ren, NULL);
+
+    if (g->preset_open) { /* the menu floats over the canvas */
+        SDL_Rect bg = {BTN_PRESETS.x - 4, BTN_PRESETS.y + BTN_PRESETS.h + 1, BTN_PRESETS.w + 8, preset_count(g) * 30 + 8};
+        draw_shadow(g->ren, bg, 9);
+        rrect_bordered(g->ren, bg, 9, (SDL_Color){COL_SURFACE2}, (SDL_Color){COL_LOSS});
+        static const char *hint[NUM_PRESETS] = {"4 conv + fc", "residual", "per-pixel masks", "generative"};
+        for (int i = 0; i < preset_count(g); ++i) {
+            SDL_Rect r = preset_rect(i);
+            int id = preset_at(g, i);
+            if (SDL_PointInRect(&mouse, &r)) {
+                SDL_Rect hl = {r.x, r.y, r.w, r.h};
+                fill_rrect(g->ren, hl, 6, (SDL_Color){52, 62, 92, 255});
+            }
+            txt(g, g->font, PRESET_NAMES[id], r.x + 10, r.y + 4, (SDL_Color){COL_TEXT});
+            int tw = 0;
+            TTF_SizeText(g->font_small, hint[id], &tw, NULL);
+            txt(g, g->font_small, hint[id], r.x + r.w - tw - 8, r.y + 8, (SDL_Color){COL_TEXT_DIM});
+        }
+    }
 }
 
 static void draw_form(Gui *g) {
@@ -1675,8 +2126,18 @@ static void draw_form(Gui *g) {
 
     /* training parameters */
     draw_panel(g->ren, PANEL_TRAIN);
-    txt(g, g->font_big, "Training", PANEL_TRAIN.x + 18, PANEL_TRAIN.y + 14, (SDL_Color){COL_TEXT});
-    static const char *labels[NUM_GENERAL_FIELDS] = {"dataset", "epochs", "batch size", "learning rate", "momentum",
+    static const char *prob_label[3] = {"Classification", "Segmentation", "Generation"};
+    for (int i = 0; i < 3; ++i) { /* the problem comes first: a segmented control */
+        SDL_Rect pb = PROBLEM_BTN[i];
+        int on = g->problem == i, hov = SDL_PointInRect(&mouse, &pb);
+        SDL_Color fill = on ? (SDL_Color){COL_LOSS} : (hov ? (SDL_Color){36, 42, 60, 255} : (SDL_Color){COL_SURFACE2});
+        rrect_bordered(g->ren, pb, 9, fill, on ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_BORDER_HI});
+        int tw = 0;
+        TTF_SizeText(g->font_med, prob_label[i], &tw, NULL);
+        txt(g, g->font_med, prob_label[i], pb.x + (pb.w - tw) / 2, pb.y + (pb.h - TTF_FontHeight(g->font_med)) / 2,
+            on ? (SDL_Color){10, 14, 28, 255} : (SDL_Color){COL_TEXT_DIM});
+    }
+    static const char *labels[NUM_GENERAL_FIELDS] = {"dataset", "epochs", "batch size", "learning rate", "optimizer (0/1)", "momentum",
                                                        "normalize (0/1)", "augment (0-2)", "seed", "fc viz pool",
                                                        "weights every N"};
     SDL_Color dim = (SDL_Color){COL_TEXT_DIM};
@@ -1684,7 +2145,7 @@ static void draw_form(Gui *g) {
         txt(g, g->font, labels[i], PANEL_TRAIN.x + 18, g->fields[i].rect.y + 5, dim);
         draw_field(g, i);
     }
-    int hy = 60 + NUM_GENERAL_FIELDS * 40 + 2;
+    int hy = 58 + NUM_GENERAL_FIELDS * FIELD_PITCH + 2;
     const DatasetInfo *fds = form_dataset(g);
     char info[64] = "";
     if (fds) snprintf(info, sizeof(info), "%dx%d%s px  -  %d images  -  %d classes", fds->cols, fds->rows,
@@ -1695,7 +2156,7 @@ static void draw_form(Gui *g) {
     txt(g, g->font_small, "picking a dataset loads its suggested settings", PANEL_TRAIN.x + 18, hy + 30, dim);
     txt(g, g->font_small, "normalize: zero-mean, unit-variance pixels", PANEL_TRAIN.x + 18, hy + 44, dim);
     txt(g, g->font_small, "augment: 1 flips both ways, 2 flips + shifts", PANEL_TRAIN.x + 18, hy + 58, dim);
-    txt(g, g->font_small, "momentum 0 = plain SGD (try 0.9 + lower lr)", PANEL_TRAIN.x + 18, hy + 72, dim);
+    txt(g, g->font_small, "optimizer: 0 = SGD + momentum, 1 = Adam (lr ~0.001)", PANEL_TRAIN.x + 18, hy + 72, dim);
     txt(g, g->font_small, "fc viz pool, weights every N: viewer only", PANEL_TRAIN.x + 18, hy + 86, dim);
 
     int ry = hy + 108;
@@ -1703,9 +2164,9 @@ static void draw_form(Gui *g) {
     SDL_RenderDrawLine(g->ren, PANEL_TRAIN.x + 16, ry - 8, PANEL_TRAIN.x + PANEL_TRAIN.w - 16, ry - 8);
     txt(g, g->font_med, "Model rules", PANEL_TRAIN.x + 18, ry, (SDL_Color){COL_TEXT});
     static const char *rules[] = {"conv / pool / gap need an image, fc a flat input (flatten / gap)",
-                                  "add sums two same-shape tensors (skip link)",
+                                  "add sums, cat joins channels (needs the same height and width)",
                                   "every block's output must be read by another",
-                                  "end with an fc whose out = #classes",
+                                  "end: fc = #classes | conv map = #classes | image (vae)",
                                   "x deletes a block, re-joining its neighbours"};
     for (int i = 0; i < 5; ++i) {
         fill_circle_aa(g->ren, PANEL_TRAIN.x + 22, ry + 30 + i * 15, 2, (SDL_Color){COL_LOSS});
@@ -1732,6 +2193,9 @@ static void draw_form(Gui *g) {
     if (g->run_active) {
         txt(g, g->font_small, "a run is active: applying replaces it", 410, 628, dim);
         draw_button(g, BTN_BACK, "< back to training view", g->font, SDL_PointInRect(&mouse, &BTN_BACK), 1);
+        if (g->pred_hdr.n > 0 || g->gen_hdr.n_recon > 0)
+            draw_button(g, BTN_VIEW_PRED, g->run_cfg.task == TASK_GENERATE ? "view generations" : "view predictions", g->font,
+                        SDL_PointInRect(&mouse, &BTN_VIEW_PRED), 1);
     }
     int can_start = g->form_valid && !g->worker_gone;
     draw_button_primary(g, BTN_START, g->run_active ? "Apply & restart" : "Start training", g->font_big,
@@ -1774,15 +2238,24 @@ static int model_info_ok(const ModelInfo *m) {
 static void ensure_sample(Gui *g) {
     int w = g->run_cfg.img_w, h = g->run_cfg.img_h, c = g->run_cfg.img_c;
     if (w < 1 || h < 1 || c < 1) return;
-    if (g->digit_tex && g->digit_w == w && g->digit_h == h && g->digit_c == c) return;
+    int want_masks = g->run_cfg.task == TASK_SEGMENT || g->run_cfg.task == TASK_GENERATE;
+    if (g->digit_tex && g->digit_w == w && g->digit_h == h && g->digit_c == c && (g->mask_tex[0] != NULL) == want_masks) return;
     if (g->digit_tex) SDL_DestroyTexture(g->digit_tex);
     g->digit_tex = SDL_CreateTexture(g->ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
     if (g->digit_tex) SDL_SetTextureScaleMode(g->digit_tex, SDL_ScaleModeNearest);
     g->digit_w = w;
     g->digit_h = h;
     g->digit_c = c;
+    for (int k = 0; k < 2; ++k) {
+        if (g->mask_tex[k]) SDL_DestroyTexture(g->mask_tex[k]);
+        g->mask_tex[k] = NULL;
+        if (g->run_cfg.task == TASK_SEGMENT || (g->run_cfg.task == TASK_GENERATE && k == 0)) {
+            g->mask_tex[k] = SDL_CreateTexture(g->ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
+            if (g->mask_tex[k]) SDL_SetTextureScaleMode(g->mask_tex[k], SDL_ScaleModeNearest);
+        }
+    }
     free(g->sample);
-    g->sample = (unsigned char *)calloc((size_t)w * (size_t)h * (size_t)c, 1);
+    g->sample = (unsigned char *)calloc(train_sample_bytes(&g->run_cfg), 1);
 }
 
 static void refresh_run_ds(Gui *g) {
@@ -1810,12 +2283,19 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         g->weights_valid = 0;
         g->has_model = 1;
         g->has_record = 0;
+        free(g->pred_data); /* predictions belong to the model that made them */
+        g->pred_data = NULL;
+        g->pred_hdr.n = 0;
+        free(g->gen_data);
+        g->gen_data = NULL;
+        memset(&g->gen_hdr, 0, sizeof(g->gen_hdr));
+        g->pred_page = 0;
         if (g->weights_tab >= g->model.n_viz) g->weights_tab = 0;
         gui_clear_history(g);
     } else if (type == MSG_PROGRESS) {
         if (!g->has_model) return;
         size_t wbytes = sizeof(float) * (size_t)g->model.total_floats;
-        size_t img_bytes = (size_t)g->run_cfg.img_h * (size_t)g->run_cfg.img_w * (size_t)g->run_cfg.img_c;
+        size_t img_bytes = train_sample_bytes(&g->run_cfg);
         size_t base = sizeof(Progress) + img_bytes;
         if (!g->sample || bytes < base || (bytes != base && bytes != base + wbytes)) return;
         Progress prog;
@@ -1831,6 +2311,31 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         g->prog = prog;
         g->has_record = 1;
         gui_push_point(g, prog.loss);
+    } else if (type == MSG_GENERATED) {
+        if (!g->has_model || g->run_cfg.task != TASK_GENERATE || bytes < sizeof(GenHeader)) return;
+        GenHeader h;
+        memcpy(&h, p, sizeof(h));
+        size_t img = (size_t)g->run_cfg.img_h * g->run_cfg.img_w * g->run_cfg.img_c;
+        if (h.n_recon < 1 || h.n_recon > 64 || h.n_samples < 0 || h.n_samples > 64 || h.n_rows < 0 || h.n_rows > 8 ||
+            h.n_steps < 0 || h.n_steps > 32 ||
+            bytes != sizeof(GenHeader) + img * ((size_t)2 * h.n_recon + h.n_samples + (size_t)h.n_rows * h.n_steps))
+            return;
+        free(g->gen_data);
+        g->gen_data = (unsigned char *)malloc(bytes);
+        if (!g->gen_data) { memset(&g->gen_hdr, 0, sizeof(g->gen_hdr)); return; }
+        memcpy(g->gen_data, p, bytes);
+        g->gen_hdr = h;
+    } else if (type == MSG_PREDICTIONS) {
+        if (!g->has_model || bytes < sizeof(PredHeader)) return;
+        PredHeader h;
+        memcpy(&h, p, sizeof(h));
+        size_t record = sizeof(PredSample) + train_sample_bytes(&g->run_cfg);
+        if (h.n < 1 || h.n > PRED_MAX_SAMPLES || bytes != sizeof(PredHeader) + (size_t)h.n * record) return;
+        free(g->pred_data);
+        g->pred_data = (unsigned char *)malloc(bytes);
+        if (!g->pred_data) { g->pred_hdr.n = 0; return; }
+        memcpy(g->pred_data, p, bytes);
+        g->pred_hdr = h;
     } else if (type == MSG_ERROR) {
         size_t n = bytes < sizeof(g->worker_msg) ? bytes : sizeof(g->worker_msg) - 1;
         memcpy(g->worker_msg, p, n);
@@ -1927,7 +2432,8 @@ static void open_weights_window(Gui *g) {
     if (g->weights_win) { SDL_RaiseWindow(g->weights_win); return; }
 
     g->weights_win = SDL_CreateWindow("tinyDL - layer weights (live)", SDL_WINDOWPOS_UNDEFINED,
-                                       SDL_WINDOWPOS_UNDEFINED, WEIGHTS_WIN_W, WEIGHTS_WIN_H, SDL_WINDOW_SHOWN);
+                                       SDL_WINDOWPOS_UNDEFINED, WEIGHTS_WIN_W, WEIGHTS_WIN_H,
+                                       SDL_WINDOW_SHOWN | SDL_WINDOW_ALWAYS_ON_TOP /* stays visible over a fullscreen main window */);
     if (!g->weights_win) {
         fprintf(stderr, "SDL_CreateWindow (weights) failed: %s\n", SDL_GetError());
         return;
@@ -2290,7 +2796,18 @@ static void render_weights_window(Gui *g) {
 
 static void draw_chart(Gui *g, SDL_Rect r) {
     draw_panel(g->ren, r);
-    txt(g, g->font, "loss (0-2.5)", r.x + 10, r.y + 8, (SDL_Color){COL_TEXT_DIM});
+    /* classification losses live in 0-2.5; a VAE's per-pixel loss is far smaller, so its axis follows the data */
+    float ymax = LOSS_CLIP;
+    int gen = g->run_cfg.task == TASK_GENERATE;
+    if (gen) {
+        ymax = 0.0f;
+        for (int i = 0; i < g->hist_count; ++i) ymax = fmaxf(ymax, g->loss_hist[i]);
+        ymax = ymax > 1e-4f ? ymax * 1.1f : 1.0f;
+    }
+    char title[48];
+    if (gen) snprintf(title, sizeof(title), "loss per pixel (0-%.2f)", ymax);
+    else snprintf(title, sizeof(title), "loss (0-2.5)");
+    txt(g, g->font, title, r.x + 10, r.y + 8, (SDL_Color){COL_TEXT_DIM});
 
     int pad_top = 32, pad_bottom = 10, pad_x = 10;
     int px0 = r.x + pad_x, px1 = r.x + r.w - pad_x;
@@ -2309,8 +2826,8 @@ static void draw_chart(Gui *g, SDL_Rect r) {
 
     SDL_SetRenderDrawColor(g->ren, COL_LOSS);
     for (int i = 1; i < n; ++i) {
-        float v0 = fminf(g->loss_hist[(start + i - 1) % HISTORY_LEN], LOSS_CLIP) / LOSS_CLIP;
-        float v1 = fminf(g->loss_hist[(start + i) % HISTORY_LEN], LOSS_CLIP) / LOSS_CLIP;
+        float v0 = fminf(g->loss_hist[(start + i - 1) % HISTORY_LEN], ymax) / ymax;
+        float v1 = fminf(g->loss_hist[(start + i) % HISTORY_LEN], ymax) / ymax;
         int x0 = px0 + plot_w * (i - 1) / (HISTORY_LEN - 1);
         int x1 = px0 + plot_w * i / (HISTORY_LEN - 1);
         int y0 = py1 - (int)(plot_h * v0);
@@ -2319,7 +2836,107 @@ static void draw_chart(Gui *g, SDL_Rect r) {
     }
 }
 
+/* Segmentation: the sample, then the true mask and the predicted mask drawn over a dimmed copy of it. */
+static void draw_segmentation_sample(Gui *g, SDL_Rect box) {
+    draw_panel(g->ren, box);
+    if (!g->digit_tex || !g->sample || !g->mask_tex[0] || !g->mask_tex[1]) return;
+    int w = g->digit_w, h = g->digit_h, c = g->digit_c;
+    size_t plane = (size_t)w * h;
+    const unsigned char *gt = g->sample + plane * c, *pred = gt + plane;
+
+    void *pixels;
+    int pitch;
+    if (SDL_LockTexture(g->digit_tex, NULL, &pixels, &pitch) == 0) {
+        for (int y = 0; y < h; ++y) {
+            Uint32 *row = (Uint32 *)((Uint8 *)pixels + y * pitch);
+            for (int x = 0; x < w; ++x) {
+                size_t at = (size_t)y * w + x;
+                Uint8 r = g->sample[at], gr = c >= 3 ? g->sample[plane + at] : r, b = c >= 3 ? g->sample[2 * plane + at] : r;
+                row[x] = (0xFFu << 24) | (b << 16) | (gr << 8) | r;
+            }
+        }
+        SDL_UnlockTexture(g->digit_tex);
+    }
+    static const Uint8 tint[2][3] = {{245, 101, 112}, {96, 140, 255}}; /* true: red, predicted: blue */
+    const unsigned char *masks[2] = {gt, pred};
+    for (int k = 0; k < 2; ++k) {
+        if (SDL_LockTexture(g->mask_tex[k], NULL, &pixels, &pitch) != 0) continue;
+        for (int y = 0; y < h; ++y) {
+            Uint32 *row = (Uint32 *)((Uint8 *)pixels + y * pitch);
+            for (int x = 0; x < w; ++x) {
+                size_t at = (size_t)y * w + x;
+                Uint8 r = g->sample[at], gr = c >= 3 ? g->sample[plane + at] : r, b = c >= 3 ? g->sample[2 * plane + at] : r;
+                if (masks[k][at]) { r = tint[k][0]; gr = tint[k][1]; b = tint[k][2]; }
+                else { r = (Uint8)(r * 0.55f); gr = (Uint8)(gr * 0.55f); b = (Uint8)(b * 0.55f); }
+                row[x] = (0xFFu << 24) | (b << 16) | (gr << 8) | r;
+            }
+        }
+        SDL_UnlockTexture(g->mask_tex[k]);
+    }
+
+    int gap = 8, tile = (box.w - 4 * gap) / 3;
+    SDL_Texture *tex[3] = {g->digit_tex, g->mask_tex[0], g->mask_tex[1]};
+    const char *cap[3] = {"scan", "true tumour", "predicted"};
+    for (int i = 0; i < 3; ++i) {
+        SDL_Rect dst = {box.x + gap + i * (tile + gap), box.y + 14, tile, tile};
+        SDL_RenderCopy(g->ren, tex[i], NULL, &dst);
+        txt(g, g->font_small, cap[i], dst.x + 2, dst.y + tile + 3, (SDL_Color){COL_TEXT_DIM});
+    }
+    long tp = 0, fp = 0, fn = 0, gt_px = 0, pr_px = 0;
+    for (size_t i = 0; i < plane; ++i) {
+        int a = gt[i] != 0, b = pred[i] != 0;
+        tp += a && b; fp += !a && b; fn += a && !b; gt_px += a; pr_px += b;
+    }
+    char buf[80];
+    snprintf(buf, sizeof(buf), "tumour pixels: true %ld, predicted %ld", gt_px, pr_px);
+    txt(g, g->font_small, buf, box.x + 10, box.y + box.h - 34, (SDL_Color){COL_TEXT_DIM});
+    if (gt_px + pr_px > 0) snprintf(buf, sizeof(buf), "this sample: dice %.2f", 2.0 * tp / (2.0 * tp + fp + fn));
+    else snprintf(buf, sizeof(buf), "this sample: no tumour");
+    txt(g, g->font_small, buf, box.x + 10, box.y + box.h - 18, (SDL_Color){COL_TEXT});
+}
+
+/* VAE: the sample the batch showed, next to the model's reconstruction of it. */
+static void draw_reconstruction_sample(Gui *g, SDL_Rect box) {
+    draw_panel(g->ren, box);
+    if (!g->digit_tex || !g->sample || !g->mask_tex[0]) return;
+    int w = g->digit_w, h = g->digit_h, c = g->digit_c;
+    size_t px = (size_t)w * h;
+    SDL_Texture *tex[2] = {g->digit_tex, g->mask_tex[0]};
+    for (int k = 0; k < 2; ++k) {
+        const unsigned char *src = g->sample + (size_t)k * px * c;
+        void *pixels;
+        int pitch;
+        if (SDL_LockTexture(tex[k], NULL, &pixels, &pitch) != 0) continue;
+        for (int y = 0; y < h; ++y) {
+            Uint32 *row = (Uint32 *)((Uint8 *)pixels + y * pitch);
+            for (int x = 0; x < w; ++x) {
+                size_t at = (size_t)y * w + x;
+                Uint8 r = src[at], gr = c >= 3 ? src[px + at] : r, b = c >= 3 ? src[2 * px + at] : r;
+                row[x] = (0xFFu << 24) | (b << 16) | (gr << 8) | r;
+            }
+        }
+        SDL_UnlockTexture(tex[k]);
+    }
+    int gap = 14, tile = (box.w - 3 * gap) / 2;
+    if (tile > box.h - 56) tile = box.h - 56;
+    static const char *cap[2] = {"input", "reconstruction"};
+    for (int k = 0; k < 2; ++k) {
+        SDL_Rect dst = {box.x + gap + k * (tile + gap), box.y + 14, tile, tile};
+        SDL_RenderCopy(g->ren, tex[k], NULL, &dst);
+        txt(g, g->font_small, cap[k], dst.x, dst.y + tile + 4, (SDL_Color){COL_TEXT_DIM});
+    }
+    txt(g, g->font_small, "the latest batch's first image", box.x + 10, box.y + box.h - 20, (SDL_Color){COL_TEXT_DIM});
+}
+
 static void draw_digit(Gui *g, SDL_Rect box) {
+    if (g->run_cfg.task == TASK_SEGMENT) {
+        draw_segmentation_sample(g, box);
+        return;
+    }
+    if (g->run_cfg.task == TASK_GENERATE) {
+        draw_reconstruction_sample(g, box);
+        return;
+    }
     const Progress *p = &g->prog;
     int correct = p->true_label == p->pred_label;
     draw_panel(g->ren, box);
@@ -2360,6 +2977,196 @@ static void draw_digit(Gui *g, SDL_Rect box) {
     txt(g, g->font, buf, box.x + 14, box.y + 16 + size + 28, verdict);
 }
 
+/* -- predictions page ---------------------------------------------------- */
+
+static SDL_Texture *pred_texture(Gui *g, int slot) {
+    int w = g->run_cfg.img_w, h = g->run_cfg.img_h;
+    if (g->pred_tex_w != w || g->pred_tex_h != h) {
+        for (int i = 0; i < 96; ++i) {
+            if (g->pred_tex[i]) SDL_DestroyTexture(g->pred_tex[i]);
+            g->pred_tex[i] = NULL;
+        }
+        g->pred_tex_w = w;
+        g->pred_tex_h = h;
+    }
+    if (!g->pred_tex[slot]) {
+        g->pred_tex[slot] = SDL_CreateTexture(g->ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (g->pred_tex[slot]) SDL_SetTextureScaleMode(g->pred_tex[slot], SDL_ScaleModeNearest);
+    }
+    return g->pred_tex[slot];
+}
+
+/* Fills a texture from a sample's planes: mask == NULL draws the scan itself, otherwise the scan dimmed with
+ * the mask painted over it in `tint`. */
+static void fill_pred_texture(SDL_Texture *tex, const unsigned char *pix, int c, int w, int h, const unsigned char *mask,
+                              const Uint8 tint[3]) {
+    void *pixels;
+    int pitch;
+    if (!tex || SDL_LockTexture(tex, NULL, &pixels, &pitch) != 0) return;
+    size_t plane = (size_t)w * h;
+    for (int y = 0; y < h; ++y) {
+        Uint32 *row = (Uint32 *)((Uint8 *)pixels + y * pitch);
+        for (int x = 0; x < w; ++x) {
+            size_t at = (size_t)y * w + x;
+            Uint8 r = pix[at], gr = c >= 3 ? pix[plane + at] : r, b = c >= 3 ? pix[2 * plane + at] : r;
+            if (mask) {
+                if (mask[at]) { r = tint[0]; gr = tint[1]; b = tint[2]; }
+                else { r = (Uint8)(r * 0.55f); gr = (Uint8)(gr * 0.55f); b = (Uint8)(b * 0.55f); }
+            }
+            row[x] = (0xFFu << 24) | (b << 16) | (gr << 8) | r;
+        }
+    }
+    SDL_UnlockTexture(tex);
+}
+
+static void draw_predictions(Gui *g) {
+    SDL_Point mouse = {g->mouse_x, g->mouse_y};
+    const PredHeader *hd = &g->pred_hdr;
+    const TrainConfig *cfg = &g->run_cfg;
+    int seg = cfg->task == TASK_SEGMENT;
+    int cols = seg ? 3 : 6, rows = seg ? 3 : 4, per_page = cols * rows;
+    int pages = hd->n > 0 ? (hd->n + per_page - 1) / per_page : 1;
+    if (g->pred_page >= pages) g->pred_page = pages - 1;
+    if (g->pred_page < 0) g->pred_page = 0;
+
+    draw_button(g, BTN_PRED_BACK, "< Back", g->font, SDL_PointInRect(&mouse, &BTN_PRED_BACK), 1);
+    txt(g, g->font_big, "Predictions", 146, 24, (SDL_Color){COL_TEXT});
+    char buf[160];
+    if (hd->n > 0) {
+        snprintf(buf, sizeof(buf), "%s  -  model after epoch %d  -  %s  -  page %d / %d", seg ? "segmentation" : "classification",
+                 hd->epoch + 1, hd->from_test ? "test split" : "training split (no test split)", g->pred_page + 1, pages);
+        txt(g, g->font_small, buf, 300, 33, (SDL_Color){COL_TEXT_DIM});
+    }
+    draw_button(g, BTN_PRED_PREV, "prev", g->font, SDL_PointInRect(&mouse, &BTN_PRED_PREV), g->pred_page > 0);
+    draw_button(g, BTN_PRED_NEXT, "next", g->font, SDL_PointInRect(&mouse, &BTN_PRED_NEXT), g->pred_page + 1 < pages);
+
+    SDL_Rect area = {20, 68, 1110, 612};
+    if (hd->n < 1 || !g->pred_data) {
+        draw_panel(g->ren, area);
+        txt(g, g->font_big, g->has_model ? "predictions appear after the first epoch finishes" : "no model yet", area.x + 250,
+            area.y + 270, (SDL_Color){COL_TEXT_DIM});
+        return;
+    }
+
+    int c = cfg->img_c, w = cfg->img_w, h = cfg->img_h;
+    size_t sample_bytes = train_sample_bytes(cfg), record = sizeof(PredSample) + sample_bytes, plane = (size_t)w * h;
+    int gap = seg ? 12 : 10;
+    int cell_w = (area.w - (cols - 1) * gap) / cols, cell_h = (area.h - (rows - 1) * gap) / rows;
+    static const Uint8 tint_true[3] = {245, 101, 112}, tint_pred[3] = {96, 140, 255};
+
+    for (int k = 0; k < per_page; ++k) {
+        int idx = g->pred_page * per_page + k;
+        if (idx >= hd->n) break;
+        const unsigned char *rec = g->pred_data + sizeof(PredHeader) + (size_t)idx * record;
+        PredSample ps;
+        memcpy(&ps, rec, sizeof(ps));
+        const unsigned char *pix = rec + sizeof(PredSample);
+        SDL_Rect cell = {area.x + (k % cols) * (cell_w + gap), area.y + (k / cols) * (cell_h + gap), cell_w, cell_h};
+
+        if (seg) {
+            SDL_Color edge = ps.f < 0 ? (SDL_Color){COL_BORDER_HI} : ps.f >= 0.75f ? (SDL_Color){COL_GOOD}
+                             : ps.f >= 0.4f ? (SDL_Color){242, 190, 80, 255} : (SDL_Color){COL_BAD};
+            rrect_bordered(g->ren, cell, 10, (SDL_Color){COL_SURFACE}, edge);
+            const unsigned char *gt = pix + plane * c, *pred = gt + plane;
+            SDL_Texture *t0 = pred_texture(g, k * 3), *t1 = pred_texture(g, k * 3 + 1), *t2 = pred_texture(g, k * 3 + 2);
+            fill_pred_texture(t0, pix, c, w, h, NULL, tint_true);
+            fill_pred_texture(t1, pix, c, w, h, gt, tint_true);
+            fill_pred_texture(t2, pix, c, w, h, pred, tint_pred);
+            int tgap = 8, tile = (cell.w - 4 * tgap) / 3;
+            if (tile > cell.h - 54) tile = cell.h - 54;
+            SDL_Texture *tex[3] = {t0, t1, t2};
+            static const char *cap[3] = {"scan", "true", "predicted"};
+            for (int i = 0; i < 3; ++i) {
+                SDL_Rect dst = {cell.x + tgap + i * (tile + tgap), cell.y + 12, tile, tile};
+                if (tex[i]) SDL_RenderCopy(g->ren, tex[i], NULL, &dst);
+                txt(g, g->font_small, cap[i], dst.x + 2, dst.y + tile + 2, (SDL_Color){COL_TEXT_DIM});
+            }
+            if (ps.f >= 0) snprintf(buf, sizeof(buf), "dice %.2f   tumour px: true %d, predicted %d", ps.f, ps.a, ps.b);
+            else snprintf(buf, sizeof(buf), "no tumour, none predicted");
+            txt(g, g->font_small, buf, cell.x + 10, cell.y + cell.h - 20,
+                ps.f < 0 ? (SDL_Color){COL_GOOD} : (SDL_Color){COL_TEXT});
+        } else {
+            int ok = ps.a == ps.b;
+            rrect_bordered(g->ren, cell, 9, (SDL_Color){COL_SURFACE}, ok ? (SDL_Color){COL_GOOD} : (SDL_Color){COL_BAD});
+            SDL_Texture *t = pred_texture(g, k);
+            fill_pred_texture(t, pix, c, w, h, NULL, tint_true);
+            int tile = cell.w - 40 < cell.h - 46 ? cell.w - 40 : cell.h - 46;
+            SDL_Rect dst = {cell.x + (cell.w - tile) / 2, cell.y + 8, tile, tile};
+            if (t) SDL_RenderCopy(g->ren, t, NULL, &dst);
+            char na[CLASS_NAME_LEN + 8], nb[CLASS_NAME_LEN + 8];
+            snprintf(buf, sizeof(buf), "pred %s %.0f%%", class_name(&g->run_ds, ps.b, na, sizeof(na)), ps.f * 100.0f);
+            txt(g, g->font_small, buf, cell.x + 8, cell.y + cell.h - 34, ok ? (SDL_Color){COL_GOOD} : (SDL_Color){COL_BAD});
+            snprintf(buf, sizeof(buf), "true %s", class_name(&g->run_ds, ps.a, nb, sizeof(nb)));
+            txt(g, g->font_small, buf, cell.x + 8, cell.y + cell.h - 18, (SDL_Color){COL_TEXT_DIM});
+        }
+    }
+}
+
+/* The VAE's page: reconstructions, samples from the prior, interpolations (see GenHeader). */
+static void draw_generations(Gui *g) {
+    SDL_Point mouse = {g->mouse_x, g->mouse_y};
+    const GenHeader *hd = &g->gen_hdr;
+    draw_button(g, BTN_PRED_BACK, "< Back", g->font, SDL_PointInRect(&mouse, &BTN_PRED_BACK), 1);
+    txt(g, g->font_big, "Generations", 146, 24, (SDL_Color){COL_TEXT});
+    char buf[160];
+    if (hd->n_recon > 0) {
+        snprintf(buf, sizeof(buf), "VAE  -  latent size %d  -  model after epoch %d", hd->z_dim, hd->epoch + 1);
+        txt(g, g->font_small, buf, 320, 33, (SDL_Color){COL_TEXT_DIM});
+    }
+    SDL_Rect area = {20, 68, 1110, 612};
+    if (hd->n_recon < 1 || !g->gen_data) {
+        draw_panel(g->ren, area);
+        txt(g, g->font_big, "generations appear after the first epoch finishes", area.x + 250, area.y + 270,
+            (SDL_Color){COL_TEXT_DIM});
+        return;
+    }
+    int c = g->run_cfg.img_c, w = g->run_cfg.img_w, h = g->run_cfg.img_h;
+    size_t img = (size_t)w * h * c;
+    const unsigned char *data = g->gen_data + sizeof(GenHeader);
+    static const Uint8 none[3] = {0, 0, 0};
+
+    int cols = 14, gap = 6, tile = (area.w - (cols - 1) * gap) / cols;
+    int y = area.y;
+    int slot = 0;
+    SDL_Color dim = {COL_TEXT_DIM};
+
+    /* reconstructions: the original above its reconstruction */
+    txt(g, g->font_small, "reconstructions   (top: test image, bottom: what the VAE rebuilds from its latent)", area.x, y, dim);
+    y += 18;
+    for (int j = 0; j < hd->n_recon && j < cols; ++j)
+        for (int k = 0; k < 2; ++k) {
+            SDL_Texture *t = pred_texture(g, slot++);
+            fill_pred_texture(t, data + ((size_t)2 * j + k) * img, c, w, h, NULL, none);
+            SDL_Rect dst = {area.x + j * (tile + gap), y + k * (tile + gap), tile, tile};
+            if (t) SDL_RenderCopy(g->ren, t, NULL, &dst);
+        }
+    y += 2 * (tile + gap) + 8;
+    data += (size_t)2 * hd->n_recon * img;
+
+    /* samples from the prior, the same latents every epoch */
+    txt(g, g->font_small, "new images   (decoded from random latents z ~ N(0, 1); the same z every epoch)", area.x, y, dim);
+    y += 18;
+    for (int j = 0; j < hd->n_samples; ++j) {
+        SDL_Texture *t = pred_texture(g, slot++);
+        fill_pred_texture(t, data + (size_t)j * img, c, w, h, NULL, none);
+        SDL_Rect dst = {area.x + (j % cols) * (tile + gap), y + (j / cols) * (tile + gap), tile, tile};
+        if (t) SDL_RenderCopy(g->ren, t, NULL, &dst);
+    }
+    y += ((hd->n_samples + cols - 1) / cols) * (tile + gap) + 8;
+    data += (size_t)hd->n_samples * img;
+
+    /* interpolation */
+    txt(g, g->font_small, "interpolation   (each row walks the latent from one test image to another)", area.x, y, dim);
+    y += 18;
+    for (int r = 0; r < hd->n_rows; ++r)
+        for (int k = 0; k < hd->n_steps && k < cols; ++k) {
+            SDL_Texture *t = pred_texture(g, slot++);
+            fill_pred_texture(t, data + ((size_t)r * hd->n_steps + k) * img, c, w, h, NULL, none);
+            SDL_Rect dst = {area.x + k * (tile + gap), y + r * (tile + gap), tile, tile};
+            if (t && slot <= 96) SDL_RenderCopy(g->ren, t, NULL, &dst);
+        }
+}
+
 static void draw_dashboard(Gui *g) {
     SDL_Point mouse = {g->mouse_x, g->mouse_y};
     SDL_Rect arch_box = {20, 20, 1110, 164};
@@ -2383,8 +3190,20 @@ static void draw_dashboard(Gui *g) {
     int wb_hover = SDL_PointInRect(&mouse, &wb);
     rrect_bordered(g->ren, wb, 12, wb_hover ? col_mix((SDL_Color){COL_SURFACE}, (SDL_Color){COL_LOSS}, 0.16f) : (SDL_Color){COL_SURFACE},
                    wb_hover ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_BORDER_HI});
-    txt(g, g->font_big, "View layer weights", wb.x + 20, wb.y + wb.h / 2 - 26, (SDL_Color){COL_LOSS});
-    txt(g, g->font, "opens a live 3D weights window", wb.x + 20, wb.y + wb.h / 2 + 4, (SDL_Color){COL_TEXT_DIM});
+    txt(g, g->font_big, "View layer weights", wb.x + 20, wb.y + 10, (SDL_Color){COL_LOSS});
+    txt(g, g->font_small, "a live 3D weights window", wb.x + 20, wb.y + 42, (SDL_Color){COL_TEXT_DIM});
+
+    SDL_Rect pb = PRED_BUTTON;
+    int pb_hover = SDL_PointInRect(&mouse, &pb);
+    rrect_bordered(g->ren, pb, 12, pb_hover ? col_mix((SDL_Color){COL_SURFACE}, (SDL_Color){COL_GOOD}, 0.14f) : (SDL_Color){COL_SURFACE},
+                   pb_hover ? (SDL_Color){COL_GOOD} : (SDL_Color){COL_BORDER_HI});
+    int gen_run = g->run_cfg.task == TASK_GENERATE;
+    int have = gen_run ? g->gen_hdr.n_recon > 0 : g->pred_hdr.n > 0;
+    txt(g, g->font_big, gen_run ? "View generations" : "View predictions", pb.x + 20, pb.y + 10, (SDL_Color){COL_GOOD});
+    txt(g, g->font_small,
+        !have ? "available after the first epoch"
+              : (gen_run ? "reconstructions, new images, interpolation" : "browse the model's answers on fixed samples"),
+        pb.x + 20, pb.y + 42, (SDL_Color){COL_TEXT_DIM});
 
     SDL_Rect info_box = {830, 530, 300, 150};
     draw_panel(g->ren, info_box);
@@ -2395,9 +3214,18 @@ static void draw_dashboard(Gui *g) {
         txt(g, g->font_big, line, info_box.x + 14, info_box.y + 12, (SDL_Color){COL_TEXT});
         snprintf(line, sizeof(line), "batch %d / %d   %.1fs", p->batch, p->batch_count, p->elapsed);
         txt(g, g->font, line, info_box.x + 14, info_box.y + 44, (SDL_Color){COL_TEXT_DIM});
-        snprintf(line, sizeof(line), "loss %.4f   acc %.1f%%", p->loss, p->acc * 100.0f);
+        int seg = g->run_cfg.task == TASK_SEGMENT, gen = g->run_cfg.task == TASK_GENERATE;
+        if (gen) snprintf(line, sizeof(line), "loss/px %.4f  KL %.1f", p->loss, p->test_iou);
+        else if (seg) snprintf(line, sizeof(line), "loss %.4f   dice %.3f", p->loss, p->acc);
+        else snprintf(line, sizeof(line), "loss %.4f   acc %.1f%%", p->loss, p->acc * 100.0f);
         txt(g, g->font, line, info_box.x + 14, info_box.y + 66, (SDL_Color){COL_LOSS});
-        if (p->test_acc >= 0.0f) snprintf(line, sizeof(line), "test acc %.1f%%", p->test_acc * 100.0f);
+        if (gen) {
+            if (p->test_acc >= 0.0f) snprintf(line, sizeof(line), "test recon/px %.4f", p->test_acc);
+            else snprintf(line, sizeof(line), "test recon --");
+        } else if (seg) {
+            if (p->test_acc >= 0.0f) snprintf(line, sizeof(line), "test dice %.3f   IoU %.3f", p->test_acc, p->test_iou);
+            else snprintf(line, sizeof(line), "test dice --");
+        } else if (p->test_acc >= 0.0f) snprintf(line, sizeof(line), "test acc %.1f%%", p->test_acc * 100.0f);
         else snprintf(line, sizeof(line), "test acc --");
         txt(g, g->font, line, info_box.x + 14, info_box.y + 88, (SDL_Color){COL_GOOD});
     } else {
@@ -2480,22 +3308,60 @@ static void focus_step(Gui *g, int dir) {
     }
 }
 
+/* Zooms by `factor` keeping the view-space point under (cx, cy) - canvas-local screen pixels - where it is. */
+static void zoom_at(Gui *g, float cx, float cy, float factor) {
+    float z0 = g->zoom, z1 = z0 * factor;
+    if (z1 < ZOOM_MIN) z1 = ZOOM_MIN;
+    if (z1 > ZOOM_MAX) z1 = ZOOM_MAX;
+    if (z1 == z0) return;
+    g->pan_x += cx / z1 - cx / z0;
+    g->pan_y += cy / z1 - cy / z0;
+    g->zoom = z1;
+}
+
+static void load_preset(Gui *g, int i) {
+    if (i == 0) graph_reset(g);
+    else if (i == 1) graph_preset_resnet(g);
+    else if (i == 2) graph_preset_unet(g);
+    else graph_preset_vae(g);
+}
+
 static void setup_click(Gui *g, SDL_Point p) {
     form_layout(g);
     g->drag = DRAG_NONE;
+    if (g->preset_open) {
+        /* the open menu sits on top: a row loads that preset, any other click just closes it */
+        g->preset_open = 0;
+        for (int i = 0; i < preset_count(g); ++i) {
+            SDL_Rect r = preset_rect(i);
+            if (SDL_PointInRect(&p, &r)) {
+                load_preset(g, preset_at(g, i));
+                return;
+            }
+        }
+        if (SDL_PointInRect(&p, &BTN_PRESETS)) return; /* clicking the button again just closes the menu */
+    }
     if (g->dropdown_open) {
         /* The open list sits on top of everything: a click on a row picks it,
          * a click on the dataset field closes it, any other click just closes
          * it and is then handled normally. */
         g->dropdown_open = 0;
-        for (int i = 0; i < g->n_datasets; ++i) {
-            SDL_Rect r = dropdown_row_rect(g, i);
+        int vis[MAX_DATASETS], nv = ds_visible(g, vis);
+        for (int k = 0; k < nv; ++k) {
+            SDL_Rect r = dropdown_row_rect(g, k);
             if (SDL_PointInRect(&p, &r)) {
-                dataset_choose(g, g->ds[i].name);
+                dataset_choose(g, g->ds[vis[k]].name);
                 return;
             }
         }
         if (SDL_PointInRect(&p, &g->fields[F_DATASET].rect)) return;
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (SDL_PointInRect(&p, &PROBLEM_BTN[i])) {
+            set_problem(g, i);
+            g->focus = -1;
+            return;
+        }
     }
     for (int i = 0; i < NUM_GENERAL_FIELDS; ++i) {
         if (SDL_PointInRect(&p, &g->fields[i].rect)) {
@@ -2509,8 +3375,21 @@ static void setup_click(Gui *g, SDL_Point p) {
     }
 
     if (SDL_PointInRect(&p, &GRAPH_VIEW)) {
+        /* zoom controls sit on top of the canvas, in screen space */
+        for (int k = 0; k < 3; ++k) {
+            SDL_Rect zr = zoom_btn(k);
+            if (!SDL_PointInRect(&p, &zr)) continue;
+            if (k == 2) graph_fit(g);
+            else zoom_at(g, (float)(ZOOM_BAR.x + ZOOM_BAR.w / 2 - GRAPH_VIEW.x), (float)(GRAPH_VIEW.h / 2), k == 0 ? 1.0f / 1.25f : 1.25f);
+            g->drag = DRAG_NONE;
+            return;
+        }
+        /* everything below happens in view space: node rects, ports and fields are all expressed in it */
+        SDL_Point pv = to_view(g, p.x, p.y);
+        g->drag_fx = g->drag_fy = 0.0f;
+        int rad = (int)fmaxf(10.0f, 8.0f / g->zoom);
         for (int i = NUM_GENERAL_FIELDS; i < NUM_FIELDS; ++i) {
-            if (g->fields[i].visible && SDL_PointInRect(&p, &g->fields[i].rect)) {
+            if (g->fields[i].visible && SDL_PointInRect(&pv, &g->fields[i].rect)) {
                 g->focus = i;
                 return;
             }
@@ -2519,13 +3398,13 @@ static void setup_click(Gui *g, SDL_Point p) {
         for (int i = MAX_NODES - 1; i >= 0; --i) { /* topmost node first */
             if (!g->nodes[i].used) continue;
             int type = g->nodes[i].type;
-            if (type != NODE_OUTPUT && near_port(node_out_port(g, i), p)) {
+            if (type != NODE_OUTPUT && near_port(node_out_port(g, i), pv, rad)) {
                 g->drag = DRAG_LINK;
                 g->drag_node = i;
                 return;
             }
             for (int k = 0; k < node_nin(type); ++k) {
-                if (!near_port(node_in_port(g, i, k), p)) continue;
+                if (!near_port(node_in_port(g, i, k), pv, rad)) continue;
                 /* Grabbing a wired input dot pulls its wire off, to be dropped elsewhere. */
                 int src = g->nodes[i].in[k];
                 if (src >= 0) {
@@ -2536,9 +3415,9 @@ static void setup_click(Gui *g, SDL_Point p) {
                 return;
             }
             SDL_Rect r = node_rect(g, i);
-            if (SDL_PointInRect(&p, &r)) {
+            if (SDL_PointInRect(&pv, &r)) {
                 SDL_Rect d = node_del_rect(r);
-                if (node_deletable(type) && SDL_PointInRect(&p, &d)) {
+                if (node_deletable(type) && SDL_PointInRect(&pv, &d)) {
                     graph_remove(g, i);
                 } else {
                     g->drag = DRAG_NODE;
@@ -2552,11 +3431,11 @@ static void setup_click(Gui *g, SDL_Point p) {
     }
 
     g->focus = -1;
-    for (int i = 0; i < NUM_PALETTE; ++i) {
+    for (int i = 0; i < palette_count(g); ++i) {
         SDL_Rect pr = palette_rect(i);
         if (SDL_PointInRect(&p, &pr)) {
             g->drag = DRAG_PAL;
-            g->drag_type = PALETTE_TYPES[i];
+            g->drag_type = palette_type(g, i);
             g->drag_moved = 0;
             g->press_x = p.x;
             g->press_y = p.y;
@@ -2564,10 +3443,13 @@ static void setup_click(Gui *g, SDL_Point p) {
         }
     }
     if (SDL_PointInRect(&p, &BTN_ARRANGE)) graph_arrange(g);
-    else if (SDL_PointInRect(&p, &BTN_RESET)) graph_reset(g);
-    else if (SDL_PointInRect(&p, &BTN_RESNET)) graph_preset_resnet(g);
+    else if (SDL_PointInRect(&p, &BTN_PRESETS)) g->preset_open = 1;
     else if (SDL_PointInRect(&p, &BTN_START)) start_from_form(g);
-    else if (g->run_active && SDL_PointInRect(&p, &BTN_BACK)) {
+    else if (g->run_active && (g->pred_hdr.n > 0 || g->gen_hdr.n_recon > 0) && SDL_PointInRect(&p, &BTN_VIEW_PRED)) {
+        g->screen = SCREEN_PRED;
+        g->pred_return = SCREEN_SETUP;
+        SDL_StopTextInput();
+    } else if (g->run_active && SDL_PointInRect(&p, &BTN_BACK)) {
         g->screen = SCREEN_RUN;
         SDL_StopTextInput();
     }
@@ -2576,8 +3458,9 @@ static void setup_click(Gui *g, SDL_Point p) {
 
 /* Finishes a drag: a wire dropped on a node connects to it, a palette block
  * dropped on the canvas is placed there, or just clicked is appended. */
-static void setup_release(Gui *g, SDL_Point p) {
+static void setup_release(Gui *g, SDL_Point p_screen) {
     form_layout(g);
+    SDL_Point p = to_view(g, p_screen.x, p_screen.y); /* node hit tests below are in view space */
     if (g->drag == DRAG_LINK) {
         for (int i = MAX_NODES - 1; i >= 0; --i) {
             if (!g->nodes[i].used || g->nodes[i].type == NODE_INPUT || i == g->drag_node) continue;
@@ -2598,8 +3481,8 @@ static void setup_release(Gui *g, SDL_Point p) {
     } else if (g->drag == DRAG_PAL) {
         if (!g->drag_moved) {
             graph_append(g, g->drag_type);
-        } else if (SDL_PointInRect(&p, &GRAPH_VIEW)) {
-            graph_add(g, g->drag_type, p.x - GRAPH_VIEW.x - g->pan_x - NODE_W / 2, p.y - GRAPH_VIEW.y - g->pan_y - 12);
+        } else if (SDL_PointInRect(&p_screen, &GRAPH_VIEW)) {
+            graph_add(g, g->drag_type, p.x - (int)floorf(g->pan_x) - NODE_W / 2, p.y - (int)floorf(g->pan_y) - 12);
         }
     }
     g->drag = DRAG_NONE;
@@ -2619,18 +3502,28 @@ static int pump_events(Gui *g) {
             /* A clicked field owns the keyboard whichever window SDL thinks has focus - with
              * the weights window open and no window manager to move focus on click, key
              * events would otherwise keep arriving tagged with the weights window. */
+            if (k == SDLK_F11) { /* fullscreen <-> window, from any screen */
+                Uint32 flags = SDL_GetWindowFlags(g->win);
+                SDL_SetWindowFullscreen(g->win, (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                break;
+            }
             int form_has_keys = e.key.windowID == main_id || g->focus >= 0;
+            if (g->screen == SCREEN_PRED && e.key.windowID == main_id) {
+                if (k == SDLK_LEFT && g->pred_page > 0) g->pred_page--;
+                else if (k == SDLK_RIGHT) g->pred_page++;
+                break;
+            }
             if (form_has_keys && g->screen == SCREEN_SETUP) {
                 if (k == SDLK_ESCAPE) {
                     if (g->dropdown_open) g->dropdown_open = 0;
                     else if (g->focus >= 0) g->focus = -1;
                     else return 0;
-                } else if ((k == SDLK_UP || k == SDLK_DOWN) && g->focus == F_DATASET && g->n_datasets > 0) {
-                    int cur = -1;
-                    for (int i = 0; i < g->n_datasets; ++i)
-                        if (strcmp(g->ds[i].name, g->fields[F_DATASET].text) == 0) cur = i;
-                    cur = (cur + (k == SDLK_DOWN ? 1 : -1) + g->n_datasets) % g->n_datasets;
-                    dataset_choose(g, g->ds[cur].name);
+                } else if ((k == SDLK_UP || k == SDLK_DOWN) && g->focus == F_DATASET && ds_visible(g, (int[MAX_DATASETS]){0}) > 0) {
+                    int vis[MAX_DATASETS], nv = ds_visible(g, vis), cur = -1;
+                    for (int i = 0; i < nv; ++i)
+                        if (strcmp(g->ds[vis[i]].name, g->fields[F_DATASET].text) == 0) cur = i;
+                    cur = (cur + (k == SDLK_DOWN ? 1 : -1) + nv) % nv;
+                    dataset_choose(g, g->ds[vis[cur]].name);
                 } else if (k == SDLK_BACKSPACE) {
                     if (g->focus >= 0 && g->fields[g->focus].kind != FK_CHOICE) {
                         size_t len = strlen(g->fields[g->focus].text);
@@ -2664,13 +3557,15 @@ static int pump_events(Gui *g) {
                 if (g->zoom3d < 0.4f) g->zoom3d = 0.4f;
                 if (g->zoom3d > 5.0f) g->zoom3d = 5.0f;
             } else if (g->screen == SCREEN_SETUP && g->win && e.wheel.windowID == main_id) {
-                /* scrolling over the node canvas pans it (shift = sideways) */
+                /* scrolling over the node canvas zooms it around the cursor (shift + scroll pans sideways) */
                 SDL_Point m = {g->mouse_x, g->mouse_y};
                 if (SDL_PointInRect(&m, &GRAPH_VIEW)) {
-                    int step = 48;
-                    if (SDL_GetModState() & KMOD_SHIFT) g->pan_x += e.wheel.y * step;
-                    else g->pan_y += e.wheel.y * step;
-                    g->pan_x += e.wheel.x * step;
+                    if (SDL_GetModState() & KMOD_SHIFT) {
+                        g->pan_x += (float)e.wheel.y * 48.0f / g->zoom;
+                    } else if (e.wheel.y != 0) {
+                        zoom_at(g, (float)(m.x - GRAPH_VIEW.x), (float)(m.y - GRAPH_VIEW.y), e.wheel.y > 0 ? 1.12f : 1.0f / 1.12f);
+                    }
+                    g->pan_x += (float)e.wheel.x * 48.0f / g->zoom;
                 }
             }
             break;
@@ -2682,11 +3577,17 @@ static int pump_events(Gui *g) {
                     if (!(e.motion.state & SDL_BUTTON_LMASK)) {
                         g->drag = DRAG_NONE; /* the release happened outside the window */
                     } else if (g->drag == DRAG_NODE) {
-                        g->nodes[g->drag_node].x += e.motion.xrel;
-                        g->nodes[g->drag_node].y += e.motion.yrel;
+                        /* screen pixels -> view units; the fractional part is carried to the next event */
+                        g->drag_fx += (float)e.motion.xrel / g->zoom;
+                        g->drag_fy += (float)e.motion.yrel / g->zoom;
+                        int dx = (int)g->drag_fx, dy = (int)g->drag_fy;
+                        g->drag_fx -= (float)dx;
+                        g->drag_fy -= (float)dy;
+                        g->nodes[g->drag_node].x += dx;
+                        g->nodes[g->drag_node].y += dy;
                     } else if (g->drag == DRAG_PAN) {
-                        g->pan_x += e.motion.xrel;
-                        g->pan_y += e.motion.yrel;
+                        g->pan_x += (float)e.motion.xrel / g->zoom;
+                        g->pan_y += (float)e.motion.yrel / g->zoom;
                     } else if (g->drag == DRAG_PAL && abs(e.motion.x - g->press_x) + abs(e.motion.y - g->press_y) > 6) {
                         g->drag_moved = 1;
                     }
@@ -2704,6 +3605,18 @@ static int pump_events(Gui *g) {
                 SDL_Point p = {e.button.x, e.button.y};
                 if (g->screen == SCREEN_SETUP) {
                     if (e.button.button == SDL_BUTTON_LEFT) setup_click(g, p);
+                } else if (g->screen == SCREEN_PRED) {
+                    if (SDL_PointInRect(&p, &BTN_PRED_BACK)) {
+                        g->screen = g->pred_return == SCREEN_SETUP ? SCREEN_SETUP : SCREEN_RUN;
+                        if (g->screen == SCREEN_SETUP) SDL_StartTextInput();
+                    } else if (SDL_PointInRect(&p, &BTN_PRED_PREV)) {
+                        if (g->pred_page > 0) g->pred_page--;
+                    } else if (SDL_PointInRect(&p, &BTN_PRED_NEXT)) {
+                        g->pred_page++; /* clamped when drawn */
+                    }
+                } else if (SDL_PointInRect(&p, &PRED_BUTTON)) {
+                    g->screen = SCREEN_PRED;
+                    g->pred_return = SCREEN_RUN;
                 } else if (SDL_PointInRect(&p, &WEIGHTS_BUTTON)) {
                     open_weights_window(g);
                 } else if (SDL_PointInRect(&p, &RESTART_BUTTON)) {
@@ -2745,21 +3658,40 @@ static int pump_events(Gui *g) {
 
 static void render_frame(Gui *g) {
     g->slot = 0;
+    if (g->frame_tex) SDL_SetRenderTarget(g->ren, g->frame_tex);
     SDL_SetRenderDrawColor(g->ren, COL_BG);
     SDL_RenderClear(g->ren);
 
     if (g->screen == SCREEN_SETUP) {
         form_update(g);
         draw_form(g);
+    } else if (g->screen == SCREEN_PRED) {
+        if (g->run_cfg.task == TASK_GENERATE) draw_generations(g);
+        else draw_predictions(g);
     } else {
         draw_dashboard(g);
+    }
+    if (g->frame_tex) { /* scale the finished picture to the window (letterboxed by the logical size) */
+        SDL_SetRenderTarget(g->ren, NULL);
+        SDL_SetRenderDrawColor(g->ren, COL_BG);
+        SDL_RenderClear(g->ren);
+        SDL_RenderCopy(g->ren, g->frame_tex, NULL, NULL);
     }
     SDL_RenderPresent(g->ren);
 
     render_weights_window(g);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    int fullscreen = 1; /* the default; --windowed opens a normal 1150x700 window, F11 toggles either way */
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--windowed") == 0) fullscreen = 0;
+        else if (strcmp(argv[i], "--fullscreen") == 0) fullscreen = 1;
+        else {
+            fprintf(stderr, "usage: train_viewer [--windowed | --fullscreen]   (F11 toggles fullscreen while it runs)\n");
+            return 2;
+        }
+    }
     /* The viewer writes to the command FIFO; if train_worker has died, that
      * write would raise SIGPIPE and kill the window instead of failing. */
     signal(SIGPIPE, SIG_IGN);
@@ -2767,11 +3699,12 @@ int main(void) {
     Gui gui;
     memset(&gui, 0, sizeof(gui)); /* label_tex[]/digit_tex etc. must start NULL - see the lazy-create checks in draw_text() */
     gui.cmd_fd = -1;
+    gui.zoom = 1.0f;
     gui.yaw = 0.6f;
     gui.pitch = 0.75f;
     gui.zoom3d = 1.0f;
     form_defaults(&gui);
-    if (gui_init(&gui) != 0) return 1;
+    if (gui_init(&gui, fullscreen) != 0) return 1;
     SDL_StartTextInput();
 
     if (mkfifo(TRAIN_FIFO_PATH, 0600) != 0 && errno != EEXIST) {
