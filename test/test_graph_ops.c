@@ -248,7 +248,32 @@ static Tensor *build_posembed(Tensor **leaves, void *user, Scratch *s) {
     return keep(s, posembed_forward(leaves[1], leaves[0]));
 }
 
+static Tensor *build_token_linear(Tensor **leaves, void *user, Scratch *s) {
+    (void)user;
+    return keep(s, tensor_token_linear(leaves[0], leaves[1], leaves[2]));
+}
+
+static Tensor *build_patchify(Tensor **leaves, void *user, Scratch *s) {
+    (void)user;
+    return keep(s, tensor_patchify(leaves[0], 2));
+}
+
+static Tensor *build_patchembed(Tensor **leaves, void *user, Scratch *s) {
+    Tensor *mid[1];
+    Tensor *out = patchembed_forward((PatchEmbed *)user, leaves[0], mid);
+    keep(s, mid[0]);
+    return keep(s, out);
+}
+
 static int g_heads = 2;
+static Tensor *build_attention_layer(Tensor **leaves, void *user, Scratch *s) {
+    Attention *at = (Attention *)user;
+    Tensor *mid[2];
+    Tensor *out = attention_layer_forward(at, leaves[0], mid);
+    keep(s, mid[0]);
+    keep(s, mid[1]);
+    return keep(s, out);
+}
 static Tensor *build_attention(Tensor **leaves, void *user, Scratch *s) {
     (void)user;
     return keep(s, attention_forward(leaves[0], g_heads));
@@ -258,16 +283,19 @@ static Tensor *build_attention(Tensor **leaves, void *user, Scratch *s) {
  * gelu - every path a residual shares the block's input with, so the gradients of both consumers must add up. */
 typedef struct TfBlock {
     LayerNorm *ln1, *ln2;
-    Conv2D *qkv, *proj, *fc1, *fc2;
+    Attention *attn;
+    Conv2D *fc1, *fc2;
 } TfBlock;
 
 static Tensor *build_tf_block(Tensor **leaves, void *user, Scratch *s) {
     TfBlock *tb = (TfBlock *)user;
     Tensor *x = leaves[0];
     Tensor *a = keep(s, layernorm_forward(tb->ln1, x));
-    a = keep(s, conv2d_forward(tb->qkv, a));
-    a = keep(s, attention_forward(a, g_heads));
-    a = keep(s, conv2d_forward(tb->proj, a));
+    Tensor *mid[2];
+    a = attention_layer_forward(tb->attn, a, mid);
+    keep(s, mid[0]);
+    keep(s, mid[1]);
+    keep(s, a);
     Tensor *x1 = keep(s, tensor_add(x, a));
     Tensor *m = keep(s, layernorm_forward(tb->ln2, x1));
     m = keep(s, conv2d_forward(tb->fc1, m));
@@ -568,21 +596,59 @@ void test_graph_ops(void) {
         }
     }
     {
+        int xs[4] = {3, 4, 3, 2}, ws[2] = {4, 6}, bs[1] = {6};
+        Tensor *x = make_leaf(4, xs, 1.0f, 0.0f);
+        Tensor *w = make_leaf(2, ws, 1.0f, 0.0f);
+        Tensor *b = make_leaf(1, bs, 1.0f, 0.0f);
+        Tensor *leaves[3] = {x, w, b};
+        failures += check_op("per-token linear", leaves, 3, build_token_linear, NULL);
+        tensor_free(x);
+        tensor_free(w);
+        tensor_free(b);
+    }
+    {
+        int xs[4] = {2, 2, 4, 6};
+        Tensor *x = make_leaf(4, xs, 1.0f, 0.0f);
+        Tensor *leaves[1] = {x};
+        failures += check_op("patchify 2x2", leaves, 1, build_patchify, NULL);
+        PatchEmbed *pe = patchembed_new(2, 2, 5);
+        float bh[5];
+        for (int i = 0; i < 5; ++i) bh[i] = 0.3f * frand();
+        tensor_set_data(pe->b, bh);
+        Tensor *l2[3] = {x, pe->w, pe->b};
+        failures += check_op("patch embedding (2x2 patches -> 5)", l2, 3, build_patchembed, pe);
+        patchembed_free(pe);
+        tensor_free(x);
+    }
+    {
+        Attention *at = attention_new(6, 3);
+        float bh[18], oh[6];
+        for (int i = 0; i < 18; ++i) bh[i] = 0.3f * frand();
+        for (int i = 0; i < 6; ++i) oh[i] = 0.3f * frand();
+        tensor_set_data(at->bqkv, bh);
+        tensor_set_data(at->bo, oh);
+        int xs[4] = {2, 6, 2, 2};
+        Tensor *x = make_leaf(4, xs, 1.0f, 0.0f);
+        Tensor *leaves[6] = {x, at->wqkv, at->bqkv, at->wo, at->bo};
+        failures += check_op("attention layer (3 heads, 2x2 tokens)", leaves, 5, build_attention_layer, at);
+        tensor_free(x);
+        attention_free(at);
+    }
+    {
         enum { D = 4, T = 5 };
         g_heads = 2;
-        TfBlock tb = {layernorm_new(D), layernorm_new(D), conv2d_new(D, 3 * D, 1, 1, 0, 1), conv2d_new(D, D, 1, 1, 0, 1),
-                      conv2d_new(D, 2 * D, 1, 1, 0, 1), conv2d_new(2 * D, D, 1, 1, 0, 1)};
+        TfBlock tb = {layernorm_new(D), layernorm_new(D), attention_new(D, g_heads), conv2d_new(D, 2 * D, 1, 1, 0, 1),
+                      conv2d_new(2 * D, D, 1, 1, 0, 1)};
         int xs[4] = {3, D, T, 1};
         Tensor *x = make_leaf(4, xs, 1.0f, 0.0f);
-        Tensor *leaves[5] = {x, tb.qkv->weight, tb.proj->weight, tb.fc1->weight, tb.ln1->gamma};
+        Tensor *leaves[5] = {x, tb.attn->wqkv, tb.attn->wo, tb.fc1->weight, tb.ln1->gamma};
         g_eps = 1e-3f;
         failures += check_op("transformer block (ln, attn, mlp)", leaves, 5, build_tf_block, &tb);
         g_eps = 1e-2f;
         tensor_free(x);
         layernorm_free(tb.ln1);
         layernorm_free(tb.ln2);
-        conv2d_free(tb.qkv);
-        conv2d_free(tb.proj);
+        attention_free(tb.attn);
         conv2d_free(tb.fc1);
         conv2d_free(tb.fc2);
     }

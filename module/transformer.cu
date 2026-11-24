@@ -162,6 +162,62 @@ __global__ void pos_grad_kernel(const float *dy, float *dpos, int B, int per_sam
     dpos[i] = s;
 }
 
+/* ---- per-token linear layer: x (B, Din, T), W (Din, Dout), y (B, Dout, T) ---- */
+
+__global__ void tl_forward_kernel(const float *x, const float *w, const float *bias, float *y, int B, int Din, int Dout, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * Dout * T) return;
+    int t = idx % T, o = (idx / T) % Dout, b = idx / (T * Dout);
+    const float *xb = x + (size_t)b * Din * T + t;
+    float s = bias[o];
+    for (int i = 0; i < Din; ++i) s += xb[(size_t)i * T] * w[(size_t)i * Dout + o];
+    y[idx] = s;
+}
+
+__global__ void tl_dx_kernel(const float *w, const float *dy, float *dx, int B, int Din, int Dout, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * Din * T) return;
+    int t = idx % T, i = (idx / T) % Din, b = idx / (T * Din);
+    const float *dyb = dy + (size_t)b * Dout * T + t;
+    float s = 0.0f;
+    for (int o = 0; o < Dout; ++o) s += w[(size_t)i * Dout + o] * dyb[(size_t)o * T];
+    dx[idx] = s;
+}
+
+__global__ void tl_dw_kernel(const float *x, const float *dy, float *dw, int B, int Din, int Dout, int T) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= Din * Dout) return;
+    int o = idx % Dout, i = idx / Dout;
+    float s = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        const float *xi = x + ((size_t)b * Din + i) * T, *dyo = dy + ((size_t)b * Dout + o) * T;
+        for (int t = 0; t < T; ++t) s += xi[t] * dyo[t];
+    }
+    dw[idx] = s;
+}
+
+__global__ void tl_db_kernel(const float *dy, float *db, int B, int Dout, int T) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= Dout) return;
+    float s = 0.0f;
+    for (int b = 0; b < B; ++b)
+        for (int t = 0; t < T; ++t) s += dy[((size_t)b * Dout + o) * T + t];
+    db[o] = s;
+}
+
+/* ---- patchify: out[b, f, t] with f = (c, r, s) inside the patch and t the patch's grid position ---- */
+
+__global__ void patchify_kernel(const float *x, float *out, int B, int C, int H, int W, int p, int copy_back) {
+    int Hp = H / p, Wp = W / p, T = Hp * Wp, F = C * p * p;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * F * T) return;
+    int t = idx % T, f = (idx / T) % F, b = idx / (T * F);
+    int c = f / (p * p), r = (f % (p * p)) / p, s = f % p;
+    size_t src = (((size_t)b * C + c) * H + (size_t)(t / Wp) * p + r) * W + (size_t)(t % Wp) * p + s;
+    if (copy_back) ((float *)x)[src] = out[idx]; /* backward: x is the gradient being filled, out the incoming one */
+    else out[idx] = x[src];
+}
+
 /* ---- attention. qkv is (B, 3D, T); head h of batch b reads channels h*dh.. of the q, k and v thirds ---- */
 
 typedef struct AttnMeta {
@@ -398,6 +454,170 @@ Tensor *posembed_backward_pos(Tensor *pos, Tensor *x, Tensor *grad_out) {
     pos_grad_kernel<<<(per + 255) / 256, 256>>>(grad_out->data, g->data, x->shape[0], per);
     CUDA_CHECK(cudaDeviceSynchronize());
     return g;
+}
+
+/* ---- per-token linear layer ---- */
+
+Tensor *tensor_token_linear(Tensor *x, Tensor *weight, Tensor *bias) {
+    if (x->ndim != 4 || weight->ndim != 2 || weight->shape[0] != x->shape[1] || tensor_numel(bias->ndim, bias->shape) != weight->shape[1]) {
+        printf("tensor_token_linear: x must be (B, %d, H, W) for a %dx%d weight\n", weight->shape[0], weight->shape[0], weight->shape[1]);
+        return NULL;
+    }
+    int B = x->shape[0], Din = x->shape[1], Dout = weight->shape[1], T = x->shape[2] * x->shape[3];
+    int shape[4] = {B, Dout, x->shape[2], x->shape[3]};
+    Tensor *y = tensor_create(4, shape, x->requires_grad || weight->requires_grad || bias->requires_grad);
+    tl_forward_kernel<<<(B * Dout * T + 255) / 256, 256>>>(x->data, weight->data, bias->data, y->data, B, Din, Dout, T);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (x->requires_grad) tensor_add_dependency_with_ctx(y, x, weight, tensor_token_linear_backward_input);
+    if (weight->requires_grad) tensor_add_dependency_with_ctx(y, weight, x, tensor_token_linear_backward_weight);
+    if (bias->requires_grad) tensor_add_dependency_with_ctx(y, bias, NULL, tensor_token_linear_backward_bias);
+    return y;
+}
+
+Tensor *tensor_token_linear_backward_input(Tensor *x, Tensor *weight, Tensor *grad_out) {
+    int B = x->shape[0], Din = x->shape[1], Dout = weight->shape[1], T = x->shape[2] * x->shape[3];
+    Tensor *dx = tensor_create(4, x->shape, 0);
+    tl_dx_kernel<<<(B * Din * T + 255) / 256, 256>>>(weight->data, grad_out->data, dx->data, B, Din, Dout, T);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return dx;
+}
+
+Tensor *tensor_token_linear_backward_weight(Tensor *weight, Tensor *x, Tensor *grad_out) {
+    int B = x->shape[0], Din = weight->shape[0], Dout = weight->shape[1], T = x->shape[2] * x->shape[3];
+    Tensor *dw = tensor_create(2, weight->shape, 0);
+    tl_dw_kernel<<<(Din * Dout + 255) / 256, 256>>>(x->data, grad_out->data, dw->data, B, Din, Dout, T);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return dw;
+}
+
+Tensor *tensor_token_linear_backward_bias(Tensor *bias, Tensor *ctx, Tensor *grad_out) {
+    (void)ctx;
+    int B = grad_out->shape[0], Dout = grad_out->shape[1], T = grad_out->shape[2] * grad_out->shape[3];
+    Tensor *db = tensor_create(bias->ndim, bias->shape, 0);
+    tl_db_kernel<<<(Dout + 255) / 256, 256>>>(grad_out->data, db->data, B, Dout, T);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return db;
+}
+
+/* ---- attention layer ---- */
+
+static Tensor *xavier_param(int rows, int cols) {
+    int shape[2] = {rows, cols};
+    Tensor *t = tensor_create(2, shape, 1);
+    float limit = sqrtf(6.0f / (float)(rows + cols));
+    float *host = (float *)malloc(sizeof(float) * (size_t)rows * cols);
+    for (int i = 0; i < rows * cols; ++i) host[i] = ((float)rand() / (float)RAND_MAX * 2.0f - 1.0f) * limit;
+    tensor_set_data(t, host);
+    free(host);
+    return t;
+}
+
+static Tensor *zero_param(int n) {
+    int shape[1] = {n};
+    Tensor *t = tensor_create(1, shape, 1);
+    CUDA_CHECK(cudaMemset(t->data, 0, sizeof(float) * n));
+    return t;
+}
+
+Attention *attention_new(int dim, int heads) {
+    Attention *self = (Attention *)malloc(sizeof(Attention));
+    if (!self) return NULL;
+    self->dim = dim;
+    self->heads = heads;
+    self->wqkv = xavier_param(dim, 3 * dim);
+    self->bqkv = zero_param(3 * dim);
+    self->wo = xavier_param(dim, dim);
+    self->bo = zero_param(dim);
+    return self;
+}
+
+void attention_free(Attention *self) {
+    if (!self) return;
+    tensor_free(self->wqkv);
+    tensor_free(self->bqkv);
+    tensor_free(self->wo);
+    tensor_free(self->bo);
+    free(self);
+}
+
+Tensor *attention_layer_forward(Attention *self, Tensor *x, Tensor *keep[2]) {
+    keep[0] = keep[1] = NULL;
+    if (x->ndim != 4 || x->shape[1] != self->dim) {
+        printf("attention_layer_forward: expected (B, %d, H, W)\n", self->dim);
+        return NULL;
+    }
+    Tensor *qkv = tensor_token_linear(x, self->wqkv, self->bqkv);
+    if (!qkv) return NULL;
+    Tensor *ctx = attention_forward(qkv, self->heads);
+    if (!ctx) {
+        tensor_free(qkv);
+        return NULL;
+    }
+    keep[0] = qkv;
+    keep[1] = ctx;
+    return tensor_token_linear(ctx, self->wo, self->bo);
+}
+
+/* ---- patchify and the patch embedding ---- */
+
+typedef struct PatchMeta {
+    int p;
+} PatchMeta;
+
+Tensor *tensor_patchify(Tensor *x, int p) {
+    if (x->ndim != 4 || p < 1 || x->shape[2] % p != 0 || x->shape[3] % p != 0) {
+        printf("tensor_patchify: %dx%d is not a multiple of the patch size %d\n", x->ndim == 4 ? x->shape[2] : 0, x->ndim == 4 ? x->shape[3] : 0, p);
+        return NULL;
+    }
+    int B = x->shape[0], C = x->shape[1], H = x->shape[2], W = x->shape[3];
+    int T = (H / p) * (W / p), F = C * p * p;
+    int shape[4] = {B, F, T, 1};
+    Tensor *out = tensor_create(4, shape, x->requires_grad);
+    patchify_kernel<<<(B * F * T + 255) / 256, 256>>>(x->data, out->data, B, C, H, W, p, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (x->requires_grad) {
+        PatchMeta *meta = (PatchMeta *)malloc(sizeof(PatchMeta));
+        meta->p = p;
+        out->meta = meta;
+        tensor_add_dependency_with_ctx(out, x, out, tensor_patchify_backward);
+    }
+    return out;
+}
+
+Tensor *tensor_patchify_backward(Tensor *x, Tensor *out, Tensor *grad_out) {
+    int p = ((PatchMeta *)out->meta)->p;
+    int B = x->shape[0], C = x->shape[1], H = x->shape[2], W = x->shape[3];
+    int T = (H / p) * (W / p), F = C * p * p;
+    Tensor *dx = tensor_create(4, x->shape, 0);
+    patchify_kernel<<<(B * F * T + 255) / 256, 256>>>(dx->data, grad_out->data, B, C, H, W, p, 1);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return dx;
+}
+
+PatchEmbed *patchembed_new(int in_c, int patch, int dim) {
+    PatchEmbed *self = (PatchEmbed *)malloc(sizeof(PatchEmbed));
+    if (!self) return NULL;
+    self->in_c = in_c;
+    self->patch = patch;
+    self->dim = dim;
+    self->w = xavier_param(in_c * patch * patch, dim);
+    self->b = zero_param(dim);
+    return self;
+}
+
+void patchembed_free(PatchEmbed *self) {
+    if (!self) return;
+    tensor_free(self->w);
+    tensor_free(self->b);
+    free(self);
+}
+
+Tensor *patchembed_forward(PatchEmbed *self, Tensor *x, Tensor *keep[1]) {
+    keep[0] = NULL;
+    Tensor *patches = tensor_patchify(x, self->patch);
+    if (!patches) return NULL;
+    keep[0] = patches;
+    return tensor_token_linear(patches, self->w, self->b);
 }
 
 /* ---- attention ---- */
