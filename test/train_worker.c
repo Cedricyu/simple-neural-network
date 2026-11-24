@@ -437,13 +437,21 @@ static void build_model_info(const TrainConfig *c, const NetShapes *s, ModelInfo
         av->tokens = tokens;
         av->gh = in.h;
         av->gw = in.w;
-        for (int id = b->in[0]; id > 0; id = c->blocks[id - 1].in[0])
-            if (c->blocks[id - 1].type == BLK_TOKENS) {
-                LayerShape g = train_block_input(s, &c->blocks[id - 1]);
+        for (int id = b->in[0]; id > 0; id = c->blocks[id - 1].in[0]) {
+            const Block *up = &c->blocks[id - 1];
+            if (up->type == BLK_TOKENS) { /* the patch grid a conv produced */
+                LayerShape g = train_block_input(s, up);
                 av->gh = g.h;
                 av->gw = g.w;
                 break;
             }
+            if (up->type == BLK_PATCH) { /* the image cut into patches: a (H / size) x (W / size) grid */
+                LayerShape g = train_block_input(s, up);
+                av->gh = g.h / up->a;
+                av->gw = g.w / up->a;
+                break;
+            }
+        }
         av->offset = info->total_attn_floats;
         av->tid = b->in[0];
         av->block = i;
