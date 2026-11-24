@@ -130,6 +130,10 @@ of the input. Limits are 48 blocks and 16 conv + fc layers.
 - **Errors** — a block that breaks a rule gets a red border and a callout under it saying why (the status line
   repeats it). Two common mistakes have a one-click fix in the callout: an fc / `view` / `vae` block fed an image
   (`insert a flatten block`) and a last fc whose width is not the class count (`set out to N`).
+- **Inside an attention block** — the `[+]` at the bottom right of an `attn` node opens a read-only popover with its
+  three steps (`q,k,v` fc, `attention`, `output proj` fc); a click on `q,k,v` or `output proj` shows the fc inside it
+  (shapes, weight count, and the q | k | v split of the first one). It only shows the structure: the block is still
+  one block with a single parameter, the heads.
 - **Units** — a residual unit (the blocks between a fork and the add that joins the two paths again, such as
   `ln - attn - add` or `ln - fc - gelu - fc - add`) gets a labelled frame (`attn block`, `mlp block`, `res block`),
   and `arrange` puts every expanded unit on a row of its own. Click `[-]` on a frame to collapse the unit into one
@@ -161,7 +165,11 @@ weights of `attn`'s projections are not shown, the attention tab shows what it d
 The weights window shows an **attention** view when you click an `attn` box: for the dashboard's sample it shows the
 sample with its token grid, and for the token you pick (click a patch; the blue box) what that token attends to,
 as the average over heads on the big image and per head beside it, plus every head's full token x token matrix
-(rows: the token that looks, columns: the token looked at; a click on a row picks that token). Several `attn` blocks
+(rows: the token that looks, columns: the token looked at; a click on a row picks that token). Each head is captioned
+with the channels it owns (`ch 8-15`: every head has its own slice of the q, k and v channels - a head is not "the q
+head" or "the k-v pair") and two words on how it behaves for the sample on screen: `self` / `local` / `mid` / `far`
+(how far from itself it looks, on the token grid) and `focused` / `mixed` / `spread` (how concentrated its weights are).
+They describe behaviour at that moment; what a head is for is learned and not fixed. Several `attn` blocks
 get a chip each. The maps are sent with every batch, so they change as the model trains; layers whose maps would
 exceed 262144 values (heads x tokens x tokens) are left out. Attention is quadratic in the number of tokens (limit 1024). There is no dropout,
 class token or causal masking; this is the vision (classification) transformer only.
@@ -172,7 +180,8 @@ A **model graph** across the top (a box per layer with its output shape; relu / 
 into the box before them as `+bn +relu`, and a residual unit - the blocks between a fork and the add that joins it
 again - collapses into one `attn` / `mlp block` / `res block` box; click its `[+]` corner to draw the blocks inside (framed,
 with the residual skip as a pink arc; click the frame's `[-]` label to fold it again; an `attn` box has its own `[+]`
-that opens it into its three steps - `q,k,v` projection, `attention`, `output proj` - with their shapes), hover a collapsed box to list
+that opens it into its three steps - `q,k,v` projection, `attention`, `output proj` - with their shapes; the two
+projections have a `[+]` too, which turns them into the `fc` they are, 32 -> 96 and 32 -> 32), hover a collapsed box to list
 what is inside; other
 skips, such as a U-Net's, are pink arcs; hover a box to trace its wires). A click on a box with weights opens the
 weights window on that layer (the box of the layer the open window shows is outlined). Live weight thumbnails under

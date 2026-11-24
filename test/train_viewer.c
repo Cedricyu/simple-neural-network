@@ -254,6 +254,9 @@ typedef struct Gui {
     GpuStats gpu;      /* the latest MSG_GPU */
     int gpu_valid;
     Uint32 gpu_at;     /* SDL_GetTicks() when it arrived */
+    int attn_inspect1;      /* editor: node + 1 of the attention block whose inside is shown, or 0 */
+    int attn_inspect_open;  /* editor: bit 0 = the q,k,v fc is shown, bit 1 = the output fc */
+    int arch_proj_open[MAX_BLOCKS]; /* training screen: per attention block, bit 0 = its q,k,v projection shows the fc inside, bit 1 = the output projection */
     int arch_attn_open[MAX_BLOCKS]; /* training screen: attention blocks (by block index) drawn as their three inner steps */
     int arch_expanded[MAX_BLOCKS]; /* training screen: units (keyed by their add block) shown with their blocks drawn */
     char arch_tip[176]; /* the model graph's hover text, drawn last so no panel covers it */
@@ -1190,6 +1193,8 @@ static void graph_fit_classes(Gui *g, int n_classes) {
 static void graph_clear(Gui *g) {
     memset(g->nodes, 0, sizeof(g->nodes));
     memset(g->unit_collapsed, 0, sizeof(g->unit_collapsed));
+    g->attn_inspect1 = 0;
+    g->attn_inspect_open = 0;
     g->focus = -1;
     g->drag = DRAG_NONE;
 }
@@ -2104,6 +2109,7 @@ static void draw_node(Gui *g, int i, SDL_Point mouse) {
         txt(g, g->font_small, "factor", r.x + 8, r.y + 31, dim);
     } else if (n->type == BLK_ATTENTION) {
         txt(g, g->font_small, "heads", r.x + 8, r.y + 31, dim);
+        txt(g, g->font_small, g->attn_inspect1 == i + 1 ? "[-]" : "[+]", r.x + r.w - 28, r.y + r.h - 18, (SDL_Color){COL_TEXT_DIM});
     } else if (n->type == BLK_PATCH) {
         txt(g, g->font_small, "size", r.x + 6, r.y + 31, dim);
         txt(g, g->font_small, "width", r.x + 6, r.y + 53, dim);
@@ -2158,6 +2164,7 @@ typedef struct ArchGroup {
     int collapsed;           /* this box is a whole unit drawn as one (it can be expanded) */
     int attn_b1;             /* attention block index + 1 for an attention box (or one of its inner steps), else 0 */
     int attn_sub;            /* 1 q,k,v projection, 2 attention, 3 output projection of an opened attention block */
+    int proj_open;           /* that projection is opened: the box is its fc, inside a frame named after the projection */
 } ArchGroup;
 
 static void draw_arch_thumb(Gui *g, SDL_Rect r, const ArchGroup *q);
@@ -2178,7 +2185,7 @@ static void arch_append(char *dst, size_t n, const char *add) {
     if (len + strlen(add) + 2 < n) snprintf(dst + len, n - len, "%s%s", len ? " " : "", add);
 }
 
-static int build_arch(const TrainConfig *c, const NetShapes *s, const int *expanded, const int *attn_open, ArchGroup *gr) {
+static int build_arch(const TrainConfig *c, const NetShapes *s, const int *expanded, const int *attn_open, const int *proj_open, ArchGroup *gr) {
     int n = 0, uses[MAX_BLOCKS + 1] = {0}, gid_of_id[MAX_BLOCKS + 1] = {0}, out_id[ARCH_MAX_GROUPS] = {0};
     int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0, n_wl = 0;
     int nb = c->n_blocks < s->n_ok ? c->n_blocks : s->n_ok;
@@ -2279,7 +2286,8 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, const int *expan
                 q->attn_tid = k->in[0];
                 q->attn_b1 = i + 1;
                 q->attn_sub = part + 1;
-                snprintf(q->name, sizeof(q->name), "%s", names[part]);
+                q->proj_open = proj_open && ((part == 0 && (proj_open[i] & 1)) || (part == 2 && (proj_open[i] & 2)));
+                snprintf(q->name, sizeof(q->name), "%s", q->proj_open ? "fc" : names[part]);
                 shape_str(part == 0 ? mid : in0, q->l2, sizeof(q->l2));
                 shape_str_compact(part == 0 ? mid : in0, q->l2c, sizeof(q->l2c));
                 if (part == 0) snprintf(q->params, sizeof(q->params), "%d -> %d", in0.c, mid.c);
@@ -2460,7 +2468,7 @@ static SDL_Rect arch_unit_frame(const ArchGroup *gr, int n, const SDL_Rect *box,
     }
     if (first) return fr;
     if (thumb_h >= 24) bottom = thumb_y + thumb_h;
-    return (SDL_Rect){fr.x - 8, fr.y - 18, fr.w + 16, bottom + 8 - (fr.y - 18)};
+    return (SDL_Rect){fr.x - 14, fr.y - 42, fr.w + 28, bottom + 14 - (fr.y - 42)};
 }
 
 /* The frame around the inner steps of an opened attention block (block index b), or an empty rect. */
@@ -2476,7 +2484,7 @@ static SDL_Rect arch_attn_frame(const ArchGroup *gr, int n, const SDL_Rect *box,
     }
     if (first) return fr;
     if (thumb_h >= 24) bottom = thumb_y + thumb_h;
-    return (SDL_Rect){fr.x - 6, fr.y - 14, fr.w + 12, bottom + 6 - (fr.y - 14)};
+    return (SDL_Rect){fr.x - 8, fr.y - 30, fr.w + 16, bottom + 8 - (fr.y - 30)};
 }
 
 /* The model as a dependency graph: boxes are layers of the network, wires are "reads the output
@@ -2490,7 +2498,7 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
     if (!cfg || cfg->n_blocks == 0) return;
 
     ArchGroup gr[ARCH_MAX_GROUPS];
-    int n = build_arch(cfg, shapes, g->arch_expanded, g->arch_attn_open, gr);
+    int n = build_arch(cfg, shapes, g->arch_expanded, g->arch_attn_open, g->arch_proj_open, gr);
     SDL_Rect box[ARCH_MAX_GROUPS];
     int box_w, box_h, thumb_y, thumb_h;
     arch_boxes(r, gr, n, ARCH_SHOW_WEIGHTS && g->weights_valid, box, &box_w, &box_h, &thumb_y, &thumb_h);
@@ -2512,6 +2520,13 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
         SDL_Color acc = node_accent(BLK_ATTENTION);
         rrect_bordered(g->ren, fr, 8, col_mix((SDL_Color){COL_SURFACE}, acc, 0.08f), col_mix((SDL_Color){COL_SURFACE}, acc, 0.5f));
         txt(g, g->font_small, "attn  [-]", fr.x + 6, fr.y + 1, col_mix(acc, (SDL_Color){255, 255, 255, 255}, 0.35f));
+    }
+    for (int i = 0; i < n; ++i) { /* an opened projection: its fc in a frame named after it */
+        if (!gr[i].proj_open) continue;
+        SDL_Rect fr = {box[i].x - 4, box[i].y - 13, box[i].w + 8, box[i].h + 17};
+        SDL_Color acc = node_accent(BLK_LINEAR);
+        rrect_bordered(g->ren, fr, 7, col_mix((SDL_Color){COL_SURFACE}, acc, 0.08f), col_mix((SDL_Color){COL_SURFACE}, acc, 0.55f));
+        txt(g, g->font_small, gr[i].attn_sub == 1 ? "q,k,v  [-]" : "output proj  [-]", fr.x + 5, fr.y + 1, col_mix(acc, (SDL_Color){255, 255, 255, 255}, 0.35f));
     }
     SDL_Point mouse = {g->mouse_x, g->mouse_y};
     int hover = -1;
@@ -2555,7 +2570,7 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
         fill_rrect(g->ren, bar, 1, acc);
         if (i == hover) rrect_bordered(g->ren, box[i], 7, (SDL_Color){COL_SURFACE2}, (SDL_Color){250, 204, 96, 255});
         SDL_RenderSetClipRect(g->ren, &box[i]);
-        if (gr[i].collapsed || (gr[i].attn_b1 && gr[i].attn_sub == 0))
+        if (gr[i].collapsed || (gr[i].attn_b1 && (gr[i].attn_sub == 0 || ((gr[i].attn_sub == 1 || gr[i].attn_sub == 3) && !gr[i].proj_open))))
             txt(g, g->font_small, "[+]", box[i].x + box[i].w - 26, box[i].y + box[i].h - 17, (SDL_Color){COL_TEXT_DIM});
         int compact = box_w < 70; /* narrow boxes (deep graphs): smaller name, short shape, no spaces */
         txt(g, compact ? g->font_small : g->font, gr[i].name, box[i].x + 5, box[i].y + (compact ? 5 : 3),
@@ -2741,6 +2756,99 @@ static void draw_unit_box(Gui *g, int an, SDL_Point mouse) {
     draw_port(g, (SDL_Point){r.x + r.w, r.y + 11}, graph_consumers(g, an) > 0, acc);
 }
 
+/* -- the inside of an attention block, shown beside its node in the editor ------ */
+
+#define ATTN_POP_W 420
+static SDL_Rect attn_toggle_rect(const Gui *g, int i) {
+    SDL_Rect r = node_rect(g, i);
+    return (SDL_Rect){r.x + r.w - 34, r.y + r.h - 20, 30, 18};
+}
+
+/* The popover (under the node), its three step boxes, its close button and the two fc detail boxes. */
+static void attn_pop_layout(const Gui *g, int node, SDL_Rect *pop, SDL_Rect box[3], SDL_Rect *close, SDL_Rect fc[2]) {
+    SDL_Rect r = node_rect(g, node);
+    int open = g->attn_inspect_open, h = 100 + ((open & 1) ? 56 : 0) + ((open & 2) ? 56 : 0);
+    *pop = (SDL_Rect){r.x, r.y + r.h + 8, ATTN_POP_W, h};
+    box[0] = (SDL_Rect){pop->x + 12, pop->y + 34, 112, 46};
+    box[1] = (SDL_Rect){pop->x + 154, pop->y + 34, 112, 46};
+    box[2] = (SDL_Rect){pop->x + 296, pop->y + 34, 112, 46};
+    *close = (SDL_Rect){pop->x + pop->w - 34, pop->y + 6, 28, 18};
+    int y = pop->y + 100;
+    fc[0] = fc[1] = (SDL_Rect){0, 0, 0, 0};
+    if (open & 1) {
+        fc[0] = (SDL_Rect){pop->x + 12, y, pop->w - 24, 48};
+        y += 56;
+    }
+    if (open & 2) fc[1] = (SDL_Rect){pop->x + 12, y, pop->w - 24, 48};
+}
+
+static void draw_attn_inspector(Gui *g, SDL_Point mouse) {
+    int node = g->attn_inspect1 - 1;
+    if (node < 0 || !g->nodes[node].used || node_hidden(g, node)) return;
+    SDL_Rect pop, box[3], close, fc[2];
+    attn_pop_layout(g, node, &pop, box, &close, fc);
+    int src = g->nodes[node].in[0], d = 0, tokens = 0, heads = 0, p[4];
+    if (src >= 0 && g->nshape_ok[src]) {
+        d = g->nshape[src].c;
+        tokens = g->nshape[src].h * g->nshape[src].w;
+    }
+    if (node_params(g, node, p)) heads = p[0];
+    SDL_Color acc = node_accent(BLK_ATTENTION), fcc = node_accent(BLK_LINEAR), dim = {COL_TEXT_DIM};
+    draw_shadow(g->ren, pop, 10);
+    rrect_bordered(g->ren, pop, 10, (SDL_Color){COL_SURFACE}, col_mix((SDL_Color){50, 57, 78, 255}, acc, 0.7f));
+    txt(g, g->font_small, "inside attn   (click q,k,v or output proj to see its fc)", pop.x + 12, pop.y + 8, dim);
+    txt(g, g->font_small, "[-]", close.x + 4, close.y + 2, dim);
+
+    char l1[3][40], l2[3][40];
+    snprintf(l1[0], sizeof(l1[0]), "q,k,v");
+    snprintf(l1[1], sizeof(l1[1]), "attention");
+    snprintf(l1[2], sizeof(l1[2]), "output proj");
+    if (d > 0) {
+        snprintf(l2[0], sizeof(l2[0]), "fc %d -> %d", d, 3 * d);
+        snprintf(l2[1], sizeof(l2[1]), "%d heads %dx%d", heads, tokens, tokens);
+        snprintf(l2[2], sizeof(l2[2]), "fc %d -> %d", d, d);
+    } else {
+        snprintf(l2[0], sizeof(l2[0]), "wire the input");
+        l2[1][0] = l2[2][0] = '\0';
+    }
+    for (int k = 0; k < 3; ++k) {
+        int clickable = k != 1, hov = clickable && SDL_PointInRect(&mouse, &box[k]);
+        int shown = (k == 0 && (g->attn_inspect_open & 1)) || (k == 2 && (g->attn_inspect_open & 2));
+        SDL_Color a = k == 1 ? acc : fcc;
+        rrect_bordered(g->ren, box[k], 8, col_mix((SDL_Color){COL_SURFACE2}, a, hov || shown ? 0.22f : 0.10f), col_mix((SDL_Color){50, 57, 78, 255}, a, shown ? 1.0f : 0.6f));
+        txt(g, g->font, l1[k], box[k].x + 8, box[k].y + 4, (SDL_Color){COL_TEXT});
+        txt(g, g->font_small, l2[k], box[k].x + 8, box[k].y + 26, dim);
+        if (k < 2) {
+            int y = box[k].y + box[k].h / 2;
+            SDL_SetRenderDrawColor(g->ren, 110, 150, 210, 255);
+            SDL_RenderDrawLine(g->ren, box[k].x + box[k].w + 4, y, box[k + 1].x - 4, y);
+        }
+    }
+    txt(g, g->font_small, "same shape in and out; the fc layers are applied to every token", pop.x + 12, pop.y + 84, dim);
+
+    for (int k = 0; k < 2; ++k) { /* the fc inside a projection */
+        if (fc[k].w <= 0) continue;
+        int out_dim = k == 0 ? 3 * d : d;
+        rrect_bordered(g->ren, fc[k], 8, col_mix((SDL_Color){COL_SURFACE2}, fcc, 0.12f), col_mix((SDL_Color){50, 57, 78, 255}, fcc, 0.8f));
+        char t[96];
+        snprintf(t, sizeof(t), d > 0 ? "fc  %d -> %d   (%d x %d weights + %d bias)" : "fc", d, out_dim, d, out_dim, out_dim);
+        txt(g, g->font, t, fc[k].x + 10, fc[k].y + 4, (SDL_Color){COL_TEXT});
+        if (k == 0 && d > 0) { /* its output is q | k | v, d values each */
+            int bw = (fc[k].w - 20) / 3;
+            static const char *nm[3] = {"q", "k", "v"};
+            for (int s = 0; s < 3; ++s) {
+                SDL_Rect seg = {fc[k].x + 10 + s * bw, fc[k].y + 26, bw - 4, 16};
+                fill_rrect(g->ren, seg, 3, col_mix((SDL_Color){30, 35, 50, 255}, acc, 0.35f));
+                char sl[24];
+                snprintf(sl, sizeof(sl), "%s: %d values", nm[s], d);
+                txt(g, g->font_small, sl, seg.x + 6, seg.y + 1, (SDL_Color){COL_TEXT});
+            }
+        } else if (d > 0) {
+            txt(g, g->font_small, "mixes the heads back together", fc[k].x + 10, fc[k].y + 28, dim);
+        }
+    }
+}
+
 /* The node canvas: grid, wires and nodes are drawn at native size into canvas_tex (so text and fields need no
  * scaling logic) and the visible part is then scaled onto the screen. */
 static void draw_canvas(Gui *g, SDL_Point mouse_screen) {
@@ -2821,6 +2929,7 @@ static void draw_canvas(Gui *g, SDL_Point mouse_screen) {
         if (g->nodes[i].used && !node_hidden(g, i)) draw_node(g, i, mouse);
     for (int an = 0; an < MAX_NODES; ++an)
         if (g->nodes[an].used && g->unit_kind[an] && g->unit_collapsed[an]) draw_unit_box(g, an, mouse);
+    draw_attn_inspector(g, mouse);
     draw_err_callout(g, mouse);
 
     if (g->drag == DRAG_LINK) draw_wire(g, node_out_port(g, g->drag_node), mouse, (SDL_Color){250, 204, 96, 255});
@@ -3154,6 +3263,7 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         g->attn_valid = 0;
         memset(g->arch_expanded, 0, sizeof(g->arch_expanded));
         memset(g->arch_attn_open, 0, sizeof(g->arch_attn_open));
+        memset(g->arch_proj_open, 0, sizeof(g->arch_proj_open));
         g->attn_layer = 0;
         g->attn_query = -1;
         g->has_model = 1;
@@ -3904,7 +4014,7 @@ static void attn_layout(SDL_Rect box, const AttnViz *av, int n_layers, AttnLayou
     L->img = (SDL_Rect){box.x + 12, box.y + 84, ATTN_IMG, ATTN_IMG};
     L->n_head = av->heads < 8 ? av->heads : 8;
     for (int h = 0; h < L->n_head; ++h)
-        L->head[h] = (SDL_Rect){L->img.x + ATTN_IMG + 20 + (h % 4) * (ATTN_HEAD + 8), box.y + 84 + (h / 4) * (ATTN_HEAD + 20), ATTN_HEAD, ATTN_HEAD};
+        L->head[h] = (SDL_Rect){L->img.x + ATTN_IMG + 20 + (h % 4) * (ATTN_HEAD + 8), box.y + 84 + (h / 4) * (ATTN_HEAD + 56), ATTN_HEAD, ATTN_HEAD};
     L->n_mat = av->heads < 6 ? av->heads : 6;
     for (int h = 0; h < L->n_mat; ++h) L->mat[h] = (SDL_Rect){box.x + 12 + h * (ATTN_MAT + 8), box.y + 84 + ATTN_IMG + 64, ATTN_MAT, ATTN_MAT};
     for (int k = 0; k < n_layers; ++k) L->chip[k] = (SDL_Rect){box.x + box.w - 12 - (n_layers - k) * 64, box.y + 10, 58, 24};
@@ -3943,6 +4053,47 @@ static void attn_overlay(Gui *g, SDL_Rect r, const AttnViz *av, const float *row
     SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_NONE);
 }
 
+/* What one head does, in two words, for the sample on screen (averaged over every query token): where it looks -
+ * "self" (a lot of weight on the token itself), "local", "mid" or "far" (the weighted distance, in grid cells, from the
+ * token to what it looks at, against the size of the grid) - and how it looks: "focused" on a few tokens, "spread"
+ * over many, or "mixed" (the normalised entropy of its weights). This describes behaviour; the role of a head is learned. */
+static void attn_head_label(const AttnViz *av, const float *m, char *out, size_t n) {
+    int T = av->tokens, gh = av->gh, gw = av->gw;
+    if (gh * gw != T) {
+        gh = T;
+        gw = 1;
+    }
+    double selfw = 0.0, dist = 0.0, ent = 0.0;
+    for (int i = 0; i < T; ++i) {
+        selfw += m[(size_t)i * T + i];
+        for (int j = 0; j < T; ++j) {
+            double pr = m[(size_t)i * T + j];
+            double dy = (double)(i / gw - j / gw), dx = (double)(i % gw - j % gw);
+            dist += pr * sqrt(dy * dy + dx * dx);
+            if (pr > 1e-9) ent -= pr * log(pr);
+        }
+    }
+    selfw /= T;
+    dist /= T;
+    ent = T > 1 ? ent / T / log((double)T) : 0.0;
+    int span = gh > gw ? gh : gw;
+    const char *where = selfw > 0.35 ? "self" : (dist < 0.25 * span ? "local" : (dist > 0.5 * span ? "far" : "mid"));
+    const char *how = ent < 0.55 ? "focused" : (ent > 0.8 ? "spread" : "mixed");
+    snprintf(out, n, "%s, %s", where, how);
+}
+
+/* "head 2  ch 8-15" and what it does, drawn under a tile. */
+static void attn_head_caption(Gui *g, const AttnViz *av, const float *maps, int h, int x, int y) {
+    int d = train_node_shape(&g->run_shapes, av->tid).c, dh = av->heads > 0 ? d / av->heads : 0;
+    char l1[40], l2[40], l3[40];
+    snprintf(l1, sizeof(l1), "head %d", h + 1);
+    snprintf(l2, sizeof(l2), "ch %d-%d", h * dh, (h + 1) * dh - 1);
+    attn_head_label(av, maps + (size_t)h * av->tokens * av->tokens, l3, sizeof(l3));
+    wtxt(g, l1, x, y, (SDL_Color){COL_TEXT});
+    wtxt(g, l2, x, y + 14, (SDL_Color){COL_TEXT_DIM});
+    wtxt(g, l3, x, y + 28, (SDL_Color){255, 214, 102, 255});
+}
+
 static void draw_attention_view(Gui *g, SDL_Rect box) {
     SDL_Renderer *R = g->weights_ren;
     const ModelInfo *m = &g->model;
@@ -3961,6 +4112,8 @@ static void draw_attention_view(Gui *g, SDL_Rect box) {
     snprintf(hdr, sizeof(hdr), "attention %d - %d heads, %d tokens (%dx%d grid)", g->attn_layer + 1, av->heads, T, av->gh, av->gw);
     wtxt(g, hdr, box.x + 10, box.y + 8, (SDL_Color){COL_TEXT});
     wtxt(g, "click a patch of the image to choose the token that looks", box.x + 10, box.y + 30, dim);
+    wtxt(g, "ch = the channels a head owns in q, k and v; the words = how it", box.x + 10, box.y + 46, dim);
+    wtxt(g, "looks for this sample (learned, not a fixed role)", box.x + 10, box.y + 60, dim);
     if (m->n_attn > 1)
         for (int k = 0; k < m->n_attn; ++k) {
             char nm[12];
@@ -3995,9 +4148,7 @@ static void draw_attention_view(Gui *g, SDL_Rect box) {
         wtxt(g, "blue box = the token that looks", L.img.x, L.img.y + ATTN_IMG + 20, dim);
         for (int h = 0; h < L.n_head; ++h) {
             attn_overlay(g, L.head[h], av, maps + ((size_t)h * T + q) * T);
-            char nm[16];
-            snprintf(nm, sizeof(nm), "head %d", h + 1);
-            wtxt(g, nm, L.head[h].x, L.head[h].y + ATTN_HEAD + 2, dim);
+            attn_head_caption(g, av, maps, h, L.head[h].x, L.head[h].y + ATTN_HEAD + 2);
         }
     } else {
         wtxt(g, "the tokens do not come from an image grid, only the matrices below are shown", box.x + 10, box.y + 90, dim);
@@ -4023,9 +4174,7 @@ static void draw_attention_view(Gui *g, SDL_Rect box) {
         SDL_SetRenderDrawColor(R, 90, 190, 255, 255);
         SDL_RenderDrawLine(R, r.x, qy, r.x + r.w - 1, qy);
         SDL_RenderDrawRect(R, &r);
-        char nm[16];
-        snprintf(nm, sizeof(nm), "head %d", h + 1);
-        wtxt(g, nm, r.x, r.y + ATTN_MAT + 2, dim);
+        attn_head_caption(g, av, maps, h, r.x, r.y + ATTN_MAT + 2);
     }
 }
 
@@ -4175,7 +4324,7 @@ static void arch_click(Gui *g, SDL_Point p) {
     if (!g->has_model || g->run_cfg.n_blocks == 0) return;
     ArchGroup gr[ARCH_MAX_GROUPS];
     SDL_Rect box[ARCH_MAX_GROUPS];
-    int n = build_arch(&g->run_cfg, &g->run_shapes, g->arch_expanded, g->arch_attn_open, gr), bw, bh, ty, th;
+    int n = build_arch(&g->run_cfg, &g->run_shapes, g->arch_expanded, g->arch_attn_open, g->arch_proj_open, gr), bw, bh, ty, th;
     arch_boxes(ARCH_BOX, gr, n, ARCH_SHOW_WEIGHTS && g->weights_valid, box, &bw, &bh, &ty, &th);
     for (int u = 0; u < MAX_BLOCKS; ++u) { /* the label of an expanded unit's frame collapses it */
         if (!g->arch_expanded[u]) continue;
@@ -4194,6 +4343,14 @@ static void arch_click(Gui *g, SDL_Point p) {
             return;
         }
     }
+    for (int i = 0; i < n; ++i) { /* the label of an opened projection's frame folds it again */
+        if (!gr[i].proj_open) continue;
+        SDL_Rect label = {box[i].x - 4, box[i].y - 13, 100, 16};
+        if (SDL_PointInRect(&p, &label)) {
+            g->arch_proj_open[gr[i].attn_b1 - 1] &= ~(gr[i].attn_sub == 1 ? 1 : 2);
+            return;
+        }
+    }
     for (int i = 0; i < n; ++i) { /* the [+] corner of a collapsed unit expands it, of an attention box opens it */
         SDL_Rect corner = {box[i].x + box[i].w - 30, box[i].y + box[i].h - 20, 30, 20};
         if (gr[i].collapsed && SDL_PointInRect(&p, &corner)) {
@@ -4202,6 +4359,10 @@ static void arch_click(Gui *g, SDL_Point p) {
         }
         if (gr[i].attn_b1 && gr[i].attn_sub == 0 && SDL_PointInRect(&p, &corner)) {
             g->arch_attn_open[gr[i].attn_b1 - 1] = 1;
+            return;
+        }
+        if (gr[i].attn_b1 && (gr[i].attn_sub == 1 || gr[i].attn_sub == 3) && !gr[i].proj_open && SDL_PointInRect(&p, &corner)) {
+            g->arch_proj_open[gr[i].attn_b1 - 1] |= gr[i].attn_sub == 1 ? 1 : 2;
             return;
         }
     }
@@ -5016,6 +5177,37 @@ static void setup_click(Gui *g, SDL_Point p) {
             err_callout_rect(g, &fix);
             if (SDL_PointInRect(&pv, &fix)) {
                 apply_error_fix(g);
+                return;
+            }
+        }
+        if (g->attn_inspect1) { /* the inside of an attention block is showing: its buttons first, and it swallows clicks on itself */
+            int node = g->attn_inspect1 - 1;
+            if (!g->nodes[node].used || node_hidden(g, node)) {
+                g->attn_inspect1 = 0;
+            } else {
+                SDL_Rect pop, box[3], close, fc[2];
+                attn_pop_layout(g, node, &pop, box, &close, fc);
+                if (SDL_PointInRect(&pv, &close)) {
+                    g->attn_inspect1 = 0;
+                    return;
+                }
+                if (SDL_PointInRect(&pv, &box[0])) {
+                    g->attn_inspect_open ^= 1;
+                    return;
+                }
+                if (SDL_PointInRect(&pv, &box[2])) {
+                    g->attn_inspect_open ^= 2;
+                    return;
+                }
+                if (SDL_PointInRect(&pv, &pop)) return;
+            }
+        }
+        for (int i = 0; i < MAX_NODES; ++i) { /* the [+] of an attention node shows what is inside it */
+            if (!g->nodes[i].used || g->nodes[i].type != BLK_ATTENTION || node_hidden(g, i)) continue;
+            SDL_Rect t = attn_toggle_rect(g, i);
+            if (SDL_PointInRect(&pv, &t)) {
+                g->attn_inspect1 = g->attn_inspect1 == i + 1 ? 0 : i + 1;
+                g->attn_inspect_open = 0;
                 return;
             }
         }
