@@ -156,6 +156,106 @@ static inline int train_cfg_fail(char *err, size_t errsz, const char *fmt, int a
     return -1;
 }
 
+/* "28x28x16" for an image, "12544 values" once flat. */
+static inline void train_shape_text(LayerShape s, char *buf, size_t n) {
+    if (s.flat) snprintf(buf, n, "%d values", s.c);
+    else snprintf(buf, n, "%dx%dx%d", s.h, s.w, s.c);
+}
+
+/* The shape rules of a single block, for the editor: what does `type` produce from these inputs, and can
+ * it take them at all? p = {a,b,c,d} as in Block, or NULL when the fields don't parse yet; in1 = the second
+ * input of add / cat, or NULL when it isn't wired (or its shape is unknown).
+ * Returns 0 (*out filled), 1 (the input is acceptable but the output can't be worked out yet: parameters
+ * missing or the other input unknown), or -1 with a short reason in err. Parameter ranges are
+ * train_cfg_derive()'s job; this only refuses what no parameters could fix. */
+static inline int train_block_infer(int type, const int *p, LayerShape in0, const LayerShape *in1, LayerShape *out, char *err,
+                                    size_t errsz) {
+#define INFER_FAIL(...)                                    \
+    do {                                                   \
+        if (err && errsz) snprintf(err, errsz, __VA_ARGS__); \
+        return -1;                                         \
+    } while (0)
+    char sa[32], sb[32];
+    train_shape_text(in0, sa, sizeof(sa));
+    *out = in0;
+    switch (type) {
+    case BLK_RELU:
+    case BLK_BATCHNORM:
+        return 0;
+    case BLK_CONV:
+        if (in0.flat) INFER_FAIL("conv needs an image, but this output is %s (flat)", sa);
+        if (!p || p[0] < 1 || p[1] < 1 || p[2] < 1 || p[3] < 0) return 1;
+        if (in0.h + 2 * p[3] < p[1] || in0.w + 2 * p[3] < p[1])
+            INFER_FAIL("conv: kernel %d is larger than the %dx%d (padded) input", p[1], in0.h + 2 * p[3], in0.w + 2 * p[3]);
+        out->c = p[0];
+        out->h = (in0.h + 2 * p[3] - p[1]) / p[2] + 1;
+        out->w = (in0.w + 2 * p[3] - p[1]) / p[2] + 1;
+        return 0;
+    case BLK_FLATTEN:
+        if (in0.flat) INFER_FAIL("flatten: this output is already flat (%s)", sa);
+        out->c = in0.c * in0.h * in0.w;
+        out->h = out->w = 1;
+        out->flat = 1;
+        return 0;
+    case BLK_LINEAR:
+        if (!in0.flat) INFER_FAIL("fc needs a flat input, but this output is the image %s - add a flatten (or gap) block first", sa);
+        if (!p || p[0] < 1) return 1;
+        if ((double)in0.c * p[0] > MAX_FC_WEIGHTS) INFER_FAIL("fc: %d x %d weights is too large", in0.c, p[0]);
+        out->c = p[0];
+        return 0;
+    case BLK_ADD:
+        if (!in1) return 1;
+        train_shape_text(*in1, sb, sizeof(sb));
+        if (!train_shape_equal(in0, *in1)) INFER_FAIL("add needs two inputs of the same shape (%s vs %s)", sa, sb);
+        return 0;
+    case BLK_CONCAT:
+        if (in0.flat) INFER_FAIL("cat needs images, but this output is %s (flat)", sa);
+        if (!in1) return 1;
+        train_shape_text(*in1, sb, sizeof(sb));
+        if (in1->flat) INFER_FAIL("cat needs images, but the other input is %s (flat)", sb);
+        if (in0.h != in1->h || in0.w != in1->w)
+            INFER_FAIL("cat needs the same height and width (%dx%d vs %dx%d)", in0.h, in0.w, in1->h, in1->w);
+        out->c = in0.c + in1->c;
+        return 0;
+    case BLK_MAXPOOL:
+        if (in0.flat) INFER_FAIL("pool needs an image, but this output is %s (flat)", sa);
+        if (!p || p[0] < 1 || p[1] < 1) return 1;
+        if (in0.h < p[0] || in0.w < p[0]) INFER_FAIL("pool: window %d is larger than the %dx%d input", p[0], in0.h, in0.w);
+        out->h = (in0.h - p[0]) / p[1] + 1;
+        out->w = (in0.w - p[0]) / p[1] + 1;
+        return 0;
+    case BLK_UPSAMPLE:
+        if (in0.flat) INFER_FAIL("up needs an image, but this output is %s (flat)", sa);
+        if (!p || p[0] < 1 || p[0] > 4) return 1;
+        out->h = in0.h * p[0];
+        out->w = in0.w * p[0];
+        return 0;
+    case BLK_RESHAPE:
+        if (!in0.flat) INFER_FAIL("view needs a flat input (an fc output), but this output is the image %s", sa);
+        if (!p || p[0] < 1 || p[1] < 1 || p[2] < 1) return 1;
+        if ((double)p[0] * p[1] * p[2] != (double)in0.c)
+            INFER_FAIL("view: %d values cannot become %dx%dx%d (= %d)", in0.c, p[1], p[2], p[0], p[0] * p[1] * p[2]);
+        out->c = p[0];
+        out->h = p[1];
+        out->w = p[2];
+        out->flat = 0;
+        return 0;
+    case BLK_REPARAM:
+        if (!in0.flat || in0.c < 2 || in0.c % 2 != 0)
+            INFER_FAIL("vae needs a flat input of 2*Z values (mean and log-variance), but this output is %s", sa);
+        out->c = in0.c / 2;
+        return 0;
+    case BLK_GAP:
+        if (in0.flat) INFER_FAIL("gap needs an image, but this output is %s (flat)", sa);
+        out->h = out->w = 1;
+        out->flat = 1;
+        return 0;
+    default:
+        return 1;
+    }
+#undef INFER_FAIL
+}
+
 /* Returns 0 and fills *s if cfg is runnable, else -1 with a one-line reason in
  * err (and s->err_block naming the offending block when there is one). */
 static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err, size_t errsz) {
@@ -442,7 +542,7 @@ typedef struct MsgHeader {
 } MsgHeader;
 
 #define MSG_MODEL 1    /* ModelInfo - sent once at the start of every run */
-#define MSG_PROGRESS 2 /* Progress, then train_sample_bytes() of sample pixels, then (if has_weights) info.total_floats floats */
+#define MSG_PROGRESS 2 /* Progress, train_sample_bytes() of sample pixels, info.total_act_floats activations, then (if has_weights) info.total_floats weights */
 #define MSG_ERROR 3    /* char[]: a NUL-terminated human-readable reason */
 #define MSG_GENERATED 5 /* GenHeader, then the images listed there (img_c*img_h*img_w bytes each); sent after every epoch */
 #define MSG_PREDICTIONS 4 /* PredHeader, then n x (PredSample + train_sample_bytes() of pixels / masks); sent after every epoch */
@@ -512,11 +612,28 @@ typedef struct LayerViz {
     char name[16];
 } LayerViz;
 
+/* One entry per fully-connected (Linear) block, in block order: what the viewer needs to draw the layer as neurons
+ * and to place the live activations that follow every Progress message (after the sample's pixels, before any
+ * weights): `dim` floats per layer, at `offset`, for the sample the dashboard is showing. */
+typedef struct ActLayer {
+    int dim;       /* neurons (output features) */
+    int in_dim;    /* inputs */
+    int prev;      /* index of the fc layer feeding this one directly (only relus in between), else -1 */
+    int viz_index; /* index into ModelInfo.layers of this layer's weight matrix */
+    int offset;    /* float offset of this layer's values in the activations payload */
+    int tid;       /* the tensor the values are read from: the layer's output, or the relu after it */
+    int relu;      /* 1 = the values are after a relu */
+    char src[12];  /* when prev < 0: what feeds the layer ("input", "flatten", "gap", "latent z", ...) */
+} ActLayer;
+
 typedef struct ModelInfo {
     TrainConfig cfg;
     int n_viz;
     LayerViz layers[MAX_VIZ_LAYERS];
     int total_floats;
+    int n_act;
+    ActLayer act[MAX_VIZ_LAYERS];
+    int total_act_floats;
 } ModelInfo;
 
 typedef struct Progress {

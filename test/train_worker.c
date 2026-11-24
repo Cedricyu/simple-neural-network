@@ -43,7 +43,7 @@
  * average-pooled over input rows (TrainConfig::fc_pool) so a heatmap update
  * stays cheap to send every batch. FC_VIZ_MAX_FLOATS caps the pooled result
  * no matter what fc_pool was asked for. */
-#define FC_FULL_DETAIL_MAX 4096
+#define FC_FULL_DETAIL_MAX 32768 /* the network view draws every connection of a layer that is sent in full */
 #define FC_VIZ_MAX_FLOATS 65536
 
 /* One entry per block; conv[i] / lin[i] / bn[i] are only set for the blocks of that type. */
@@ -65,6 +65,7 @@ typedef struct ForwardCache {
     int n;
     Tensor *logits;
     Tensor *latent_in; /* VAE: the (B, 2Z) mean / log-variance tensor that fed the sampling block */
+    Tensor *val[MAX_BLOCKS + 1]; /* every tensor of the pass by id (0 = input, i+1 = block i's output), until free_cache */
 } ForwardCache;
 
 static Tensor *cache_add(ForwardCache *c, Tensor *t) {
@@ -179,6 +180,7 @@ static void net_forward_ex(Net *n, Tensor *x, ForwardCache *c, int training, Ten
         val[i + 1] = cache_add(c, out);
     }
     c->logits = val[n->n_blocks];
+    memcpy(c->val, val, sizeof(val));
 }
 
 static void net_forward(Net *n, Tensor *x, ForwardCache *c, int training) { net_forward_ex(n, x, c, training, NULL); }
@@ -271,7 +273,8 @@ static int effective_pool(int in_dim, int out_dim, int requested) {
 static void build_model_info(const TrainConfig *c, const NetShapes *s, ModelInfo *info) {
     memset(info, 0, sizeof(*info));
     info->cfg = *c;
-    int offset = 0, v = 0, n_conv = 0, n_lin = 0;
+    int offset = 0, v = 0, n_conv = 0, n_lin = 0, act_of_block[MAX_BLOCKS];
+    for (int i = 0; i < c->n_blocks; ++i) act_of_block[i] = -1;
     for (int i = 0; i < c->n_blocks; ++i) {
         const Block *b = &c->blocks[i];
         LayerShape in = train_block_input(s, b);
@@ -297,6 +300,29 @@ static void build_model_info(const TrainConfig *c, const NetShapes *s, ModelInfo
             lv->offset = offset;
             snprintf(lv->name, sizeof(lv->name), "fc%d", ++n_lin);
             offset += lv->count * lv->cols;
+
+            /* the live activations of this layer: its own output, or the relu right after it */
+            ActLayer *al = &info->act[info->n_act];
+            act_of_block[i] = info->n_act++;
+            al->dim = b->a;
+            al->in_dim = in.c;
+            al->viz_index = v - 1;
+            al->offset = info->total_act_floats;
+            al->tid = i + 1;
+            for (int j = i + 1; j < c->n_blocks; ++j)
+                if (c->blocks[j].type == BLK_RELU && c->blocks[j].in[0] == i + 1) {
+                    al->tid = j + 1;
+                    al->relu = 1;
+                    break;
+                }
+            info->total_act_floats += al->dim;
+            /* what feeds it: walk back through relus to the block that produced its input */
+            int id = b->in[0];
+            while (id > 0 && c->blocks[id - 1].type == BLK_RELU) id = c->blocks[id - 1].in[0];
+            al->prev = -1;
+            if (id > 0 && c->blocks[id - 1].type == BLK_LINEAR) al->prev = act_of_block[id - 1];
+            else if (id == 0) snprintf(al->src, sizeof(al->src), "input");
+            else snprintf(al->src, sizeof(al->src), "%s", c->blocks[id - 1].type == BLK_REPARAM ? "latent z" : train_block_type_name(c->blocks[id - 1].type));
         }
     }
     info->n_viz = v;
@@ -328,6 +354,20 @@ static void gather_viz(const Net *n, const ModelInfo *info, float *out, float *s
                 reduce_fc_viz(scratch, lv->in_dim, lv->out_dim, lv->pool, out + lv->offset);
             }
         }
+    }
+}
+
+/* The shown sample's row of every fc layer's output (or relu output), after the forward pass of this batch. */
+static void gather_activations(const ModelInfo *info, const ForwardCache *c, int shown, float *out, float *tmp) {
+    for (int k = 0; k < info->n_act; ++k) {
+        const ActLayer *al = &info->act[k];
+        const Tensor *t = c->val[al->tid];
+        if (!t || t->ndim != 2 || t->shape[1] != al->dim || shown >= t->shape[0]) {
+            memset(out + al->offset, 0, sizeof(float) * (size_t)al->dim);
+            continue;
+        }
+        tensor_to_host((Tensor *)t, tmp);
+        memcpy(out + al->offset, tmp + (size_t)shown * al->dim, sizeof(float) * (size_t)al->dim);
     }
 }
 
@@ -913,6 +953,11 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
     float *target_buf = gen ? (float *)malloc(sizeof(float) * (size_t)batch_size * img_px) : NULL;
     unsigned char *batch_mask = seg ? (unsigned char *)malloc((size_t)batch_size * map_px) : NULL;
     float *viz = (float *)malloc(sizeof(float) * (info.total_floats > 0 ? info.total_floats : 1));
+    float *acts = (float *)calloc((size_t)(info.total_act_floats > 0 ? info.total_act_floats : 1), sizeof(float));
+    size_t max_act_tmp = 1;
+    for (int k = 0; k < info.n_act; ++k)
+        if ((size_t)batch_size * info.act[k].dim > max_act_tmp) max_act_tmp = (size_t)batch_size * info.act[k].dim;
+    float *act_tmp = (float *)malloc(sizeof(float) * max_act_tmp);
     float *scratch = (float *)malloc(sizeof(float) * max_weight_floats(&net));
     unsigned char *pixels = (unsigned char *)malloc(sample_bytes);
     /* Samples are visited in a fresh random order every epoch: datasets are
@@ -1034,7 +1079,7 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
                     int k, label = batch_y[j];
                     softmax(host_logits + j * nc, probs, nc);
                     batch_loss += -logf(probs[label] + 1e-7f);
-                    for (k = 0; k < nc; ++k) grad_output[j * nc + k] = probs[k] - ((k == label) ? 1.0f : 0.0f);
+                    for (k = 0; k < nc; ++k) grad_output[j * nc + k] = (probs[k] - ((k == label) ? 1.0f : 0.0f)) / (float)curr_batch; /* the loss is the batch mean */
                     if (argmax(probs, nc) == label) batch_correct++;
                     if (j == 0) sample_pred = argmax(probs, nc);
                 }
@@ -1049,6 +1094,7 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
             tensor_backward(cache.logits, grad_tensor);
             tensor_free(grad_tensor);
             net_update(&net, cfg, batch_no + 1);
+            gather_activations(&info, &cache, shown, acts, act_tmp); /* before the pass's tensors are freed */
             free_cache(&cache);
 
             epoch_loss += batch_loss;
@@ -1115,9 +1161,10 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
             }
             if (prog.has_weights) gather_viz(&net, &info, viz, scratch);
 
-            const void *parts[3] = {&prog, pixels, viz};
-            size_t sizes[3] = {sizeof(prog), sample_bytes, prog.has_weights ? sizeof(float) * (size_t)info.total_floats : 0};
-            if (send_msgv(fifo, MSG_PROGRESS, parts, sizes, 3) != 0) {
+            const void *parts[4] = {&prog, pixels, acts, viz};
+            size_t sizes[4] = {sizeof(prog), sample_bytes, sizeof(float) * (size_t)info.total_act_floats,
+                               prog.has_weights ? sizeof(float) * (size_t)info.total_floats : 0};
+            if (send_msgv(fifo, MSG_PROGRESS, parts, sizes, 4) != 0) {
                 fprintf(stderr, "train_worker: viewer disconnected, stopping.\n");
                 result = RUN_GONE;
                 break;
@@ -1152,6 +1199,8 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
     free(lat_buf);
     free(target_buf);
     free(viz);
+    free(acts);
+    free(act_tmp);
     free(scratch);
     free(pixels);
     free(perm);

@@ -19,8 +19,8 @@ sudo apt install -y libsdl2-dev libsdl2-ttf-dev      # GUI only
 make train_gui
 ```
 
-The GUI opens **fullscreen** (the whole picture is scaled to fit your screen, keeping its proportions); press
-`F11` to switch between fullscreen and a window, or start windowed with `./train_viewer --windowed`.
+The GUI opens in a 1150x700 window; press `F11` to switch to fullscreen (the whole picture is scaled to fit your
+screen, keeping its proportions) and back, or start fullscreen with `./train_viewer --fullscreen`.
 
 Requirements: an NVIDIA GPU, the CUDA Toolkit (`nvcc` on `PATH`) and `gcc`. If `nvcc --version` is
 newer than the CUDA version `nvidia-smi` reports (common on WSL2), build with a matching toolkit:
@@ -63,8 +63,8 @@ yours to make:
 | **Generation** | new images (a VAE) | any (no labels used) | `vae` | input / reconstruction, generations page |
 
 Everything below follows from it: the task the trainer runs, the datasets the dropdown offers (Segmentation lists
-only datasets with masks), the blocks on the palette, the presets, and the default training settings (switching
-problem loads that problem's default model, and picking a dataset rebuilds a U-Net or VAE for its image size).
+only datasets with masks), the blocks on offer, the presets, and the default training settings (switching
+problem clears the model, since another problem's model would not fit; a preset or your own graph is yours to pick).
 Below the problem selector are the training parameters, and on the right a **node editor** for the model. Everything is validated continuously: every block shows the shape it outputs,
 the parameter count updates live, and anything that can't run (shape mismatch, a model that doesn't end
 in one output per class, a batch that won't fit in GPU memory, ...) is shown in red with the offending
@@ -73,9 +73,9 @@ block outlined, instead of reaching the GPU. Start switches to the live dashboar
 
 | field | meaning |
 |---|---|
-| problem | Classification, Segmentation or Generation (see above); switching loads that problem's default model and settings |
+| problem | Classification, Segmentation or Generation (see above); switching clears the model and loads that problem's training settings |
 | dataset | folders under `data/`; image size, channels and class count are read from the files, and picking one loads its suggested settings |
-| epochs, batch size, learning rate, seed | |
+| epochs, batch size, learning rate, seed | the loss is the mean over the batch, so SGD learning rates are the usual ones (0.01-0.1; the default is 0.01) |
 | optimizer | 0 = SGD with momentum, 1 = Adam (betas 0.9 / 0.999) |
 | momentum | SGD momentum, 0 = plain SGD (ignored by Adam) |
 | normalize | 1 = standardize pixels per channel |
@@ -106,18 +106,24 @@ The graph must end in one value per class (classification: an fc block), in a ma
 the full image size (segmentation dataset: a 1x1 conv), or, if it contains a `vae` block, in an image the size
 of the input. Limits are 48 blocks and 16 conv + fc layers.
 
-- **Build** — click a palette chip to append a block, or drag it onto the canvas. Drag from an output dot
+- **Build** — the editor starts empty (just `input` and `output`). Open the `blocks` menu (top left) and click a block to
+  drop it on the canvas, or drag it where you want it. Blocks arrive unwired - pull the wires yourself; or drag it onto the canvas. Drag from an output dot
   to an input dot to wire; grab a wired input dot to move its wire; `x` deletes a block and re-joins its
   neighbours; `arrange` lays the nodes out in evaluation order and zooms to fit them all.
 - **Zoom and pan** — scroll to zoom around the cursor (35%-200%), drag the background to pan, shift + scroll to pan
   sideways; the bar at the canvas's bottom right has `-` / `+` and `fit` (show every node). A big graph such as the
   U-Net is shown whole after `arrange` or loading a preset, and you zoom in to edit a block.
-- **Presets** (the menu next to `arrange`) — Classification: `cnn` (4 conv + fc, the default) and `resnet`
-  (stem, an identity residual block, a stride-2 block with a 1x1-conv shortcut, global average pool, fc);
+- **Presets** (the menu next to `arrange`; nothing is loaded until you pick one, `empty` clears the canvas) —
+  Classification: `cnn` (4 conv + fc), `resnet`
+  (stem, an identity residual block, a stride-2 block with a 1x1-conv shortcut, global average pool, fc) and `mlp`
+  (flatten and three fc layers);
   Segmentation: `unet` (two downsampling levels, nearest upsampling + concat skips, 1x1 conv head); Generation:
-  `vae` (below). The block palette follows the problem too: Classification has `flat`, `fc`, `gap` but no
+  `vae` (below). The `blocks` menu follows the problem too: Classification has `flat`, `fc`, `gap` but no
   `up` / `cat`; Segmentation has `up` / `cat` but no `flat` / `fc` / `gap`; `view` and `vae` appear only under
   Generation.
+- **Errors** — a block that breaks a rule gets a red border and a callout under it saying why (the status line
+  repeats it). Two common mistakes have a one-click fix in the callout: an fc / `view` / `vae` block fed an image
+  (`insert a flatten block`) and a last fc whose width is not the class count (`set out to N`).
 - **Read the graph** — wires are blue between neighbours in evaluation order and pink for skips and
   branches; hover a block to light up everything it reads and everything that reads it.
 
@@ -129,7 +135,9 @@ A **model graph** across the top (a box per layer with its output shape, relu / 
 `+bn +relu`, residual shortcuts as pink arcs, hover to trace), the loss curve, the current sample
 (green border = predicted correctly), the running test accuracy, and the weights viewer. For segmentation
 the sample box shows the scan, the true mask and the predicted mask side by side, and the numbers are the
-batch's Dice and the test split's Dice / IoU.
+batch's Dice and the test split's Dice / IoU. If the loss turns NaN, or a classifier's loss sits at
+ln(#classes) (the network predicts one answer for everything, usually dead ReLUs after a too-high learning
+rate), a red banner over the loss curve says so and suggests a fix.
 
 ![Training window with the ResNet dependency graph](docs/gui_resnet_run.png)
 
@@ -189,6 +197,21 @@ rate whatever the gradient's scale, which matters for losses that sum over pixel
 live: conv filters as bars (height = weight, blue < 0 < red), fc matrices as a height-field surface.
 Drag to rotate, scroll to zoom, `0` resets.
 
+A fully-connected weight matrix has no spatial structure (its rows are arbitrary features), so a height field of it
+looks like noise. The last tab, **network**, shows the fc layers as neurons instead:
+
+- each layer is a column of neurons (a strip of thin cells when there are many), **brightness = that neuron's
+  activation for the sample the dashboard is showing**, updated every batch; a classifier's last layer is labelled
+  with the class names and probabilities, the winner ringed;
+- the **strongest 90 connections** between neighbouring layers are drawn as lines: by default weight x activation, i.e.
+  what pushes the next neuron up (red) or down (blue) *for this sample*, so you can see which hidden neurons drive a
+  decision; the button in the corner switches to the plain weight;
+- a layer fed by a flatten, the raw input or the VAE's latent hangs off a single block (too many inputs to draw), each
+  line as strong as that neuron's weight norm, with the sample shown under it;
+- layers whose weights were sent pooled (more than 32768 weights) draw no connections.
+
+The `mlp` preset (flatten, fc 64, fc 32, fc) is the model this view is made for.
+
 ![fc1 weights in 3D](docs/weights_fc1.png)
 
 ### Two processes
@@ -204,7 +227,7 @@ A dataset is a folder `data/<name>/` with IDX files (`train-images-idx3-ubyte`, 
 and optionally `t10k-*` for a test split evaluated every epoch). Images are grey or colour, up to
 128x128, 2-16 classes. Colour images use a 4-dimensional variant (magic `0x00000804`: count, channels,
 rows, cols, each image stored channel by channel). Optional `classes.txt` names the classes; optional
-`defaults.txt` (`key value` lines: `epochs`, `batch_size`, `lr`, `momentum`, `normalize`, `augment`)
+`defaults.txt` (`key value` lines: `epochs`, `batch_size`, `lr`, `momentum`, `normalize`, `augment`, `optimizer`)
 is loaded into the form when the dataset is picked.
 
 | dataset | get it | result |
@@ -228,7 +251,7 @@ pip install pyarrow numpy pillow          # for the converters
 ```
 
 Notes from training the harder sets: NEU-CLS needs per-epoch shuffling (the files are sorted by class),
-standardization, momentum 0.9, flips and lr ~1e-4 for the CNN (its `defaults.txt` has them); a residual
+standardization, momentum 0.9, flips and lr ~6e-3 for the CNN (its `defaults.txt` has them); a residual
 network does not beat the CNN on 1440 images. The CIFAR-10 run was stopped at epoch 10 of 15
 (about 50 s/epoch), so ~73% is a partial result, not a tuned one.
 
