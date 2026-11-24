@@ -25,8 +25,8 @@ BASE = "https://huggingface.co/datasets/uoft-cs/cifar10/resolve/main/plain_text/
 FILES = {"train": "train-00000-of-00001.parquet", "test": "test-00000-of-00001.parquet"}
 CLASSES = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
 
-# Settings that train the preset ResNet reasonably; tuned in the README's CIFAR-10 section.
-DEFAULTS = "epochs 20\nbatch_size 64\nlr 0.01\nmomentum 0.9\nnormalize 1\naugment 2\n"
+# Adam trains both the plain CNN (no BatchNorm, which diverges with SGD at lr 0.01) and the ResNet preset.
+DEFAULTS = "epochs 20\nbatch_size 64\nlr 0.001\nmomentum 0.9\nnormalize 1\naugment 2\noptimizer 1\n"
 
 
 def fetch(url, dest):

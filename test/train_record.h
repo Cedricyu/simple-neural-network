@@ -37,8 +37,10 @@
  * (including out-of-memory), so a config that can't fit must be rejected up
  * front with a readable message rather than discovered mid-run. */
 #define MAX_BLOCKS 48
-#define MAX_VIZ_LAYERS 16 /* conv + linear blocks: the layers that have weights to show */
-#define MAX_CONV_CHANNELS 64
+#define MAX_VIZ_LAYERS 24 /* conv + linear blocks: the layers that have weights to show */
+#define MAX_CONV_CHANNELS 256 /* a transformer's packed q,k,v projection is 3x the embedding width */
+#define MAX_TOKENS 1024 /* positions (h*w) of a token sequence: attention is quadratic in it */
+#define MAX_HEADS 16
 #define MAX_KERNEL 7
 #define MAX_STRIDE 4
 #define MAX_PADDING 3
@@ -58,7 +60,7 @@
 #define BLK_CONV 1    /* a = out channels, b = kernel, c = stride, d = padding; needs an image (not flat) */
 #define BLK_RELU 2    /* no parameters */
 #define BLK_FLATTEN 3 /* (C,H,W) -> C*H*W values; needs an image */
-#define BLK_LINEAR 4  /* a = out features; needs a flat input */
+#define BLK_LINEAR 4  /* a = out features; needs a flat input, or a token sequence (an image one pixel wide), where it is applied to every token */
 #define BLK_ADD 5     /* in[0] + in[1], elementwise: both must have the same shape (the residual connection) */
 #define BLK_BATCHNORM 6 /* per-channel normalization with learned scale and shift; any shape */
 #define BLK_MAXPOOL 7   /* a = window, b = stride; needs an image */
@@ -67,6 +69,15 @@
 #define BLK_CONCAT 10   /* in[0] and in[1] joined along the channels: same height and width, channels add up */
 #define BLK_RESHAPE 11  /* a,b,c = channels, height, width: a flat input of exactly a*b*c values becomes a feature map */
 #define BLK_REPARAM 12  /* the VAE sampling step: a flat input of 2*Z values (mu, logvar) -> Z values; f = KL weight */
+/* Transformer blocks. A token sequence is a (D, T, 1) "image": D features per token, T tokens, so the per-token
+ * linear layers are 1x1 convs and the residual connections are adds. */
+#define BLK_LAYERNORM 13 /* normalizes every position across its channels; learned scale and shift; any shape */
+#define BLK_GELU 14      /* the smooth relu of transformers; any shape */
+#define BLK_TOKENS 15    /* (C,H,W) -> (C,H*W,1): the patches of a conv become a sequence; needs an image */
+#define BLK_POS 16       /* adds a learned (C,H,W) position embedding; needs an image */
+#define BLK_PATCH 18     /* a = patch size, b = embedding width: cuts an image into patches and projects each to b values - a token sequence (b, H/a*W/a, 1); needs an image with sides a multiple of a */
+#define MAX_PATCH 32
+#define BLK_ATTENTION 17 /* a = heads: multi-head self-attention with its own q,k,v and output projections (D channels in and out, D a multiple of heads); needs an image */
 
 #define OPT_SGD 0
 #define OPT_ADAM 1
@@ -105,6 +116,7 @@ typedef struct TrainConfig {
 /* Viewer -> worker. Kept far below PIPE_BUF so a command is written and read
  * atomically (never split across two read()s). */
 #define TRAIN_CMD_START 1 /* (re)initialize with cfg and train from scratch */
+#define TRAIN_CMD_STOP 2  /* stop the run in progress (the cfg is unused); ignored when nothing is running */
 typedef struct TrainCmd {
     uint32_t magic;
     uint32_t type;
@@ -143,6 +155,12 @@ static inline const char *train_block_type_name(int type) {
     case BLK_CONCAT: return "concat";
     case BLK_RESHAPE: return "reshape";
     case BLK_REPARAM: return "reparam";
+    case BLK_LAYERNORM: return "layernorm";
+    case BLK_GELU: return "gelu";
+    case BLK_TOKENS: return "tokens";
+    case BLK_POS: return "pos";
+    case BLK_ATTENTION: return "attention";
+    case BLK_PATCH: return "patch";
     default: return "?";
     }
 }
@@ -154,6 +172,132 @@ static inline int train_shape_equal(LayerShape a, LayerShape b) {
 static inline int train_cfg_fail(char *err, size_t errsz, const char *fmt, int a, int b) {
     if (err && errsz) snprintf(err, errsz, fmt, a, b);
     return -1;
+}
+
+/* "28x28x16" for an image, "12544 values" once flat. */
+static inline void train_shape_text(LayerShape s, char *buf, size_t n) {
+    if (s.flat) snprintf(buf, n, "%d values", s.c);
+    else snprintf(buf, n, "%dx%dx%d", s.h, s.w, s.c);
+}
+
+/* The shape rules of a single block, for the editor: what does `type` produce from these inputs, and can
+ * it take them at all? p = {a,b,c,d} as in Block, or NULL when the fields don't parse yet; in1 = the second
+ * input of add / cat, or NULL when it isn't wired (or its shape is unknown).
+ * Returns 0 (*out filled), 1 (the input is acceptable but the output can't be worked out yet: parameters
+ * missing or the other input unknown), or -1 with a short reason in err. Parameter ranges are
+ * train_cfg_derive()'s job; this only refuses what no parameters could fix. */
+static inline int train_block_infer(int type, const int *p, LayerShape in0, const LayerShape *in1, LayerShape *out, char *err,
+                                    size_t errsz) {
+#define INFER_FAIL(...)                                    \
+    do {                                                   \
+        if (err && errsz) snprintf(err, errsz, __VA_ARGS__); \
+        return -1;                                         \
+    } while (0)
+    char sa[32], sb[32];
+    train_shape_text(in0, sa, sizeof(sa));
+    *out = in0;
+    switch (type) {
+    case BLK_RELU:
+    case BLK_BATCHNORM:
+    case BLK_LAYERNORM:
+    case BLK_GELU:
+        return 0;
+    case BLK_TOKENS:
+        if (in0.flat) INFER_FAIL("tokens needs an image to cut into a sequence, but this output is %s (flat)", sa);
+        out->h = in0.h * in0.w;
+        out->w = 1;
+        return 0;
+    case BLK_POS:
+        if (in0.flat) INFER_FAIL("pos needs a token sequence or image, but this output is %s (flat)", sa);
+        return 0;
+    case BLK_ATTENTION:
+        if (in0.flat) INFER_FAIL("attention needs a token sequence, but this output is %s (flat) - use tokens first", sa);
+        if (!p || p[0] < 1 || p[0] > MAX_HEADS) return 1;
+        if (in0.c % p[0] != 0) INFER_FAIL("attention: %d channels do not split into %d heads", in0.c, p[0]);
+        if (in0.h * in0.w > MAX_TOKENS) INFER_FAIL("attention: %d tokens is more than the limit %d", in0.h * in0.w, MAX_TOKENS);
+        return 0;
+    case BLK_CONV:
+        if (in0.flat) INFER_FAIL("conv needs an image, but this output is %s (flat)", sa);
+        if (!p || p[0] < 1 || p[1] < 1 || p[2] < 1 || p[3] < 0) return 1;
+        if (in0.h + 2 * p[3] < p[1] || in0.w + 2 * p[3] < p[1])
+            INFER_FAIL("conv: kernel %d is larger than the %dx%d (padded) input", p[1], in0.h + 2 * p[3], in0.w + 2 * p[3]);
+        out->c = p[0];
+        out->h = (in0.h + 2 * p[3] - p[1]) / p[2] + 1;
+        out->w = (in0.w + 2 * p[3] - p[1]) / p[2] + 1;
+        return 0;
+    case BLK_FLATTEN:
+        if (in0.flat) INFER_FAIL("flatten: this output is already flat (%s)", sa);
+        out->c = in0.c * in0.h * in0.w;
+        out->h = out->w = 1;
+        out->flat = 1;
+        return 0;
+    case BLK_LINEAR:
+        if (!in0.flat && in0.w != 1) INFER_FAIL("fc needs a flat input (or a token sequence), but this output is the image %s - add a flatten (or gap) block first", sa);
+        if (!p || p[0] < 1) return 1;
+        if ((double)in0.c * p[0] > MAX_FC_WEIGHTS) INFER_FAIL("fc: %d x %d weights is too large", in0.c, p[0]);
+        out->c = p[0];
+        return 0;
+    case BLK_PATCH:
+        if (in0.flat) INFER_FAIL("patch needs an image, but this output is %s (flat)", sa);
+        if (!p || p[0] < 1 || p[1] < 1) return 1;
+        if (p[0] > MAX_PATCH) INFER_FAIL("patch: size must be 1-%d", MAX_PATCH);
+        if (in0.h % p[0] != 0 || in0.w % p[0] != 0) INFER_FAIL("patch: the image %dx%d is not a multiple of the patch size %d", in0.h, in0.w, p[0]);
+        if ((in0.h / p[0]) * (in0.w / p[0]) > MAX_TOKENS) INFER_FAIL("patch: %d tokens is more than the limit %d", (in0.h / p[0]) * (in0.w / p[0]), MAX_TOKENS);
+        out->c = p[1];
+        out->h = (in0.h / p[0]) * (in0.w / p[0]);
+        out->w = 1;
+        return 0;
+    case BLK_ADD:
+        if (!in1) return 1;
+        train_shape_text(*in1, sb, sizeof(sb));
+        if (!train_shape_equal(in0, *in1)) INFER_FAIL("add needs two inputs of the same shape (%s vs %s)", sa, sb);
+        return 0;
+    case BLK_CONCAT:
+        if (in0.flat) INFER_FAIL("cat needs images, but this output is %s (flat)", sa);
+        if (!in1) return 1;
+        train_shape_text(*in1, sb, sizeof(sb));
+        if (in1->flat) INFER_FAIL("cat needs images, but the other input is %s (flat)", sb);
+        if (in0.h != in1->h || in0.w != in1->w)
+            INFER_FAIL("cat needs the same height and width (%dx%d vs %dx%d)", in0.h, in0.w, in1->h, in1->w);
+        out->c = in0.c + in1->c;
+        return 0;
+    case BLK_MAXPOOL:
+        if (in0.flat) INFER_FAIL("pool needs an image, but this output is %s (flat)", sa);
+        if (!p || p[0] < 1 || p[1] < 1) return 1;
+        if (in0.h < p[0] || in0.w < p[0]) INFER_FAIL("pool: window %d is larger than the %dx%d input", p[0], in0.h, in0.w);
+        out->h = (in0.h - p[0]) / p[1] + 1;
+        out->w = (in0.w - p[0]) / p[1] + 1;
+        return 0;
+    case BLK_UPSAMPLE:
+        if (in0.flat) INFER_FAIL("up needs an image, but this output is %s (flat)", sa);
+        if (!p || p[0] < 1 || p[0] > 4) return 1;
+        out->h = in0.h * p[0];
+        out->w = in0.w * p[0];
+        return 0;
+    case BLK_RESHAPE:
+        if (!in0.flat) INFER_FAIL("view needs a flat input (an fc output), but this output is the image %s", sa);
+        if (!p || p[0] < 1 || p[1] < 1 || p[2] < 1) return 1;
+        if ((double)p[0] * p[1] * p[2] != (double)in0.c)
+            INFER_FAIL("view: %d values cannot become %dx%dx%d (= %d)", in0.c, p[1], p[2], p[0], p[0] * p[1] * p[2]);
+        out->c = p[0];
+        out->h = p[1];
+        out->w = p[2];
+        out->flat = 0;
+        return 0;
+    case BLK_REPARAM:
+        if (!in0.flat || in0.c < 2 || in0.c % 2 != 0)
+            INFER_FAIL("vae needs a flat input of 2*Z values (mean and log-variance), but this output is %s", sa);
+        out->c = in0.c / 2;
+        return 0;
+    case BLK_GAP:
+        if (in0.flat) INFER_FAIL("gap needs an image, but this output is %s (flat)", sa);
+        out->h = out->w = 1;
+        out->flat = 1;
+        return 0;
+    default:
+        return 1;
+    }
+#undef INFER_FAIL
 }
 
 /* Returns 0 and fills *s if cfg is runnable, else -1 with a one-line reason in
@@ -212,7 +356,7 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
 
     double act_floats = (double)c->img_h * c->img_w * c->img_c;
     LayerShape cur = s->input;
-    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0, n_rep = 0, rep_id = -1;
+    int n_conv = 0, n_lin = 0, n_patch = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0, n_rep = 0, rep_id = -1;
     int uses[MAX_BLOCKS + 1] = {0};
     for (int i = 0; i < c->n_blocks; ++i) {
         const Block *b = &c->blocks[i];
@@ -262,8 +406,8 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
             break;
         case BLK_LINEAR: {
             n_lin++;
-            if (!cur.flat)
-                return train_cfg_fail(err, errsz, "fc%d: needs a flat input - put a Flatten or Global Avg Pool block before it", n_lin, 0);
+            if (!cur.flat && cur.w != 1)
+                return train_cfg_fail(err, errsz, "fc%d: needs a flat input (or a token sequence) - put a Flatten or Global Avg Pool block before it", n_lin, 0);
             if (b->a < 1 || b->a > MAX_FC_WIDTH)
                 return train_cfg_fail(err, errsz, "fc%d: out features must be 1-%d", n_lin, MAX_FC_WIDTH);
             if ((double)cur.c * b->a > MAX_FC_WEIGHTS) {
@@ -273,7 +417,24 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
                 return -1;
             }
             cur.c = b->a;
-            act_floats += (double)b->a;
+            act_floats += (double)b->a * (cur.flat ? 1 : cur.h * cur.w);
+            break;
+        }
+        case BLK_PATCH: {
+            n_patch++;
+            if (cur.flat) return train_cfg_fail(err, errsz, "patch%d: needs an image input", n_patch, 0);
+            if (b->a < 1 || b->a > MAX_PATCH) return train_cfg_fail(err, errsz, "patch%d: size must be 1-%d", n_patch, MAX_PATCH);
+            if (b->b < 1 || b->b > MAX_FC_WIDTH) return train_cfg_fail(err, errsz, "patch%d: width must be 1-%d", n_patch, MAX_FC_WIDTH);
+            if (cur.h % b->a != 0 || cur.w % b->a != 0)
+                return train_cfg_fail(err, errsz, "patch: the image side is not a multiple of the patch size %d", b->a, 0);
+            int tokens = (cur.h / b->a) * (cur.w / b->a);
+            if (tokens > MAX_TOKENS) return train_cfg_fail(err, errsz, "patch: %d tokens is more than the limit %d", tokens, MAX_TOKENS);
+            if ((double)cur.c * b->a * b->a * b->b > MAX_FC_WEIGHTS)
+                return train_cfg_fail(err, errsz, "patch%d: the projection is too large", n_patch, 0);
+            act_floats += (double)cur.c * cur.h * cur.w + (double)b->b * tokens; /* the patches and their projection */
+            cur.c = b->b;
+            cur.h = tokens;
+            cur.w = 1;
             break;
         }
         case BLK_ADD: {
@@ -377,6 +538,32 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
             cur.c /= 2;
             act_floats += (double)cur.c * 3;
             break;
+        case BLK_LAYERNORM:
+        case BLK_GELU:
+            act_floats += (double)cur.c * cur.h * cur.w;
+            break;
+        case BLK_TOKENS:
+            if (cur.flat) return train_cfg_fail(err, errsz, "tokens: needs an image input", 0, 0);
+            cur.h *= cur.w;
+            cur.w = 1;
+            if (cur.h > MAX_TOKENS) return train_cfg_fail(err, errsz, "tokens: %d tokens is more than the limit %d", cur.h, MAX_TOKENS);
+            act_floats += (double)cur.c * cur.h;
+            break;
+        case BLK_POS:
+            if (cur.flat) return train_cfg_fail(err, errsz, "pos: needs a token sequence or an image", 0, 0);
+            act_floats += (double)cur.c * cur.h * cur.w;
+            break;
+        case BLK_ATTENTION: {
+            if (cur.flat) return train_cfg_fail(err, errsz, "attention: needs a token sequence (use a tokens block first)", 0, 0);
+            if (b->a < 1 || b->a > MAX_HEADS) return train_cfg_fail(err, errsz, "attention: heads must be 1-%d", MAX_HEADS, 0);
+            if (cur.c % b->a != 0)
+                return train_cfg_fail(err, errsz, "attention: %d channels do not split into %d heads", cur.c, b->a);
+            int tokens = cur.h * cur.w;
+            if (tokens > MAX_TOKENS) return train_cfg_fail(err, errsz, "attention: %d tokens is more than the limit %d", tokens, MAX_TOKENS);
+            /* q,k,v (3 maps), the attention maps and their gradient, the context and the projected output */
+            act_floats += 5.0 * cur.c * tokens + 2.0 * b->a * tokens * tokens;
+            break;
+        }
         case BLK_GAP:
             if (cur.flat) return train_cfg_fail(err, errsz, "gap: needs an image input", 0, 0);
             cur.h = cur.w = 1;
@@ -386,7 +573,7 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
         default:
             return train_cfg_fail(err, errsz, "block %d has an unknown type", i + 1, 0);
         }
-        if (n_conv + n_lin > MAX_VIZ_LAYERS)
+        if (n_conv + n_lin + n_patch > MAX_VIZ_LAYERS)
             return train_cfg_fail(err, errsz, "at most %d conv + linear layers", MAX_VIZ_LAYERS, 0);
         s->out[i] = cur;
         s->n_ok = i + 1;
@@ -442,9 +629,10 @@ typedef struct MsgHeader {
 } MsgHeader;
 
 #define MSG_MODEL 1    /* ModelInfo - sent once at the start of every run */
-#define MSG_PROGRESS 2 /* Progress, then train_sample_bytes() of sample pixels, then (if has_weights) info.total_floats floats */
+#define MSG_PROGRESS 2 /* Progress, train_sample_bytes() of sample pixels, info.total_act_floats activations, info.total_attn_floats attention probabilities, then (if has_weights) info.total_floats weights */
 #define MSG_ERROR 3    /* char[]: a NUL-terminated human-readable reason */
 #define MSG_GENERATED 5 /* GenHeader, then the images listed there (img_c*img_h*img_w bytes each); sent after every epoch */
+#define MSG_GPU 6      /* GpuStats - the device's load, sent about twice a second while a run is going */
 #define MSG_PREDICTIONS 4 /* PredHeader, then n x (PredSample + train_sample_bytes() of pixels / masks); sent after every epoch */
 #define MSG_MAX_BYTES (16u * 1024u * 1024u)
 
@@ -509,15 +697,59 @@ typedef struct LayerViz {
     int out_dim;
     int pool; /* MATRIX: input rows averaged per displayed row */
     int offset;
+    int hidden; /* not shown as a tab: the projections around an attention block (its q,k,v and output convs) */
     char name[16];
 } LayerViz;
+
+/* One entry per fully-connected (Linear) block, in block order: what the viewer needs to draw the layer as neurons
+ * and to place the live activations that follow every Progress message (after the sample's pixels, before any
+ * weights): `dim` floats per layer, at `offset`, for the sample the dashboard is showing. */
+typedef struct ActLayer {
+    int dim;       /* neurons (output features) */
+    int in_dim;    /* inputs */
+    int prev;      /* index of the fc layer feeding this one directly (only relus in between), else -1 */
+    int viz_index; /* index into ModelInfo.layers of this layer's weight matrix */
+    int offset;    /* float offset of this layer's values in the activations payload */
+    int tid;       /* the tensor the values are read from: the layer's output, or the relu after it */
+    int relu;      /* 1 = the values are after a relu */
+    char src[12];  /* when prev < 0: what feeds the layer ("input", "flatten", "gap", "latent z", ...) */
+} ActLayer;
+
+/* One entry per attention block (up to MAX_ATTN_VIZ, as long as all maps stay under ATTN_MAX_FLOATS): the
+ * attention probabilities of the sample the dashboard shows, [head][query token][key token], sent with every
+ * Progress message after the activations. */
+#define MAX_ATTN_VIZ 8
+#define ATTN_MAX_FLOATS 262144
+typedef struct AttnViz {
+    int heads;
+    int tokens;
+    int gh, gw;  /* the grid the tokens were cut from (gh*gw == tokens), found by walking back to the tokens block */
+    int offset;  /* float offset of this layer's maps in the attention payload */
+    int tid;     /* tensor id the attention block reads: identifies it in the model graph */
+    int block;   /* index of the attention block, whose packed q,k,v the worker keeps for the maps */
+} AttnViz;
 
 typedef struct ModelInfo {
     TrainConfig cfg;
     int n_viz;
     LayerViz layers[MAX_VIZ_LAYERS];
     int total_floats;
+    int n_act;
+    ActLayer act[MAX_VIZ_LAYERS];
+    int total_act_floats;
+    int n_attn;
+    AttnViz attn[MAX_ATTN_VIZ];
+    int total_attn_floats;
 } ModelInfo;
+
+/* What the dashboard shows about the GPU (see gpu_stats.h for what each number means; -1 = unknown). */
+typedef struct GpuStats {
+    char name[64];
+    int sm_total;                   /* streaming multiprocessors on the device */
+    int util_gpu, util_mem;         /* % of the last sample period a kernel was running / memory was being accessed */
+    int mem_used_mb, mem_total_mb;  /* video memory, all processes */
+    int temp_c, power_w, sm_clock_mhz;
+} GpuStats;
 
 typedef struct Progress {
     int epoch;

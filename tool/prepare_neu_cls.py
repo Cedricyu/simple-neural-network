@@ -27,7 +27,7 @@ CLASSES = ["crazing", "inclusion", "patches", "pitted_surface", "rolled-in_scale
 # Measured with the GUI's default model (4 conv + fc 128 + fc 6) at 64x64: ~90% test accuracy after 80
 # epochs. The set is tiny (1440 images), so without standardization + momentum + flips the model
 # overfits or doesn't train at all; lr above ~3e-4 with momentum 0.9 goes unstable.
-DEFAULTS = "epochs 80\nbatch_size 64\nlr 0.0001\nmomentum 0.9\nnormalize 1\naugment 1\n"
+DEFAULTS = "epochs 80\nbatch_size 64\nlr 0.006\nmomentum 0.9\nnormalize 1\naugment 1\n"
 
 
 def fetch(url, dest):
