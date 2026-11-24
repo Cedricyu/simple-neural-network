@@ -98,13 +98,14 @@ can feed several nodes, so branches and skip connections work.
 | add | two inputs, summed | two tensors of the same shape |
 | cat | two inputs joined along the channels | two images of the same height and width |
 | flatten | (C,H,W) to C*H*W values | an image |
-| fc | out features 1-4096 | a flat input |
+| fc | out features 1-4096; on a token sequence it is applied to every token | a flat input, or a token sequence |
 | view | reshape a flat vector into a (channels, height, width) map | a flat input of exactly c*h*w values |
 | ln | layer norm: every position is normalized across its channels; learned scale and shift | anything |
 | gelu | | anything |
+| patch | cuts the image into non-overlapping patches (size 1-32) and projects each to `width` values: a token sequence (width, H/size * W/size, 1) | an image whose sides are multiples of the size |
 | tokens | (C,H,W) to a sequence of H*W tokens, shape (C,H*W,1) | an image |
 | pos | learned position embedding, one value per position and channel | an image / token sequence |
-| attn | multi-head self-attention; parameter = heads; takes packed q,k,v (3D channels), gives D | a token sequence, channels a multiple of 3*heads |
+| attn | multi-head self-attention with its own q,k,v and output projections (they are not convolutions and are not drawn); parameter = heads; D channels in and out | a token sequence, channels a multiple of heads |
 | vae | the VAE sampling step: 2*Z values (mean, log-variance) in, Z values out; parameter = KL weight | a flat input; at most one per model |
 
 The graph must end in one value per class (classification: an fc block), in a map with one channel per class at
@@ -129,6 +130,11 @@ of the input. Limits are 48 blocks and 16 conv + fc layers.
 - **Errors** — a block that breaks a rule gets a red border and a callout under it saying why (the status line
   repeats it). Two common mistakes have a one-click fix in the callout: an fc / `view` / `vae` block fed an image
   (`insert a flatten block`) and a last fc whose width is not the class count (`set out to N`).
+- **Units** — a residual unit (the blocks between a fork and the add that joins the two paths again, such as
+  `ln - attn - add` or `ln - fc - gelu - fc - add`) gets a labelled frame (`attn block`, `mlp block`, `res block`),
+  and `arrange` puts every expanded unit on a row of its own. Click `[-]` on a frame to collapse the unit into one
+  box (a click on the box, `[+]`, expands it again): its blocks are neither drawn nor clickable, but still part of the
+  model, and the wires attach to the box. The `resnet` and `vit` presets start collapsed.
 - **Read the graph** — wires are blue between neighbours in evaluation order and pink for skips and
   branches; hover a block to light up everything it reads and everything that reads it.
 
@@ -136,32 +142,57 @@ of the input. Limits are 48 blocks and 16 conv + fc layers.
 
 ### Transformer
 
-A token sequence is a `(D, T, 1)` image: D features per token, T tokens. That makes the per-token linear layers
-1x1 `conv`s and the residual connections `add`s, so a transformer is built from the same graph editor. The
+A token sequence is a `(D, T, 1)` tensor: D features per token, T tokens. `patch` turns an image into one,
+`fc` then works on every token, `add` is the residual connection, and `attn` is one block (module `Attention` in
+`module/transformer.cu`) that holds its own q,k,v and output projection weights; no convolution is involved. The
 `vit` preset (Classification) is a pre-norm vision transformer:
 
 ```
-conv 4x4 stride 4 (patches) - tokens - pos
- x2 [ ln - conv 1x1 (3D: packed q,k,v) - attn (4 heads) - conv 1x1 (D) - add(x)
-      ln - conv 1x1 (mlp) - gelu - conv 1x1 (D) - add ]
+patch 4x4 -> 32 - pos
+  [ ln - attn (4 heads) - add(x)
+    ln - fc 64 - gelu - fc 32 - add ]      one such block; stack more by hand
 ln - gap (mean over tokens) - fc
 ```
 
-Loading it also selects Adam 0.001. On Fashion-MNIST (D = 32, 49 tokens, 19.6k parameters) it reaches 85.6% test accuracy after 6 epochs (about 25 s each, no augmentation or dropout).
-`attn` has no weights of its own: the projections before and after it are the 1x1 convs, whose weights the weights
-viewer shows as in x out matrices like an fc layer's. Attention is quadratic in the number of tokens (limit 1024),
-the width limit of a conv is 256 channels, so D up to 85 with the packed projection. There is no dropout,
+Loading it also selects Adam 0.001. On Fashion-MNIST (D = 32, 49 tokens, 11.1k parameters) it reaches 86.0% test accuracy after 6 epochs (about 6.5 s each, no augmentation
+or dropout). The weights of `patch` and the mlp's `fc` layers show in the weights viewer as in x out matrices; the
+weights of `attn`'s projections are not shown, the attention tab shows what it does instead.
+
+The weights window shows an **attention** view when you click an `attn` box: for the dashboard's sample it shows the
+sample with its token grid, and for the token you pick (click a patch; the blue box) what that token attends to,
+as the average over heads on the big image and per head beside it, plus every head's full token x token matrix
+(rows: the token that looks, columns: the token looked at; a click on a row picks that token). Several `attn` blocks
+get a chip each. The maps are sent with every batch, so they change as the model trains; layers whose maps would
+exceed 262144 values (heads x tokens x tokens) are left out. Attention is quadratic in the number of tokens (limit 1024). There is no dropout,
 class token or causal masking; this is the vision (classification) transformer only.
 
 ### Training dashboard
 
-A **model graph** across the top (a box per layer with its output shape, relu / bn folded in as
-`+bn +relu`, residual shortcuts as pink arcs, hover to trace), the loss curve, the current sample
+A **model graph** across the top (a box per layer with its output shape; relu / bn / gelu / tokens / pos are folded
+into the box before them as `+bn +relu`, and a residual unit - the blocks between a fork and the add that joins it
+again - collapses into one `attn` / `mlp block` / `res block` box; click its `[+]` corner to draw the blocks inside (framed,
+with the residual skip as a pink arc; click the frame's `[-]` label to fold it again; an `attn` box has its own `[+]`
+that opens it into its three steps - `q,k,v` projection, `attention`, `output proj` - with their shapes), hover a collapsed box to list
+what is inside; other
+skips, such as a U-Net's, are pink arcs; hover a box to trace its wires). A click on a box with weights opens the
+weights window on that layer (the box of the layer the open window shows is outlined). Live weight thumbnails under
+the boxes exist but are switched off (`ARCH_SHOW_WEIGHTS` in `train_viewer.c`), the loss curve, the current sample
 (green border = predicted correctly), the running test accuracy, and the weights viewer. For segmentation
 the sample box shows the scan, the true mask and the predicted mask side by side, and the numbers are the
 batch's Dice and the test split's Dice / IoU. If the loss turns NaN, or a classifier's loss sits at
 ln(#classes) (the network predicts one answer for everything, usually dead ReLUs after a too-high learning
 rate), a red banner over the loss curve says so and suggests a fix.
+
+The **stop** button (next to restart and settings) ends the run after the current batch: the dashboard keeps the last
+curve and numbers, marked `stopped`, and `restart` starts again from scratch. Once the last batch has been reported
+the button reads `done`.
+
+A **GPU strip** under the loss curve shows the device (name, number of SMs), an estimate of how many SMs are busy
+and how many are free, the video memory in use, temperature and power, updated about twice a second. The worker reads
+them through NVML (`libnvidia-ml`, loaded at run time; without it only the SM count is shown). Be aware of what NVML
+reports: *GPU utilization* is the share of time during which at least one kernel was running, not a count of busy
+SMs, so "busy ~N of M" is that percentage times the SM count - an estimate (a small kernel that occupies a few SMs all
+the time reads as 100%). The memory figure is for the whole device, every process included.
 
 ![Training window with the ResNet dependency graph](docs/gui_resnet_run.png)
 
@@ -217,12 +248,14 @@ rate whatever the gradient's scale, which matters for losses that sum over pixel
 
 ### Weights viewer
 
-"View layer weights" opens a second window with one tab per conv / fc layer, drawn in 3D and updated
-live: conv filters as bars (height = weight, blue < 0 < red), fc matrices as a height-field surface.
+Clicking a box of the model graph on the training screen opens a second window on that layer's weights - there is
+no tab bar, the model graph is the navigation (click another box to look at another layer). It is drawn in 3D and
+updated live: conv filters as bars (height = weight, blue < 0 < red), fc matrices as a height-field surface.
 Drag to rotate, scroll to zoom, `0` resets.
 
 A fully-connected weight matrix has no spatial structure (its rows are arbitrary features), so a height field of it
-looks like noise. The last tab, **network**, shows the fc layers as neurons instead:
+looks like noise. The **network** view, reached with the `network >` button in the corner of an fc layer's weights
+(`< weights` goes back), shows the fc layers as neurons instead:
 
 - each layer is a column of neurons (a strip of thin cells when there are many), **brightness = that neuron's
   activation for the sample the dashboard is showing**, updated every batch; a classifier's last layer is labelled

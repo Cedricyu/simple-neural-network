@@ -40,16 +40,18 @@
 
 /* Hit-tested by pump_events() and drawn by the render functions from the same
  * constants so the two can never drift apart. */
-static const SDL_Rect WEIGHTS_BUTTON = {830, 370, 300, 70};
 static const SDL_Rect PRED_BUTTON = {830, 450, 300, 70};
 static const SDL_Rect BTN_PRED_BACK = {20, 20, 110, 36};
 static const SDL_Rect BTN_PRED_PREV = {1018, 20, 54, 36};
 static const SDL_Rect BTN_PRED_NEXT = {1076, 20, 54, 36};
 static const SDL_Rect BTN_VIEW_PRED = {648, 646, 200, 34}; /* settings screen: jump to the predictions page */
-static const SDL_Rect RESTART_BUTTON = {830, 644, 146, 36};
-static const SDL_Rect SETTINGS_BUTTON = {984, 644, 146, 36};
+static const SDL_Rect RESTART_BUTTON = {830, 644, 94, 36};
+static const SDL_Rect STOP_BUTTON = {932, 644, 94, 36};
+static const SDL_Rect SETTINGS_BUTTON = {1034, 644, 96, 36};
 
 static const SDL_Rect PANEL_TRAIN = {20, 20, 370, 660};
+static const SDL_Rect ARCH_BOX = {20, 20, 1110, 164}; /* the model graph on the training screen */
+#define ARCH_SHOW_WEIGHTS 0 /* 1 = a live weight thumbnail under every box of the model graph that has weights (off for now) */
 static const SDL_Rect PANEL_GRAPH = {410, 20, 720, 546};
 static const SDL_Rect GRAPH_VIEW = {411, 66, 718, 499}; /* the node canvas, below the palette row */
 static const SDL_Rect BTN_ARRANGE = {976, 28, 64, 30};
@@ -70,8 +72,8 @@ static SDL_Rect preset_rect(int i) {
 }
 /* Blocks offered per problem: the VAE's view / vae blocks make no sense for classification, and a generator
  * has no use for global average pooling. */
-static const int PALETTE_CLS[13] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP,
-                                    BLK_LAYERNORM, BLK_GELU, BLK_TOKENS, BLK_POS, BLK_ATTENTION};
+static const int PALETTE_CLS[14] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP,
+                                    BLK_LAYERNORM, BLK_GELU, BLK_PATCH, BLK_TOKENS, BLK_POS, BLK_ATTENTION};
 static const int PALETTE_SEG[7] = {BLK_CONV, BLK_RELU, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT};
 static const int PALETTE_GEN[11] = {BLK_CONV,    BLK_RELU,   BLK_FLATTEN,  BLK_LINEAR,   BLK_ADD,     BLK_BATCHNORM,
                                     BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT, BLK_RESHAPE, BLK_REPARAM};
@@ -190,6 +192,7 @@ typedef struct Gui {
     int cmd_fd; /* write end of the viewer->worker command FIFO */
     int screen;
     int run_active;  /* a Start was sent and not rejected since */
+    int stopped;     /* the Stop button was pressed for this run */
     int worker_gone; /* data FIFO hit EOF / protocol error */
     char worker_msg[256];
 
@@ -208,6 +211,10 @@ typedef struct Gui {
     int chain_len;
     int node_block[MAX_NODES]; /* node -> index into form_cfg.blocks, or -1 if not on the path */
     char node_name[MAX_NODES][12];
+    int node_unit[MAX_NODES]; /* the add node of the residual unit a node belongs to, or -1 */
+    int unit_collapsed[MAX_NODES]; /* per unit (keyed by its add node): drawn as one box, its blocks hidden */
+    int auto_collapse;             /* the next arrange collapses every unit (set by the presets) */
+    int unit_kind[MAX_NODES]; /* for an add node that closes a unit: 1 attention, 2 mlp, 3 other residual block; else 0 */
     int form_err_node;
     int form_err_shape; /* the failing block was rejected by train_cfg_derive (shapes / sizes), not merely left unwired */
     LayerShape nshape[MAX_NODES]; /* what each node outputs, worked out from its inputs and fields (valid where nshape_ok) */
@@ -241,9 +248,22 @@ typedef struct Gui {
      * of reusing anything from the main window. All NULL when closed. */
     SDL_Window *weights_win;
     SDL_Renderer *weights_ren;
-    int weights_tab; /* index into model.layers, or model.n_viz for the network (neuron) view; persists across close/reopen */
+    int weights_tab; /* index of the visible weight tab (hidden layers skipped), then the network (neuron) view and the attention view when the model has them; persists across close/reopen */
     float *acts;     /* the live activations of every fc layer for the dashboard's sample (ModelInfo.act offsets) */
     int acts_valid;
+    GpuStats gpu;      /* the latest MSG_GPU */
+    int gpu_valid;
+    Uint32 gpu_at;     /* SDL_GetTicks() when it arrived */
+    int arch_attn_open[MAX_BLOCKS]; /* training screen: attention blocks (by block index) drawn as their three inner steps */
+    int arch_expanded[MAX_BLOCKS]; /* training screen: units (keyed by their add block) shown with their blocks drawn */
+    char arch_tip[176]; /* the model graph's hover text, drawn last so no panel covers it */
+    SDL_Rect arch_tip_r;
+    int arch_tip_on;
+    float *attn;     /* attention probabilities of the shown sample, [layer][head][query][key] (see AttnViz) */
+    int attn_valid;
+    int attn_layer;  /* attention tab: which attention block */
+    int attn_query;  /* attention tab: the query token, or -1 for the middle of the grid */
+    int net_back_tab; /* the weight tab the network view's "< weights" button returns to */
     int net_mode;    /* network view edges: 0 = contribution to this sample (weight x activation), 1 = the weight itself */
     SDL_Texture *net_img_tex; /* the sample, drawn in the network view (weights window renderer) */
     int net_img_w, net_img_h;
@@ -269,7 +289,7 @@ static SDL_Rect view_rect(const Gui *g) {
     return r;
 }
 
-static int palette_count(const Gui *g) { return g->problem == PROBLEM_GENERATE ? 11 : (g->problem == PROBLEM_SEGMENT ? 7 : 13); }
+static int palette_count(const Gui *g) { return g->problem == PROBLEM_GENERATE ? 11 : (g->problem == PROBLEM_SEGMENT ? 7 : 14); }
 static int palette_type(const Gui *g, int i) {
     return g->problem == PROBLEM_GENERATE ? PALETTE_GEN[i] : (g->problem == PROBLEM_SEGMENT ? PALETTE_SEG[i] : PALETTE_CLS[i]);
 }
@@ -702,6 +722,7 @@ static int node_height(int type) {
     case BLK_RESHAPE: return 84;
     case BLK_REPARAM: return 72;
     case BLK_ATTENTION: return 72;
+    case BLK_PATCH: return 84;
     default: return 46;
     }
 }
@@ -715,6 +736,7 @@ static int node_nparams(int type) {
     case BLK_RESHAPE: return 3;
     case BLK_REPARAM: return 1;
     case BLK_ATTENTION: return 1;
+    case BLK_PATCH: return 2;
     default: return 0;
     }
 }
@@ -741,6 +763,7 @@ static const char *node_type_title(int type) {
     case BLK_TOKENS: return "tokens";
     case BLK_POS: return "pos";
     case BLK_ATTENTION: return "attn";
+    case BLK_PATCH: return "patch";
     default: return "fc";
     }
 }
@@ -764,6 +787,7 @@ static SDL_Color node_accent(int type) {
     case BLK_TOKENS: return (SDL_Color){120, 150, 235, 255};
     case BLK_POS: return (SDL_Color){206, 170, 120, 255};
     case BLK_ATTENTION: return (SDL_Color){244, 118, 118, 255};
+    case BLK_PATCH: return (SDL_Color){110, 160, 245, 255};
     default: return (SDL_Color){150, 156, 168, 255};
     }
 }
@@ -774,16 +798,34 @@ static SDL_Rect node_rect(const Gui *g, int i) {
     return r;
 }
 
+/* A residual unit can be collapsed into one box; its blocks are then neither drawn nor clickable. */
+static int node_hidden(const Gui *g, int i) {
+    int u = g->node_unit[i];
+    return u >= 0 && g->unit_kind[u] && g->unit_collapsed[u];
+}
+/* The box a collapsed unit is drawn as: at the top-left of its blocks, one node wide. */
+static SDL_Rect unit_box(const Gui *g, int add_node) {
+    int x0 = INT_MAX, y0 = INT_MAX;
+    for (int j = 0; j < MAX_NODES; ++j) {
+        if (!g->nodes[j].used || g->node_unit[j] != add_node) continue;
+        SDL_Rect r = node_rect(g, j);
+        if (r.x < x0) x0 = r.x;
+        if (r.y < y0) y0 = r.y;
+    }
+    SDL_Rect b = {x0 == INT_MAX ? 0 : x0, y0 == INT_MAX ? 0 : y0, NODE_W, 64};
+    return b;
+}
+
 static SDL_Point node_out_port(const Gui *g, int i) {
-    SDL_Rect r = node_rect(g, i);
+    SDL_Rect r = node_hidden(g, i) ? unit_box(g, g->node_unit[i]) : node_rect(g, i);
     SDL_Point p = {r.x + r.w, r.y + 11};
     return p;
 }
 
-/* Input port k of node i: an add node has two, stacked. */
+/* Input port k of node i: an add node has two, stacked (a collapsed unit has one, on its box). */
 static SDL_Point node_in_port(const Gui *g, int i, int k) {
-    SDL_Rect r = node_rect(g, i);
-    SDL_Point p = {r.x, r.y + 11 + k * 22};
+    SDL_Rect r = node_hidden(g, i) ? unit_box(g, g->node_unit[i]) : node_rect(g, i);
+    SDL_Point p = {r.x, r.y + 11 + (node_hidden(g, i) ? 0 : k * 22)};
     return p;
 }
 
@@ -852,6 +894,10 @@ static void node_set_defaults(Gui *g, int i) {
         field_set(g, F_NODE(i, 2), "7", FK_INT);
     } else if (t == BLK_REPARAM) field_set(g, F_NODE(i, 0), "1", FK_FLOAT);
     else if (t == BLK_ATTENTION) field_set(g, F_NODE(i, 0), "4", FK_INT);
+    else if (t == BLK_PATCH) {
+        field_set(g, F_NODE(i, 0), "4", FK_INT);
+        field_set(g, F_NODE(i, 1), "32", FK_INT);
+    }
 }
 
 static int graph_add(Gui *g, int type, int x, int y) {
@@ -985,11 +1031,84 @@ static void graph_fit(Gui *g) {
 }
 
 /* Places the nodes in order left to right, wrapping into rows `wrap` pixels wide. */
+/* Residual units: for every add, walk back along each input through blocks nobody else reads; when both walks end
+ * at the same tensor (a zero-length walk is an identity shortcut), everything walked plus the add is one unit.
+ * unit_of[b] = the add block that block b belongs to (-1 for none), unit_n[add] = the unit's block count (0 if the
+ * add closes no unit), unit_fork[add] = the tensor the two paths start from. `uses[id]` = readers of tensor id. */
+static void arch_find_units(const TrainConfig *c, int nb, const int *uses, int *unit_of, int *unit_n, int *unit_fork) {
+    for (int i = 0; i < MAX_BLOCKS; ++i) {
+        unit_of[i] = -1;
+        unit_n[i] = unit_fork[i] = 0;
+    }
+    for (int i = 0; i < nb; ++i) {
+        const Block *k = &c->blocks[i];
+        if (k->type != BLK_ADD) continue;
+        int members[2][MAX_BLOCKS], cnt[2] = {0, 0}, ends[2];
+        for (int side = 0; side < 2; ++side) {
+            int id = k->in[side];
+            while (id > 0 && uses[id] == 1 && c->blocks[id - 1].type != BLK_ADD && c->blocks[id - 1].type != BLK_CONCAT &&
+                   c->blocks[id - 1].type != BLK_REPARAM && unit_of[id - 1] < 0 && cnt[side] < 16) {
+                members[side][cnt[side]++] = id - 1;
+                id = c->blocks[id - 1].in[0];
+            }
+            ends[side] = id;
+        }
+        if (ends[0] != ends[1] || cnt[0] + cnt[1] < 2) continue;
+        for (int side = 0; side < 2; ++side)
+            for (int m = 0; m < cnt[side]; ++m) unit_of[members[side][m]] = i;
+        unit_n[i] = cnt[0] + cnt[1] + 1;
+        unit_fork[i] = ends[0];
+    }
+}
+
+static int graph_compile(Gui *g);
+
+/* Which nodes form residual units in the graph as it is wired now (it must compile): node_unit / unit_kind. */
+static void graph_units(Gui *g) {
+    for (int i = 0; i < MAX_NODES; ++i) g->node_unit[i] = -1, g->unit_kind[i] = 0;
+    const TrainConfig *c = &g->form_cfg;
+    int nb = g->chain_len, uses[MAX_BLOCKS + 1] = {0}, unit_of[MAX_BLOCKS], unit_n[MAX_BLOCKS], unit_fork[MAX_BLOCKS];
+    if (nb <= 0 || c->n_blocks != nb) return;
+    for (int i = 0; i < nb; ++i) {
+        uses[c->blocks[i].in[0]]++;
+        if (c->blocks[i].type == BLK_ADD || c->blocks[i].type == BLK_CONCAT) uses[c->blocks[i].in[1]]++;
+    }
+    arch_find_units(c, nb, uses, unit_of, unit_n, unit_fork);
+    for (int i = 0; i < nb; ++i) {
+        if (unit_n[i] <= 0) continue;
+        int add_node = g->chain[i], attn = 0, gelu = 0;
+        g->node_unit[add_node] = add_node;
+        for (int j = 0; j < nb; ++j) {
+            if (unit_of[j] != i) continue;
+            g->node_unit[g->chain[j]] = add_node;
+            attn |= c->blocks[j].type == BLK_ATTENTION;
+            gelu |= c->blocks[j].type == BLK_GELU;
+        }
+        g->unit_kind[add_node] = attn ? 1 : (gelu ? 2 : 3);
+    }
+}
+
 static void graph_layout_rows(Gui *g, const int *order, int n, int wrap) {
-    int x = 14, y = 14, row_h = 0;
+    int x = 14, y = 14, row_h = 0, prev_unit = -1, prev_open = 0;
+    int placed_first[MAX_NODES] = {0}, first_x[MAX_NODES] = {0}, first_y[MAX_NODES] = {0};
     for (int k = 0; k < n; ++k) {
         Node *nd = &g->nodes[order[k]];
-        int h = node_height(nd->type);
+        int unit = g->node_unit[order[k]];
+        int in_unit = unit >= 0 && g->unit_kind[unit], collapsed = in_unit && g->unit_collapsed[unit];
+        if (collapsed && placed_first[unit]) { /* the rest of a collapsed unit sits under its box */
+            nd->x = first_x[unit];
+            nd->y = first_y[unit];
+            continue;
+        }
+        int open = in_unit && !collapsed;
+        int h = collapsed ? 64 : node_height(nd->type);
+        if (k > 0 && unit != prev_unit && x != 14 && (open || prev_open)) { /* an expanded unit gets a row of its own, room for its frame */
+            x = 14;
+            y += row_h + 48;
+            row_h = 0;
+        }
+        prev_unit = unit;
+        prev_open = open;
         if (x + NODE_W > wrap - 8) {
             x = 14;
             y += row_h + 34;
@@ -997,6 +1116,11 @@ static void graph_layout_rows(Gui *g, const int *order, int n, int wrap) {
         }
         nd->x = x;
         nd->y = y;
+        if (collapsed) {
+            placed_first[unit] = 1;
+            first_x[unit] = x;
+            first_y[unit] = y;
+        }
         x += NODE_W + NODE_GAP;
         if (h > row_h) row_h = h;
     }
@@ -1005,6 +1129,15 @@ static void graph_layout_rows(Gui *g, const int *order, int n, int wrap) {
 /* Lays the nodes out left to right in evaluation order, wrapping into rows; anything not connected
  * to the output goes last. */
 static void graph_arrange(Gui *g) {
+    if (graph_compile(g) == 0) {
+        graph_units(g);
+        if (g->auto_collapse)
+            for (int i = 0; i < MAX_NODES; ++i)
+                if (g->unit_kind[i]) g->unit_collapsed[i] = 1;
+    } else { /* not wired through yet: there are no units to keep together */
+        for (int i = 0; i < MAX_NODES; ++i) g->node_unit[i] = -1, g->unit_kind[i] = 0;
+    }
+    g->auto_collapse = 0;
     int order[MAX_NODES], n = 0, state[MAX_NODES] = {0}, en = -1, ep = 0;
     int out = graph_find(g, NODE_OUTPUT);
     if (out >= 0) {
@@ -1056,6 +1189,7 @@ static void graph_fit_classes(Gui *g, int n_classes) {
 
 static void graph_clear(Gui *g) {
     memset(g->nodes, 0, sizeof(g->nodes));
+    memset(g->unit_collapsed, 0, sizeof(g->unit_collapsed));
     g->focus = -1;
     g->drag = DRAG_NONE;
 }
@@ -1133,6 +1267,7 @@ static void graph_preset_resnet(Gui *g) {
     x = resnet_block(g, x, 32, 2, 1);
     x = gadd(g, BLK_GAP, 0, 0, 0, 0, x, -1);
     x = gadd(g, BLK_LINEAR, 10, 0, 0, 0, x, -1);
+    g->auto_collapse = 1; /* the units start collapsed: one box each, expand to edit what is inside */
     graph_finish(g, x);
 }
 
@@ -1193,41 +1328,39 @@ static void graph_preset_mlp(Gui *g) {
     graph_finish(g, x);
 }
 
-/* A small vision transformer: a strided conv cuts the image into patches (4x4, then 2x2 merges while there are more
- * than 100 of them), tokens turns the patch grid into a sequence, a learned position embedding is added, and two
- * pre-norm blocks follow - layernorm, packed q,k,v projection, 4-head attention, output projection, residual add;
- * layernorm, an expanding 1x1 conv, gelu, a 1x1 conv back, residual add - then layernorm, global average
- * pooling over the tokens and the classifier. The 1x1 convs are the per-token linear layers. */
+/* A small vision transformer: a patch block cuts the image into patches (the smallest size from 4 that divides it and
+ * leaves at most 100 tokens) and projects each to 32 values, a learned position embedding is added, and one pre-norm
+ * block follows (depth = 1; raise it here) - layernorm, 4-head self-attention, residual add; layernorm, an fc that
+ * widens every token, gelu, an fc back, residual add - then layernorm, global average pooling over the tokens and the
+ * classifier. No convolution anywhere: fc applies to every token of a sequence. */
 static void graph_preset_vit(Gui *g) {
     graph_clear(g);
     const DatasetInfo *d = form_dataset(g);
-    int h = d ? d->rows : 28, w = d ? d->cols : 28, dim = 32, heads = 4, depth = 2, mlp = 64;
+    int h = d ? d->rows : 28, w = d ? d->cols : 28, dim = 32, heads = 4, depth = 1, mlp = 64;
+    /* the smallest patch (from 4) that divides the image and leaves at most 100 tokens; failing that, one that divides it */
+    int patch = 0;
+    for (int p = 4; p <= MAX_PATCH && !patch; ++p)
+        if (h % p == 0 && w % p == 0 && (h / p) * (w / p) <= 100) patch = p;
+    for (int p = 4; p <= MAX_PATCH && !patch; ++p)
+        if (h % p == 0 && w % p == 0) patch = p;
+    if (!patch) patch = 4;
     int x = graph_add(g, NODE_INPUT, 0, 0);
-    x = gadd(g, BLK_CONV, dim, 4, 4, 0, x, -1);
-    h /= 4;
-    w /= 4;
-    while (h * w > 100 && h >= 2 && w >= 2) {
-        x = gadd(g, BLK_CONV, dim, 2, 2, 0, x, -1);
-        h /= 2;
-        w /= 2;
-    }
-    x = gadd(g, BLK_TOKENS, 0, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_PATCH, patch, dim, 0, 0, x, -1);
     x = gadd(g, BLK_POS, 0, 0, 0, 0, x, -1);
     for (int k = 0; k < depth; ++k) {
         int a = gadd(g, BLK_LAYERNORM, 0, 0, 0, 0, x, -1);
-        a = gadd(g, BLK_CONV, 3 * dim, 1, 1, 0, a, -1);
         a = gadd(g, BLK_ATTENTION, heads, 0, 0, 0, a, -1);
-        a = gadd(g, BLK_CONV, dim, 1, 1, 0, a, -1);
         x = gadd(g, BLK_ADD, 0, 0, 0, 0, x, a);
         int m = gadd(g, BLK_LAYERNORM, 0, 0, 0, 0, x, -1);
-        m = gadd(g, BLK_CONV, mlp, 1, 1, 0, m, -1);
+        m = gadd(g, BLK_LINEAR, mlp, 0, 0, 0, m, -1);
         m = gadd(g, BLK_GELU, 0, 0, 0, 0, m, -1);
-        m = gadd(g, BLK_CONV, dim, 1, 1, 0, m, -1);
+        m = gadd(g, BLK_LINEAR, dim, 0, 0, 0, m, -1);
         x = gadd(g, BLK_ADD, 0, 0, 0, 0, x, m);
     }
     x = gadd(g, BLK_LAYERNORM, 0, 0, 0, 0, x, -1);
     x = gadd(g, BLK_GAP, 0, 0, 0, 0, x, -1);
     x = gadd(g, BLK_LINEAR, 10, 0, 0, 0, x, -1);
+    g->auto_collapse = 1; /* the units start collapsed: one box each, expand to edit what is inside */
     graph_finish(g, x);
 }
 
@@ -1361,7 +1494,7 @@ static void form_layout(Gui *g) {
         g->fields[i].visible = 1;
     }
     for (int i = 0; i < MAX_NODES; ++i) {
-        if (!g->nodes[i].used) continue;
+        if (!g->nodes[i].used || node_hidden(g, i)) continue;
         SDL_Rect r = node_rect(g, i);
         if (g->nodes[i].type == BLK_CONV) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 30, r.y + 28, 36, 20};
@@ -1378,6 +1511,9 @@ static void form_layout(Gui *g) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 56, r.y + 28, 48, 20};
         } else if (g->nodes[i].type == BLK_UPSAMPLE || g->nodes[i].type == BLK_ATTENTION) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 60, r.y + 28, 34, 20};
+        } else if (g->nodes[i].type == BLK_PATCH) {
+            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 34, r.y + 28, 30, 20};
+            g->fields[F_NODE(i, 1)].rect = (SDL_Rect){r.x + 34, r.y + 50, 48, 20};
         } else if (g->nodes[i].type == BLK_MAXPOOL) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 22, r.y + 28, 28, 20};
             g->fields[F_NODE(i, 1)].rect = (SDL_Rect){r.x + 72, r.y + 28, 28, 20};
@@ -1557,7 +1693,7 @@ static int graph_compile(Gui *g) {
     static const char *conv_cols[4] = {"out channels", "kernel", "stride", "padding"};
     static const char *pool_cols[2] = {"window", "stride"};
     int id_of_node[MAX_NODES];
-    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0, n_ln = 0, n_attn = 0;
+    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0, n_ln = 0, n_attn = 0, n_patch = 0;
     for (int k = 0; k < n_order; ++k) {
         int node = order[k], type = g->nodes[node].type;
         if (type == NODE_INPUT) {
@@ -1586,6 +1722,7 @@ static int graph_compile(Gui *g) {
         else if (type == BLK_CONCAT) snprintf(nm, nsz, "cat%d", ++n_cat);
         else if (type == BLK_LAYERNORM) snprintf(nm, nsz, "ln%d", ++n_ln);
         else if (type == BLK_ATTENTION) snprintf(nm, nsz, "attn%d", ++n_attn);
+        else if (type == BLK_PATCH) snprintf(nm, nsz, "patch%d", ++n_patch);
         if (type == BLK_REPARAM) {
             char *end;
             const char *t = g->fields[F_NODE(node, 0)].text;
@@ -1601,7 +1738,7 @@ static int graph_compile(Gui *g) {
         for (int j = 0; j < node_nparams(type) && type != BLK_REPARAM; ++j) {
             if (parse_int(&g->fields[F_NODE(node, j)], dst[j])) {
                 char what[48];
-                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : (type == BLK_UPSAMPLE ? "factor" : (type == BLK_ATTENTION ? "heads" : type == BLK_RESHAPE ? (j == 0 ? "channels" : (j == 1 ? "height" : "width")) : "out features")));
+                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : (type == BLK_UPSAMPLE ? "factor" : (type == BLK_ATTENTION ? "heads" : type == BLK_PATCH ? (j == 0 ? "patch size" : "width") : type == BLK_RESHAPE ? (j == 0 ? "channels" : (j == 1 ? "height" : "width")) : "out features")));
                 snprintf(what, sizeof(what), "%s %s", nm, col);
                 g->form_err_node = node;
                 return form_fail(g, F_NODE(node, j), what);
@@ -1629,6 +1766,7 @@ static void form_update(Gui *g) {
     g->form_err_field = -1;
     g->form_err_node = -1;
     g->form_err_shape = 0;
+    for (int i = 0; i < MAX_NODES; ++i) g->node_unit[i] = -1, g->unit_kind[i] = 0;
     g->chain_len = 0;
     for (int i = 0; i < MAX_NODES; ++i) g->node_block[i] = -1;
     shapes_update(g);
@@ -1688,6 +1826,7 @@ static void form_update(Gui *g) {
     if (parse_int(&g->fields[F_VIZ], &c->viz_every)) { form_fail(g, F_VIZ, "weights every N"); return; }
 
     if (graph_compile(g) != 0) return;
+    graph_units(g);
     if (train_cfg_derive(c, &g->form_shapes, g->form_err, sizeof(g->form_err)) == 0) {
         g->form_valid = 1;
     } else if (g->form_shapes.err_block >= 0 && g->form_shapes.err_block < g->chain_len) {
@@ -1703,8 +1842,10 @@ static long count_parameters(const TrainConfig *c, const NetShapes *s) {
         LayerShape in = train_block_input(s, b);
         if (b->type == BLK_CONV) total += (long)b->a * in.c * b->b * b->b + b->a;
         else if (b->type == BLK_LINEAR) total += (long)in.c * b->a + b->a;
+        else if (b->type == BLK_PATCH) total += (long)in.c * b->a * b->a * b->b + b->b;
         else if (b->type == BLK_BATCHNORM || b->type == BLK_LAYERNORM) total += 2L * in.c; /* scale + shift */
         else if (b->type == BLK_POS) total += (long)in.c * in.h * in.w;
+        else if (b->type == BLK_ATTENTION) total += 4L * in.c * in.c + 4L * in.c; /* q,k,v (D x 3D) and output (D x D) projections, with biases */
     }
     return total;
 }
@@ -1963,6 +2104,9 @@ static void draw_node(Gui *g, int i, SDL_Point mouse) {
         txt(g, g->font_small, "factor", r.x + 8, r.y + 31, dim);
     } else if (n->type == BLK_ATTENTION) {
         txt(g, g->font_small, "heads", r.x + 8, r.y + 31, dim);
+    } else if (n->type == BLK_PATCH) {
+        txt(g, g->font_small, "size", r.x + 6, r.y + 31, dim);
+        txt(g, g->font_small, "width", r.x + 6, r.y + 53, dim);
     } else if (n->type == BLK_RESHAPE) {
         txt(g, g->font_small, "channels  h   w", r.x + 8, r.y + 27, dim);
     } else if (n->type == BLK_REPARAM) {
@@ -1993,18 +2137,31 @@ static void draw_node(Gui *g, int i, SDL_Point mouse) {
 #define ARCH_ROWS 3
 #define ARCH_MAX_GROUPS (MAX_BLOCKS + 1)
 
-/* One box of the graph: a block, with the relu / batch-norm blocks that directly follow it (and
- * nothing else reads its output) folded in so a deep net still fits the bar. */
+/* One box of the graph: a block, with the relu / batch-norm / gelu / tokens / pos blocks that directly follow it
+ * (and nothing else reads its output) folded in, or a whole residual unit - the blocks between a tensor that forks
+ * and the add that joins the two paths again - collapsed into one box ("attn block", "mlp block", "res block"),
+ * so a deep net still fits the bar. */
 typedef struct ArchGroup {
     char name[16];
     char l2[28];     /* output shape */
     char l2c[16];    /* the same, short ("16@64"), for boxes too narrow for l2 */
     char params[20]; /* kernel / stride, shown when nothing was folded in */
     char fold[20];   /* e.g. "+bn +relu" */
+    char detail[176]; /* a collapsed residual unit: the blocks inside it, shown when the box is hovered */
     int type;        /* BLK_* or NODE_INPUT: picks the accent colour */
     int level, row;  /* layer = longest path from the input; row separates parallel branches */
     int src[2], nsrc;
+    int layers[4], n_layers; /* the weighted layers (indices into ModelInfo.layers) this box stands for */
+    int has_attn, attn_tid;  /* the attention this box shows: the tensor id its attention block reads */
+    int unit_add;            /* the add block of the residual unit this box belongs to (or stands for), else -1 */
+    int unit_kind;           /* that unit's kind: 1 attention, 2 mlp, 3 other residual block */
+    int collapsed;           /* this box is a whole unit drawn as one (it can be expanded) */
+    int attn_b1;             /* attention block index + 1 for an attention box (or one of its inner steps), else 0 */
+    int attn_sub;            /* 1 q,k,v projection, 2 attention, 3 output projection of an opened attention block */
 } ArchGroup;
+
+static void draw_arch_thumb(Gui *g, SDL_Rect r, const ArchGroup *q);
+static int arch_group_tab(const Gui *g, const ArchGroup *q);
 
 static void shape_str_compact(LayerShape l, char *buf, size_t n) {
     if (l.flat) snprintf(buf, n, "%d", l.c);
@@ -2021,16 +2178,47 @@ static void arch_append(char *dst, size_t n, const char *add) {
     if (len + strlen(add) + 2 < n) snprintf(dst + len, n - len, "%s%s", len ? " " : "", add);
 }
 
-static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
+static int build_arch(const TrainConfig *c, const NetShapes *s, const int *expanded, const int *attn_open, ArchGroup *gr) {
     int n = 0, uses[MAX_BLOCKS + 1] = {0}, gid_of_id[MAX_BLOCKS + 1] = {0}, out_id[ARCH_MAX_GROUPS] = {0};
-    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0;
+    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0, n_wl = 0;
     int nb = c->n_blocks < s->n_ok ? c->n_blocks : s->n_ok;
     for (int i = 0; i < nb; ++i) {
         uses[c->blocks[i].in[0]]++;
         if (c->blocks[i].type == BLK_ADD || c->blocks[i].type == BLK_CONCAT) uses[c->blocks[i].in[1]]++;
     }
 
+    /* residual units: for every add, walk back along each input through blocks nobody else reads; when both
+     * walks end at the same tensor (a zero-length walk is an identity shortcut), everything walked plus the add is
+     * one unit. unit_of[b] = the add that block b belongs to, or -1. */
+    int unit_of[MAX_BLOCKS], unit_n[MAX_BLOCKS] = {0}, unit_fork[MAX_BLOCKS] = {0};
+    int unit_lay[MAX_BLOCKS][4], unit_nlay[MAX_BLOCKS] = {0}, unit_attn[MAX_BLOCKS], unit_heads[MAX_BLOCKS] = {0};
+    char unit_detail[MAX_BLOCKS][160];
+    for (int i = 0; i < MAX_BLOCKS; ++i) {
+        unit_of[i] = -1;
+        unit_attn[i] = -1;
+        unit_detail[i][0] = '\0';
+    }
+    arch_find_units(c, nb, uses, unit_of, unit_n, unit_fork);
+    /* an expanded unit is not collapsed: its blocks become boxes of their own, remembered as members of the unit */
+    int unit_member[MAX_BLOCKS], member_kind[MAX_BLOCKS] = {0};
+    for (int i = 0; i < MAX_BLOCKS; ++i) unit_member[i] = -1;
+    for (int i = 0; i < nb; ++i) {
+        if (unit_n[i] <= 0 || !expanded || !expanded[i]) continue;
+        int attn = 0, gelu = 0;
+        for (int j = 0; j < nb; ++j)
+            if (unit_of[j] == i) {
+                attn |= c->blocks[j].type == BLK_ATTENTION;
+                gelu |= c->blocks[j].type == BLK_GELU;
+                unit_member[j] = i;
+                unit_of[j] = -1;
+            }
+        unit_member[i] = i;
+        member_kind[i] = attn ? 1 : (gelu ? 2 : 3);
+        unit_n[i] = 0;
+    }
+
     memset(&gr[0], 0, sizeof(gr[0]));
+    gr[0].unit_add = -1;
     snprintf(gr[0].name, sizeof(gr[0].name), "input");
     shape_str(s->input, gr[0].l2, sizeof(gr[0].l2));
     shape_str_compact(s->input, gr[0].l2c, sizeof(gr[0].l2c));
@@ -2040,16 +2228,74 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
     for (int i = 0; i < nb; ++i) {
         const Block *k = &c->blocks[i];
         int in0 = k->in[0];
-        if ((k->type == BLK_RELU || k->type == BLK_BATCHNORM || k->type == BLK_GELU) && in0 > 0 && uses[in0] == 1 &&
-            out_id[gid_of_id[in0]] == in0) {
+        if (unit_of[i] >= 0) { /* inside a collapsed unit: keep the layer numbering, remember what it was */
+            char nm[24];
+            int u = unit_of[i];
+            if ((k->type == BLK_CONV || k->type == BLK_LINEAR || k->type == BLK_PATCH) && unit_nlay[u] < 4) unit_lay[u][unit_nlay[u]++] = n_wl;
+            if (k->type == BLK_CONV || k->type == BLK_LINEAR || k->type == BLK_PATCH) n_wl++;
+            if (k->type == BLK_ATTENTION) {
+                unit_attn[u] = k->in[0];
+                unit_heads[u] = k->a;
+            }
+            switch (k->type) {
+            case BLK_CONV: snprintf(nm, sizeof(nm), "conv%d(%d)", ++n_conv, k->a); break;
+            case BLK_LINEAR: snprintf(nm, sizeof(nm), "fc%d(%d)", ++n_lin, k->a); break;
+            case BLK_BATCHNORM: snprintf(nm, sizeof(nm), "bn%d", ++n_bn); break;
+            case BLK_MAXPOOL: snprintf(nm, sizeof(nm), "pool%d", ++n_pool); break;
+            case BLK_UPSAMPLE: snprintf(nm, sizeof(nm), "up%d", ++n_up); break;
+            case BLK_ATTENTION: snprintf(nm, sizeof(nm), "attn(%dh)", k->a); break;
+            default: snprintf(nm, sizeof(nm), "%s", node_type_title(k->type)); break;
+            }
+            char *d = unit_detail[unit_of[i]];
+            size_t len = strlen(d);
+            snprintf(d + len, sizeof(unit_detail[0]) - len, "%s%s", len ? " > " : "", nm);
+            continue;
+        }
+        int foldable = k->type == BLK_RELU || k->type == BLK_BATCHNORM || k->type == BLK_GELU || k->type == BLK_TOKENS || k->type == BLK_POS;
+        if (foldable && in0 > 0 && uses[in0] == 1 && out_id[gid_of_id[in0]] == in0) {
             int gi = gid_of_id[in0];
-            arch_append(gr[gi].fold, sizeof(gr[gi].fold), k->type == BLK_RELU ? "+relu" : (k->type == BLK_GELU ? "+gelu" : "+bn"));
+            arch_append(gr[gi].fold, sizeof(gr[gi].fold),
+                        k->type == BLK_RELU ? "+relu" : (k->type == BLK_GELU ? "+gelu" : (k->type == BLK_TOKENS ? "+tokens" : (k->type == BLK_POS ? "+pos" : "+bn"))));
+            shape_str(s->out[i], gr[gi].l2, sizeof(gr[gi].l2));
+            shape_str_compact(s->out[i], gr[gi].l2c, sizeof(gr[gi].l2c));
             out_id[gi] = i + 1;
             gid_of_id[i + 1] = gi;
             continue;
         }
+        if (k->type == BLK_ATTENTION && attn_open && attn_open[i]) { /* its inner steps, one box each */
+            LayerShape in0 = train_block_input(s, k), mid = in0;
+            mid.c = 3 * in0.c;
+            static const char *names[3] = {"q,k,v", "attention", "output proj"};
+            int prev = gid_of_id[k->in[0]];
+            for (int part = 0; part < 3; ++part) {
+                ArchGroup *q = &gr[n];
+                memset(q, 0, sizeof(*q));
+                q->unit_add = unit_member[i];
+                q->unit_kind = unit_member[i] >= 0 ? member_kind[unit_member[i]] : 0;
+                q->type = part == 1 ? BLK_ATTENTION : BLK_LINEAR;
+                q->src[0] = prev;
+                q->nsrc = 1;
+                q->has_attn = 1;
+                q->attn_tid = k->in[0];
+                q->attn_b1 = i + 1;
+                q->attn_sub = part + 1;
+                snprintf(q->name, sizeof(q->name), "%s", names[part]);
+                shape_str(part == 0 ? mid : in0, q->l2, sizeof(q->l2));
+                shape_str_compact(part == 0 ? mid : in0, q->l2c, sizeof(q->l2c));
+                if (part == 0) snprintf(q->params, sizeof(q->params), "%d -> %d", in0.c, mid.c);
+                else if (part == 1) snprintf(q->params, sizeof(q->params), "%d heads %dx%d", k->a, in0.h * in0.w, in0.h * in0.w);
+                else snprintf(q->params, sizeof(q->params), "%d -> %d", in0.c, in0.c);
+                prev = n;
+                n++;
+            }
+            out_id[n - 1] = i + 1;
+            gid_of_id[i + 1] = n - 1;
+            continue;
+        }
         ArchGroup *q = &gr[n];
         memset(q, 0, sizeof(*q));
+        q->unit_add = unit_member[i];
+        q->unit_kind = unit_member[i] >= 0 ? member_kind[unit_member[i]] : 0;
         q->type = k->type;
         q->src[0] = gid_of_id[in0];
         q->nsrc = 1;
@@ -2057,14 +2303,58 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
             q->src[1] = gid_of_id[k->in[1]];
             q->nsrc = 2;
         }
+        if (k->type == BLK_ADD && unit_n[i] > 0) { /* a collapsed residual unit: one box fed by the fork */
+            int has_attn = 0, has_gelu = 0, has_conv = 0;
+            for (int j = 0; j < nb; ++j)
+                if (unit_of[j] == i) {
+                    has_attn |= c->blocks[j].type == BLK_ATTENTION;
+                    has_gelu |= c->blocks[j].type == BLK_GELU;
+                    has_conv |= c->blocks[j].type == BLK_CONV;
+                }
+            q->src[0] = gid_of_id[unit_fork[i]];
+            q->nsrc = 1;
+            if (has_attn) { /* its projections stay out of the picture; the box shows the attention instead */
+                q->has_attn = 1;
+                q->attn_tid = unit_attn[i];
+            } else {
+                for (int m = 0; m < unit_nlay[i]; ++m) q->layers[q->n_layers++] = unit_lay[i][m];
+            }
+            q->unit_add = i;
+            q->collapsed = 1;
+            q->unit_kind = has_attn ? 1 : (has_gelu ? 2 : 3);
+            q->type = has_attn ? BLK_ATTENTION : (has_gelu ? BLK_GELU : (has_conv ? BLK_CONV : BLK_ADD));
+            snprintf(q->name, sizeof(q->name), "%s", has_attn ? "attn" : (has_gelu ? "mlp block" : "res block"));
+            if (has_attn) { /* the norm and the residual around it are not worth drawing: the box is just the attention */
+                snprintf(q->params, sizeof(q->params), "%d heads", unit_heads[i]);
+            } else {
+                snprintf(q->params, sizeof(q->params), "%d layers", unit_n[i]);
+                snprintf(q->detail, sizeof(q->detail), "%s > add", unit_detail[i]);
+            }
+            shape_str(s->out[i], q->l2, sizeof(q->l2));
+            shape_str_compact(s->out[i], q->l2c, sizeof(q->l2c));
+            ++n_add;
+            out_id[n] = i + 1;
+            gid_of_id[i + 1] = n;
+            n++;
+            continue;
+        }
         shape_str(s->out[i], q->l2, sizeof(q->l2));
         shape_str_compact(s->out[i], q->l2c, sizeof(q->l2c));
         switch (k->type) {
         case BLK_CONV:
             snprintf(q->name, sizeof(q->name), "conv%d", ++n_conv);
             snprintf(q->params, sizeof(q->params), "%dx%d s%d", k->b, k->b, k->c);
+            q->layers[q->n_layers++] = n_wl++;
             break;
-        case BLK_LINEAR: snprintf(q->name, sizeof(q->name), "fc%d", ++n_lin); break;
+        case BLK_LINEAR:
+            snprintf(q->name, sizeof(q->name), "fc%d", ++n_lin);
+            q->layers[q->n_layers++] = n_wl++;
+            break;
+        case BLK_PATCH:
+            snprintf(q->name, sizeof(q->name), "patch");
+            snprintf(q->params, sizeof(q->params), "%dx%d > %d", k->a, k->a, k->b);
+            q->layers[q->n_layers++] = n_wl++;
+            break;
         case BLK_ADD: snprintf(q->name, sizeof(q->name), "add%d", ++n_add); break;
         case BLK_UPSAMPLE:
             snprintf(q->name, sizeof(q->name), "up%d", ++n_up);
@@ -2080,6 +2370,9 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
         case BLK_ATTENTION:
             snprintf(q->name, sizeof(q->name), "attn");
             snprintf(q->params, sizeof(q->params), "%d heads", k->a);
+            q->has_attn = 1;
+            q->attn_tid = k->in[0];
+            q->attn_b1 = i + 1;
             break;
         default: snprintf(q->name, sizeof(q->name), "%s", train_block_type_name(k->type)); break;
         }
@@ -2114,18 +2407,10 @@ static void draw_arrow_head(Gui *g, float x, float y, float dx, float dy, SDL_Co
     SDL_RenderDrawLine(g->ren, (int)x, (int)y, (int)(x - dx * 6 - px * 3.5f), (int)(y - dy * 6 - py * 3.5f));
 }
 
-/* The model as a dependency graph: boxes are layers of the network, wires are "reads the output
- * of". Residual shortcuts show up as pink arcs over the boxes they skip; hover a box to light up
- * everything it reads and everything that reads it. */
-static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const NetShapes *shapes) {
-    draw_panel(g->ren, r);
-    txt(g, g->font, "model graph", r.x + 10, r.y + 6, (SDL_Color){COL_TEXT_DIM});
-    txt(g, g->font_small, "pink = skip / branch    hover a box to trace its wires", r.x + r.w - 420, r.y + r.h - 17,
-        (SDL_Color){COL_TEXT_DIM});
-    if (!cfg || cfg->n_blocks == 0) return;
-
-    ArchGroup gr[ARCH_MAX_GROUPS];
-    int n = build_arch(cfg, shapes, gr);
+/* Where the boxes go: layers left to right, branch rows top to bottom. With `thumbs` (live weights available) a
+ * single-row graph moves up and leaves a strip under the boxes, where each box with weights gets a thumbnail of the
+ * same width directly below it: *thumb_y / *thumb_h say where that strip is (0 when there is none). */
+static void arch_boxes(SDL_Rect r, const ArchGroup *gr, int n, int thumbs, SDL_Rect *box, int *out_w, int *out_h, int *thumb_y, int *thumb_h) {
     int n_levels = 0, n_rows = 1;
     for (int i = 0; i < n; ++i) {
         if (gr[i].level + 1 > n_levels) n_levels = gr[i].level + 1;
@@ -2137,6 +2422,7 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
     int top = r.y + 44; /* room above row 0 for the skip arcs */
     int avail = r.y + r.h - 22 - top;
     int box_h = 46, pitch = 0;
+    *thumb_y = *thumb_h = 0;
     if (n_rows > 1) {
         pitch = (avail - box_h) / (n_rows - 1);
         if (pitch < box_h + 4) { /* rows don't fit at full height: shrink the boxes instead */
@@ -2144,15 +2430,88 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
             if (box_h < 30) box_h = 30;
             pitch = box_h + 4;
         }
+    } else if (thumbs) {
+        top = r.y + 32;
+        *thumb_y = top + box_h + 8;
+        *thumb_h = r.y + r.h - 10 - *thumb_y;
     } else {
         top += (avail - box_h) / 2 - 4;
     }
-
-    SDL_Rect box[ARCH_MAX_GROUPS];
     for (int i = 0; i < n; ++i) {
         int col_x = area_x + gr[i].level * col_w + (col_w - box_w) / 2;
         int row_y = top + (n_rows > 1 ? gr[i].row * pitch : 0);
         box[i] = (SDL_Rect){col_x, row_y, box_w, box_h};
+    }
+    *out_w = box_w;
+    *out_h = box_h;
+}
+
+/* The frame around an expanded unit's boxes (all of them in one row), or an empty rect; *kind is the unit's kind. */
+static SDL_Rect arch_unit_frame(const ArchGroup *gr, int n, const SDL_Rect *box, int unit, int thumb_y, int thumb_h, int *kind) {
+    SDL_Rect fr = {0, 0, 0, 0};
+    int first = 1, bottom = 0;
+    for (int i = 0; i < n; ++i) {
+        if (gr[i].unit_add != unit || gr[i].collapsed) continue;
+        if (first) fr = box[i];
+        else SDL_UnionRect(&fr, &box[i], &fr);
+        first = 0;
+        *kind = gr[i].unit_kind;
+        bottom = box[i].y + box[i].h;
+    }
+    if (first) return fr;
+    if (thumb_h >= 24) bottom = thumb_y + thumb_h;
+    return (SDL_Rect){fr.x - 8, fr.y - 18, fr.w + 16, bottom + 8 - (fr.y - 18)};
+}
+
+/* The frame around the inner steps of an opened attention block (block index b), or an empty rect. */
+static SDL_Rect arch_attn_frame(const ArchGroup *gr, int n, const SDL_Rect *box, int b, int thumb_y, int thumb_h) {
+    SDL_Rect fr = {0, 0, 0, 0};
+    int first = 1, bottom = 0;
+    for (int i = 0; i < n; ++i) {
+        if (gr[i].attn_b1 != b + 1 || gr[i].attn_sub == 0) continue;
+        if (first) fr = box[i];
+        else SDL_UnionRect(&fr, &box[i], &fr);
+        first = 0;
+        bottom = box[i].y + box[i].h;
+    }
+    if (first) return fr;
+    if (thumb_h >= 24) bottom = thumb_y + thumb_h;
+    return (SDL_Rect){fr.x - 6, fr.y - 14, fr.w + 12, bottom + 6 - (fr.y - 14)};
+}
+
+/* The model as a dependency graph: boxes are layers of the network, wires are "reads the output
+ * of". Residual shortcuts show up as pink arcs over the boxes they skip; hover a box to light up
+ * everything it reads and everything that reads it. */
+static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const NetShapes *shapes) {
+    draw_panel(g->ren, r);
+    txt(g, g->font, "model graph", r.x + 10, r.y + 6, (SDL_Color){COL_TEXT_DIM});
+    txt(g, g->font_small, "click a box or thumbnail: weights   hover: wires / contents   pink = skip", r.x + r.w - 440, r.y + 8,
+        (SDL_Color){COL_TEXT_DIM});
+    if (!cfg || cfg->n_blocks == 0) return;
+
+    ArchGroup gr[ARCH_MAX_GROUPS];
+    int n = build_arch(cfg, shapes, g->arch_expanded, g->arch_attn_open, gr);
+    SDL_Rect box[ARCH_MAX_GROUPS];
+    int box_w, box_h, thumb_y, thumb_h;
+    arch_boxes(r, gr, n, ARCH_SHOW_WEIGHTS && g->weights_valid, box, &box_w, &box_h, &thumb_y, &thumb_h);
+    for (int u = 0; u < MAX_BLOCKS; ++u) { /* a frame around every expanded unit, behind its boxes */
+        if (!g->arch_expanded[u]) continue;
+        int kind = 0;
+        SDL_Rect fr = arch_unit_frame(gr, n, box, u, thumb_y, thumb_h, &kind);
+        if (fr.w <= 0) continue;
+        SDL_Color acc = node_accent(kind == 1 ? BLK_ATTENTION : (kind == 2 ? BLK_GELU : BLK_CONV));
+        rrect_bordered(g->ren, fr, 10, col_mix((SDL_Color){COL_SURFACE}, acc, 0.10f), col_mix((SDL_Color){COL_SURFACE}, acc, 0.6f));
+        char lab[24];
+        snprintf(lab, sizeof(lab), "%s  [-]", kind == 1 ? "attn block" : (kind == 2 ? "mlp block" : "res block"));
+        txt(g, g->font_small, lab, fr.x + 8, fr.y + 2, col_mix(acc, (SDL_Color){255, 255, 255, 255}, 0.35f));
+    }
+    for (int b = 0; b < MAX_BLOCKS; ++b) { /* a frame around the inner steps of every opened attention block */
+        if (!g->arch_attn_open[b]) continue;
+        SDL_Rect fr = arch_attn_frame(gr, n, box, b, thumb_y, thumb_h);
+        if (fr.w <= 0) continue;
+        SDL_Color acc = node_accent(BLK_ATTENTION);
+        rrect_bordered(g->ren, fr, 8, col_mix((SDL_Color){COL_SURFACE}, acc, 0.08f), col_mix((SDL_Color){COL_SURFACE}, acc, 0.5f));
+        txt(g, g->font_small, "attn  [-]", fr.x + 6, fr.y + 1, col_mix(acc, (SDL_Color){255, 255, 255, 255}, 0.35f));
     }
     SDL_Point mouse = {g->mouse_x, g->mouse_y};
     int hover = -1;
@@ -2196,6 +2555,8 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
         fill_rrect(g->ren, bar, 1, acc);
         if (i == hover) rrect_bordered(g->ren, box[i], 7, (SDL_Color){COL_SURFACE2}, (SDL_Color){250, 204, 96, 255});
         SDL_RenderSetClipRect(g->ren, &box[i]);
+        if (gr[i].collapsed || (gr[i].attn_b1 && gr[i].attn_sub == 0))
+            txt(g, g->font_small, "[+]", box[i].x + box[i].w - 26, box[i].y + box[i].h - 17, (SDL_Color){COL_TEXT_DIM});
         int compact = box_w < 70; /* narrow boxes (deep graphs): smaller name, short shape, no spaces */
         txt(g, compact ? g->font_small : g->font, gr[i].name, box[i].x + 5, box[i].y + (compact ? 5 : 3),
             (SDL_Color){COL_TEXT});
@@ -2210,6 +2571,33 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
         }
         if (box_h >= 40) txt(g, g->font_small, l3, box[i].x + 5, box[i].y + 31, (SDL_Color){COL_TEXT_DIM});
         SDL_RenderSetClipRect(g->ren, NULL);
+        int shown = g->weights_win && arch_group_tab(g, &gr[i]) == g->weights_tab; /* the one the weights window shows */
+        if (thumb_h >= 24 && (gr[i].n_layers > 0 || gr[i].has_attn)) {
+            /* the live weights of the layer(s) this box stands for, in the strip right below it */
+            SDL_Rect tp = {box[i].x, thumb_y, box[i].w, thumb_h};
+            rrect_bordered(g->ren, tp, 7, (SDL_Color){COL_SURFACE}, shown ? (SDL_Color){90, 190, 255, 255} : (SDL_Color){COL_BORDER});
+            SDL_Rect th = {tp.x + 5, tp.y + 5, tp.w - 10, tp.h - 10};
+            draw_arch_thumb(g, th, &gr[i]);
+            SDL_SetRenderDrawColor(g->ren, 62, 70, 94, 255);
+            SDL_RenderDrawLine(g->ren, box[i].x + box[i].w / 2, box[i].y + box[i].h, box[i].x + box[i].w / 2, thumb_y - 1);
+        }
+        if (shown) {
+            SDL_SetRenderDrawColor(g->ren, 90, 190, 255, 255);
+            SDL_RenderDrawRect(g->ren, &box[i]);
+            SDL_Rect in = {box[i].x + 1, box[i].y + 1, box[i].w - 2, box[i].h - 2};
+            SDL_RenderDrawRect(g->ren, &in);
+        }
+    }
+
+    g->arch_tip_on = 0;
+    if (hover >= 0 && gr[hover].detail[0]) { /* what a collapsed unit holds: drawn at the end of the frame */
+        int lines = wrap_line_count(gr[hover].detail, 34);
+        if (lines > 5) lines = 5;
+        SDL_Rect tip = {box[hover].x, box[hover].y + box[hover].h + 8, 250, 14 + lines * 16};
+        if (tip.x + tip.w > r.x + r.w - 6) tip.x = r.x + r.w - 6 - tip.w;
+        snprintf(g->arch_tip, sizeof(g->arch_tip), "%s", gr[hover].detail);
+        g->arch_tip_r = tip;
+        g->arch_tip_on = 1;
     }
 }
 
@@ -2231,6 +2619,7 @@ static const char *palette_label(int type) {
     case BLK_TOKENS: return "tokens";
     case BLK_POS: return "pos";
     case BLK_ATTENTION: return "attn";
+    case BLK_PATCH: return "patch";
     default: return "vae";
     }
 }
@@ -2253,7 +2642,7 @@ static void draw_link_feedback(Gui *g, SDL_Point mouse) {
     LayerShape res;
     int has_res;
     for (int j = 0; j < MAX_NODES; ++j) {
-        if (!g->nodes[j].used || g->nodes[j].type == NODE_INPUT || j == from) continue;
+        if (!g->nodes[j].used || g->nodes[j].type == NODE_INPUT || j == from || node_hidden(g, j)) continue;
         for (int k = 0; k < node_nin(g->nodes[j].type); ++k) {
             int ok = link_check(g, from, j, k, why, sizeof(why), &res, &has_res);
             SDL_Point pt = node_in_port(g, j, k);
@@ -2309,6 +2698,49 @@ static void draw_link_feedback(Gui *g, SDL_Point mouse) {
     if (nl2) draw_wrapped(g, g->font_small, lines[1], box.x + 10, box.y + 24, 36, 16, 4, col[1]);
 }
 
+static const char *unit_title(int kind) { return kind == 1 ? "attn block" : (kind == 2 ? "mlp block" : "res block"); }
+
+/* Where the frame of an expanded unit is (view space): around its blocks, with room for the label on top. */
+static SDL_Rect unit_frame(const Gui *g, int add_node) {
+    SDL_Rect fr = {0, 0, 0, 0};
+    int first = 1;
+    for (int j = 0; j < MAX_NODES; ++j) {
+        if (!g->nodes[j].used || g->node_unit[j] != add_node) continue;
+        SDL_Rect r = node_rect(g, j);
+        if (first) fr = r;
+        else SDL_UnionRect(&fr, &r, &fr);
+        first = 0;
+    }
+    fr = (SDL_Rect){fr.x - 10, fr.y - 26, fr.w + 20, fr.h + 38};
+    return fr;
+}
+
+/* A collapsed unit: one box in the colour of its kind; a click expands it. */
+static void draw_unit_box(Gui *g, int an, SDL_Point mouse) {
+    SDL_Rect r = unit_box(g, an);
+    int kind = g->unit_kind[an], hover = SDL_PointInRect(&mouse, &r);
+    SDL_Color acc = node_accent(kind == 1 ? BLK_ATTENTION : (kind == 2 ? BLK_GELU : BLK_CONV));
+    draw_shadow(g->ren, r, 9);
+    rrect_bordered(g->ren, r, 9, col_mix((SDL_Color){COL_SURFACE2}, acc, hover ? 0.22f : 0.12f), col_mix((SDL_Color){50, 57, 78, 255}, acc, 0.7f));
+    fill_circle_aa(g->ren, r.x + 14, r.y + 13, 3, acc);
+    txt(g, g->font_med, unit_title(kind), r.x + 24, r.y + 4, (SDL_Color){COL_TEXT});
+    txt(g, g->font_small, "[+]", r.x + r.w - 26, r.y + 45, (SDL_Color){COL_TEXT_DIM});
+    int members = 0;
+    for (int j = 0; j < MAX_NODES; ++j) members += g->nodes[j].used && g->node_unit[j] == an;
+    char shape[48] = "";
+    if (g->nshape_ok[an]) {
+        const LayerShape *o = &g->nshape[an];
+        if (o->flat) snprintf(shape, sizeof(shape), "-> %d", o->c);
+        else snprintf(shape, sizeof(shape), "-> %dx%dx%d", o->h, o->w, o->c);
+    }
+    txt(g, g->font_small, shape, r.x + 8, r.y + 29, (SDL_Color){COL_TEXT_DIM});
+    char inside[32];
+    snprintf(inside, sizeof(inside), "%d blocks", members);
+    txt(g, g->font_small, inside, r.x + 8, r.y + 45, (SDL_Color){COL_TEXT_DIM});
+    draw_port(g, (SDL_Point){r.x, r.y + 11}, 1, acc);
+    draw_port(g, (SDL_Point){r.x + r.w, r.y + 11}, graph_consumers(g, an) > 0, acc);
+}
+
 /* The node canvas: grid, wires and nodes are drawn at native size into canvas_tex (so text and fields need no
  * scaling logic) and the visible part is then scaled onto the screen. */
 static void draw_canvas(Gui *g, SDL_Point mouse_screen) {
@@ -2344,9 +2776,21 @@ static void draw_canvas(Gui *g, SDL_Point mouse_screen) {
     if (SDL_PointInRect(&mouse_screen, &GRAPH_VIEW) && g->drag == DRAG_NONE) {
         for (int i = MAX_NODES - 1; i >= 0 && hover < 0; --i) {
             SDL_Rect r = node_rect(g, i);
-            if (g->nodes[i].used && SDL_PointInRect(&mouse, &r)) hover = i;
+            if (g->nodes[i].used && !node_hidden(g, i) && SDL_PointInRect(&mouse, &r)) hover = i;
         }
     }
+    /* a frame around every residual unit (attn / mlp / res block), behind the wires and nodes */
+    for (int an = 0; an < MAX_NODES; ++an) {
+        if (!g->nodes[an].used || !g->unit_kind[an] || g->unit_collapsed[an]) continue;
+        SDL_Rect fr = unit_frame(g, an);
+        int kind = g->unit_kind[an];
+        SDL_Color acc = node_accent(kind == 1 ? BLK_ATTENTION : (kind == 2 ? BLK_GELU : BLK_CONV));
+        rrect_bordered(g->ren, fr, 12, col_mix((SDL_Color){13, 15, 22, 255}, acc, 0.10f), col_mix((SDL_Color){13, 15, 22, 255}, acc, 0.55f));
+        char lab[24];
+        snprintf(lab, sizeof(lab), "%s  [-]", unit_title(kind));
+        txt(g, g->font_small, lab, fr.x + 12, fr.y + 5, col_mix(acc, (SDL_Color){255, 255, 255, 255}, 0.35f));
+    }
+
     /* Wires are drawn in three passes so the interesting ones end up on top: ordinary
      * (blue), skip / branch (pink: the source isn't the block right before the reader in
      * evaluation order, e.g. a residual shortcut), then the hovered node's (gold). */
@@ -2356,6 +2800,8 @@ static void draw_canvas(Gui *g, SDL_Point mouse_screen) {
             for (int k = 0; k < node_nin(g->nodes[t].type); ++k) {
                 int src = g->nodes[t].in[k];
                 if (src < 0) continue;
+                if (node_hidden(g, t) && node_hidden(g, src) && g->node_unit[src] == g->node_unit[t]) continue; /* inside a collapsed unit */
+                if (node_hidden(g, t) && t == g->node_unit[t]) continue; /* the unit's own skip wire into its add */
                 int src_id = g->nodes[src].type == NODE_INPUT ? 0 : g->node_block[src] + 1;
                 int dst_id = g->nodes[t].type == NODE_OUTPUT ? g->chain_len + 1 : g->node_block[t] + 1;
                 int on_path = (g->nodes[src].type == NODE_INPUT || g->node_block[src] >= 0) &&
@@ -2372,7 +2818,9 @@ static void draw_canvas(Gui *g, SDL_Point mouse_screen) {
         }
     }
     for (int i = 0; i < MAX_NODES; ++i)
-        if (g->nodes[i].used) draw_node(g, i, mouse);
+        if (g->nodes[i].used && !node_hidden(g, i)) draw_node(g, i, mouse);
+    for (int an = 0; an < MAX_NODES; ++an)
+        if (g->nodes[an].used && g->unit_kind[an] && g->unit_collapsed[an]) draw_unit_box(g, an, mouse);
     draw_err_callout(g, mouse);
 
     if (g->drag == DRAG_LINK) draw_wire(g, node_out_port(g, g->drag_node), mouse, (SDL_Color){250, 204, 96, 255});
@@ -2585,13 +3033,30 @@ static void draw_form(Gui *g) {
 
 /* -- messages from the worker -------------------------------------------- */
 
+/* The weights window's tabs: one per weighted layer, then the neuron view (when there are fc layers), then the
+ * attention view (when there are attention blocks). */
+static int vis_count(const Gui *g) {
+    int n = 0;
+    for (int i = 0; i < g->model.n_viz; ++i) n += !g->model.layers[i].hidden;
+    return n;
+}
+/* The model.layers index behind the tab-th weight tab (hidden layers have none). */
+static int vis_layer(const Gui *g, int tab) {
+    for (int i = 0, k = 0; i < g->model.n_viz; ++i)
+        if (!g->model.layers[i].hidden && k++ == tab) return i;
+    return 0;
+}
+static int tabs_total(const Gui *g) { return vis_count(g) + (g->model.n_act > 0 ? 1 : 0) + (g->model.n_attn > 0 ? 1 : 0); }
+static int tab_net(const Gui *g) { return g->model.n_act > 0 ? vis_count(g) : -1; }
+static int tab_attn(const Gui *g) { return g->model.n_attn > 0 ? vis_count(g) + (g->model.n_act > 0 ? 1 : 0) : -1; }
+
 static int model_info_ok(const ModelInfo *m) {
     NetShapes s;
     char err[64];
     if (train_cfg_derive(&m->cfg, &s, err, sizeof(err)) != 0) return 0;
     int weighted = 0;
     for (int i = 0; i < m->cfg.n_blocks; ++i)
-        if (m->cfg.blocks[i].type == BLK_CONV || m->cfg.blocks[i].type == BLK_LINEAR) weighted++;
+        if (m->cfg.blocks[i].type == BLK_CONV || m->cfg.blocks[i].type == BLK_LINEAR || m->cfg.blocks[i].type == BLK_PATCH) weighted++;
     if (m->n_viz != weighted || m->n_viz > MAX_VIZ_LAYERS) return 0;
     long used = 0;
     for (int i = 0; i < m->n_viz; ++i) {
@@ -2620,7 +3085,17 @@ static int model_info_ok(const ModelInfo *m) {
             return 0;
         act_used += al->dim;
     }
-    return act_used == m->total_act_floats;
+    if (act_used != m->total_act_floats) return 0;
+    long attn_used = 0;
+    if (m->n_attn < 0 || m->n_attn > MAX_ATTN_VIZ) return 0;
+    for (int k = 0; k < m->n_attn; ++k) {
+        const AttnViz *av = &m->attn[k];
+        if (av->heads < 1 || av->heads > MAX_HEADS || av->tokens < 1 || av->tokens > MAX_TOKENS || av->gh < 1 || av->gw < 1 ||
+            av->offset != attn_used || av->tid < 0 || av->tid > m->cfg.n_blocks)
+            return 0;
+        attn_used += (long)av->heads * av->tokens * av->tokens;
+    }
+    return attn_used == m->total_attn_floats && attn_used <= ATTN_MAX_FLOATS;
 }
 
 /* The sample texture and pixel buffer follow the dataset's image size, which
@@ -2674,6 +3149,13 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         free(g->acts);
         g->acts = (float *)calloc((size_t)(info.total_act_floats > 0 ? info.total_act_floats : 1), sizeof(float));
         g->acts_valid = 0;
+        free(g->attn);
+        g->attn = (float *)calloc((size_t)(info.total_attn_floats > 0 ? info.total_attn_floats : 1), sizeof(float));
+        g->attn_valid = 0;
+        memset(g->arch_expanded, 0, sizeof(g->arch_expanded));
+        memset(g->arch_attn_open, 0, sizeof(g->arch_attn_open));
+        g->attn_layer = 0;
+        g->attn_query = -1;
         g->has_model = 1;
         g->has_record = 0;
         free(g->pred_data); /* predictions belong to the model that made them */
@@ -2683,15 +3165,16 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         g->gen_data = NULL;
         memset(&g->gen_hdr, 0, sizeof(g->gen_hdr));
         g->pred_page = 0;
-        if (g->weights_tab >= g->model.n_viz + (g->model.n_act > 0 ? 1 : 0)) g->weights_tab = 0;
+        if (g->weights_tab >= tabs_total(g)) g->weights_tab = 0;
         gui_clear_history(g);
     } else if (type == MSG_PROGRESS) {
         if (!g->has_model) return;
         size_t wbytes = sizeof(float) * (size_t)g->model.total_floats;
         size_t img_bytes = train_sample_bytes(&g->run_cfg);
         size_t abytes = sizeof(float) * (size_t)g->model.total_act_floats;
-        size_t base = sizeof(Progress) + img_bytes + abytes;
-        if (!g->sample || !g->acts || bytes < base || (bytes != base && bytes != base + wbytes)) return;
+        size_t tbytes = sizeof(float) * (size_t)g->model.total_attn_floats;
+        size_t base = sizeof(Progress) + img_bytes + abytes + tbytes;
+        if (!g->sample || !g->acts || !g->attn || bytes < base || (bytes != base && bytes != base + wbytes)) return;
         Progress prog;
         memcpy(&prog, p, sizeof(prog));
         if (prog.has_weights) {
@@ -2704,9 +3187,17 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         memcpy(g->sample, p + sizeof(Progress), img_bytes);
         if (abytes) memcpy(g->acts, p + sizeof(Progress) + img_bytes, abytes);
         g->acts_valid = 1;
+        if (tbytes) memcpy(g->attn, p + sizeof(Progress) + img_bytes + abytes, tbytes);
+        g->attn_valid = 1;
         g->prog = prog;
         g->has_record = 1;
         gui_push_point(g, prog.loss);
+    } else if (type == MSG_GPU) {
+        if (bytes == sizeof(GpuStats)) {
+            memcpy(&g->gpu, p, sizeof(GpuStats));
+            g->gpu_valid = 1;
+            g->gpu_at = SDL_GetTicks();
+        }
     } else if (type == MSG_GENERATED) {
         if (!g->has_model || g->run_cfg.task != TASK_GENERATE || bytes < sizeof(GenHeader)) return;
         GenHeader h;
@@ -2798,18 +3289,23 @@ static void rx_pump(Rx *r, int fd, Gui *g) {
 
 #define WEIGHTS_WIN_W 700
 #define WEIGHTS_WIN_H 600
-#define WEIGHTS_TAB_Y 20
-#define WEIGHTS_TAB_H 44
 #define WEIGHTS_CONTENT_W (WEIGHTS_WIN_W - 40)
-#define WEIGHTS_CONTENT_H (WEIGHTS_WIN_H - (WEIGHTS_TAB_Y + WEIGHTS_TAB_H + 16) - 20)
+#define WEIGHTS_CONTENT_H (WEIGHTS_WIN_H - 40)
+/* What the window shows is chosen by clicking a box of the model graph, so there is no tab bar: the view fills it. */
+static const SDL_Rect WEIGHTS_CONTENT = {20, 20, WEIGHTS_CONTENT_W, WEIGHTS_CONTENT_H};
 
-/* Pure function of (i, n) (no Gui) so render_weights_window (draws tabs) and
- * pump_events (hit-tests clicks on them) use the exact same rects. */
-static SDL_Rect weights_tab_rect(int i, int n) {
-    int bar_w = WEIGHTS_WIN_W - 40;
-    int tab_w = bar_w / (n > 0 ? n : 1);
-    SDL_Rect r = {20 + i * tab_w, WEIGHTS_TAB_Y, tab_w - 4, WEIGHTS_TAB_H};
+/* The corner button that flips between an fc layer's weights and the neuron (network) view. */
+static SDL_Rect weights_flip_button(SDL_Rect box) {
+    SDL_Rect r = {box.x + box.w - 120, box.y + box.h - 34, 110, 26};
     return r;
+}
+/* Its label, or NULL when this view has nothing to flip to. */
+static const char *weights_flip_label(const Gui *g) {
+    if (g->model.n_act <= 0) return NULL;
+    if (g->weights_tab == tab_net(g)) return "< weights";
+    if (g->weights_tab == tab_attn(g) || g->weights_tab >= vis_count(g)) return NULL;
+    const char *name = g->model.layers[vis_layer(g, g->weights_tab)].name;
+    return name[0] == 'f' && name[1] == 'c' ? "network >" : NULL; /* fc layers: their neurons */
 }
 
 static void close_weights_window(Gui *g) {
@@ -3181,6 +3677,35 @@ static SDL_Color neuron_color(float t) {
  * connections between neighbouring layers as lines: red pushes the next neuron up, blue pushes it down. A layer
  * with many neurons is drawn as a strip of thin cells; the first layer after a flatten (or the raw input) has too
  * many inputs to draw, so it hangs off a single block, each line as strong as that neuron's weight norm. */
+/* Uploads the dashboard's current sample into net_img_tex (a texture of the weights window's renderer) and returns
+ * it, or NULL when there is no sample yet. */
+static SDL_Texture *sample_texture(Gui *g) {
+    SDL_Renderer *R = g->weights_ren;
+    if (!g->sample || g->run_cfg.img_w <= 0) return NULL;
+    int w = g->run_cfg.img_w, h = g->run_cfg.img_h, c = g->run_cfg.img_c;
+    if (!g->net_img_tex || g->net_img_w != w || g->net_img_h != h) {
+        if (g->net_img_tex) SDL_DestroyTexture(g->net_img_tex);
+        g->net_img_tex = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (g->net_img_tex) SDL_SetTextureScaleMode(g->net_img_tex, SDL_ScaleModeNearest);
+        g->net_img_w = w;
+        g->net_img_h = h;
+    }
+    void *pixels;
+    int pitch;
+    size_t plane = (size_t)w * h;
+    if (!g->net_img_tex || SDL_LockTexture(g->net_img_tex, NULL, &pixels, &pitch) != 0) return NULL;
+    for (int y = 0; y < h; ++y) {
+        Uint32 *row = (Uint32 *)((Uint8 *)pixels + y * pitch);
+        for (int x = 0; x < w; ++x) {
+            size_t at = (size_t)y * w + x;
+            Uint8 r = g->sample[at], gr = c >= 3 ? g->sample[plane + at] : r, b = c >= 3 ? g->sample[2 * plane + at] : r;
+            row[x] = (0xFFu << 24) | (b << 16) | (gr << 8) | r;
+        }
+    }
+    SDL_UnlockTexture(g->net_img_tex);
+    return g->net_img_tex;
+}
+
 static void draw_network_view(Gui *g, SDL_Rect box) {
     SDL_Renderer *R = g->weights_ren;
     const ModelInfo *m = &g->model;
@@ -3297,33 +3822,11 @@ static void draw_network_view(Gui *g, SDL_Rect box) {
     }
 
     /* the sample itself above the first source block */
-    if (g->sample && g->run_cfg.img_w > 0) {
-        int w = g->run_cfg.img_w, h = g->run_cfg.img_h, c = g->run_cfg.img_c;
-        if (!g->net_img_tex || g->net_img_w != w || g->net_img_h != h) {
-            if (g->net_img_tex) SDL_DestroyTexture(g->net_img_tex);
-            g->net_img_tex = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
-            if (g->net_img_tex) SDL_SetTextureScaleMode(g->net_img_tex, SDL_ScaleModeNearest);
-            g->net_img_w = w;
-            g->net_img_h = h;
-        }
-        void *pixels;
-        int pitch;
-        size_t plane = (size_t)w * h;
-        if (g->net_img_tex && SDL_LockTexture(g->net_img_tex, NULL, &pixels, &pitch) == 0) {
-            for (int y = 0; y < h; ++y) {
-                Uint32 *row = (Uint32 *)((Uint8 *)pixels + y * pitch);
-                for (int x = 0; x < w; ++x) {
-                    size_t at = (size_t)y * w + x;
-                    Uint8 r = g->sample[at], gr = c >= 3 ? g->sample[plane + at] : r, b = c >= 3 ? g->sample[2 * plane + at] : r;
-                    row[x] = (0xFFu << 24) | (b << 16) | (gr << 8) | r;
-                }
-            }
-            SDL_UnlockTexture(g->net_img_tex);
-            int tile = 64; /* under the source block, where there is room */
-            SDL_Rect dst = {col_x[0] - tile / 2, (top + bottom) / 2 + 72, tile, tile};
-            SDL_RenderCopy(R, g->net_img_tex, NULL, &dst);
-            wtxt(g, "this sample", dst.x - 2, dst.y + tile + 3, dim);
-        }
+    if (sample_texture(g)) {
+        int tile = 64; /* under the source block, where there is room */
+        SDL_Rect dst = {col_x[0] - tile / 2, (top + bottom) / 2 + 72, tile, tile};
+        SDL_RenderCopy(R, g->net_img_tex, NULL, &dst);
+        wtxt(g, "this sample", dst.x - 2, dst.y + tile + 3, dim);
     }
 
     /* neurons and labels */
@@ -3382,6 +3885,353 @@ static void draw_network_view(Gui *g, SDL_Rect box) {
     else if (!g->acts_valid) wtxt(g, "waiting for the first batch...", box.x + 10, box.y + box.h - 20, dim);
 }
 
+/* -- attention view --------------------------------------------------------- */
+
+#define ATTN_IMG 240  /* the sample, with the token grid over it */
+#define ATTN_HEAD 88  /* one head's map for the chosen query token */
+#define ATTN_MAT 96   /* one head's full query x key matrix */
+
+typedef struct AttnLayout {
+    SDL_Rect img;
+    SDL_Rect head[8];
+    int n_head;
+    SDL_Rect mat[6];
+    int n_mat;
+    SDL_Rect chip[MAX_ATTN_VIZ];
+} AttnLayout;
+
+static void attn_layout(SDL_Rect box, const AttnViz *av, int n_layers, AttnLayout *L) {
+    L->img = (SDL_Rect){box.x + 12, box.y + 84, ATTN_IMG, ATTN_IMG};
+    L->n_head = av->heads < 8 ? av->heads : 8;
+    for (int h = 0; h < L->n_head; ++h)
+        L->head[h] = (SDL_Rect){L->img.x + ATTN_IMG + 20 + (h % 4) * (ATTN_HEAD + 8), box.y + 84 + (h / 4) * (ATTN_HEAD + 20), ATTN_HEAD, ATTN_HEAD};
+    L->n_mat = av->heads < 6 ? av->heads : 6;
+    for (int h = 0; h < L->n_mat; ++h) L->mat[h] = (SDL_Rect){box.x + 12 + h * (ATTN_MAT + 8), box.y + 84 + ATTN_IMG + 64, ATTN_MAT, ATTN_MAT};
+    for (int k = 0; k < n_layers; ++k) L->chip[k] = (SDL_Rect){box.x + box.w - 12 - (n_layers - k) * 64, box.y + 10, 58, 24};
+}
+
+/* dark -> magenta -> yellow */
+static SDL_Color attn_color(float t) {
+    t = sqrtf(fminf(fmaxf(t, 0.0f), 1.0f));
+    SDL_Color a = {20, 24, 46, 255}, b = {170, 60, 130, 255}, c = {255, 220, 110, 255};
+    return t < 0.5f ? col_mix(a, b, t * 2.0f) : col_mix(b, c, (t - 0.5f) * 2.0f);
+}
+
+static int attn_query_of(const Gui *g, const AttnViz *av) {
+    if (g->attn_query >= 0 && g->attn_query < av->tokens) return g->attn_query;
+    return av->gh * av->gw == av->tokens ? (av->gh / 2) * av->gw + av->gw / 2 : av->tokens / 2;
+}
+
+/* One head's attention from the query token over the token grid, drawn over the (dimmed) sample. */
+static void attn_overlay(Gui *g, SDL_Rect r, const AttnViz *av, const float *row /* tokens values */) {
+    SDL_Renderer *R = g->weights_ren;
+    if (g->net_img_tex) SDL_RenderCopy(R, g->net_img_tex, NULL, &r);
+    SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(R, 8, 10, 16, 150);
+    SDL_RenderFillRect(R, &r);
+    float mx = 1e-9f;
+    for (int j = 0; j < av->tokens; ++j) mx = fmaxf(mx, row[j]);
+    for (int j = 0; j < av->tokens; ++j) {
+        int cx = j % av->gw, cy = j / av->gw;
+        SDL_Rect c = {r.x + cx * r.w / av->gw, r.y + cy * r.h / av->gh, 0, 0};
+        c.w = r.x + (cx + 1) * r.w / av->gw - c.x;
+        c.h = r.y + (cy + 1) * r.h / av->gh - c.y;
+        SDL_Color col = attn_color(row[j] / mx);
+        SDL_SetRenderDrawColor(R, col.r, col.g, col.b, (Uint8)(40 + 190 * sqrtf(row[j] / mx)));
+        SDL_RenderFillRect(R, &c);
+    }
+    SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_NONE);
+}
+
+static void draw_attention_view(Gui *g, SDL_Rect box) {
+    SDL_Renderer *R = g->weights_ren;
+    const ModelInfo *m = &g->model;
+    draw_panel(R, box);
+    SDL_Color dim = {COL_TEXT_DIM};
+    if (g->attn_layer >= m->n_attn) g->attn_layer = 0;
+    const AttnViz *av = &m->attn[g->attn_layer];
+    AttnLayout L;
+    attn_layout(box, av, m->n_attn, &L);
+    int T = av->tokens;
+    int grid_ok = av->gh * av->gw == T;
+    int q = attn_query_of(g, av);
+    const float *maps = g->attn + av->offset;
+
+    char hdr[96];
+    snprintf(hdr, sizeof(hdr), "attention %d - %d heads, %d tokens (%dx%d grid)", g->attn_layer + 1, av->heads, T, av->gh, av->gw);
+    wtxt(g, hdr, box.x + 10, box.y + 8, (SDL_Color){COL_TEXT});
+    wtxt(g, "click a patch of the image to choose the token that looks", box.x + 10, box.y + 30, dim);
+    if (m->n_attn > 1)
+        for (int k = 0; k < m->n_attn; ++k) {
+            char nm[12];
+            snprintf(nm, sizeof(nm), "attn%d", k + 1);
+            int active = k == g->attn_layer, tw = 0;
+            rrect_bordered(R, L.chip[k], 8, active ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_SURFACE2}, active ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_BORDER_HI});
+            TTF_SizeText(g->font_small, nm, &tw, NULL);
+            wtxt(g, nm, L.chip[k].x + (L.chip[k].w - tw) / 2, L.chip[k].y + 5, active ? (SDL_Color){10, 14, 28, 255} : (SDL_Color){COL_TEXT});
+        }
+    if (!g->attn_valid) {
+        wtxt(g, "waiting for the first batch...", box.x + 10, box.y + 60, dim);
+        return;
+    }
+
+    sample_texture(g);
+    if (grid_ok) {
+        /* the big image: the average over heads of what the chosen token attends to */
+        float *avg = (float *)calloc((size_t)T, sizeof(float));
+        if (avg) {
+            for (int h = 0; h < av->heads; ++h)
+                for (int j = 0; j < T; ++j) avg[j] += maps[((size_t)h * T + q) * T + j] / (float)av->heads;
+            attn_overlay(g, L.img, av, avg);
+            free(avg);
+        }
+        /* the chosen token's patch */
+        SDL_Rect qr = {L.img.x + (q % av->gw) * L.img.w / av->gw, L.img.y + (q / av->gw) * L.img.h / av->gh, 0, 0};
+        qr.w = L.img.x + (q % av->gw + 1) * L.img.w / av->gw - qr.x;
+        qr.h = L.img.y + (q / av->gw + 1) * L.img.h / av->gh - qr.y;
+        SDL_SetRenderDrawColor(R, 90, 190, 255, 255);
+        SDL_RenderDrawRect(R, &qr);
+        wtxt(g, "average over heads", L.img.x, L.img.y + ATTN_IMG + 4, dim);
+        wtxt(g, "blue box = the token that looks", L.img.x, L.img.y + ATTN_IMG + 20, dim);
+        for (int h = 0; h < L.n_head; ++h) {
+            attn_overlay(g, L.head[h], av, maps + ((size_t)h * T + q) * T);
+            char nm[16];
+            snprintf(nm, sizeof(nm), "head %d", h + 1);
+            wtxt(g, nm, L.head[h].x, L.head[h].y + ATTN_HEAD + 2, dim);
+        }
+    } else {
+        wtxt(g, "the tokens do not come from an image grid, only the matrices below are shown", box.x + 10, box.y + 90, dim);
+    }
+
+    wtxt(g, "all tokens (rows: looking, columns: looked at)", box.x + 12, L.mat[0].y - 20, dim);
+    for (int h = 0; h < L.n_mat; ++h) {
+        SDL_Rect r = L.mat[h];
+        int cells = T < ATTN_MAT ? T : ATTN_MAT;
+        float mx = 1e-9f;
+        for (size_t i = 0; i < (size_t)T * T; ++i) mx = fmaxf(mx, maps[(size_t)h * T * T + i]);
+        for (int ci = 0; ci < cells; ++ci)
+            for (int cj = 0; cj < cells; ++cj) {
+                int i = ci * T / cells, j = cj * T / cells;
+                SDL_Color col = attn_color(maps[((size_t)h * T + i) * T + j] / mx);
+                SDL_SetRenderDrawColor(R, col.r, col.g, col.b, 255);
+                SDL_Rect c = {r.x + cj * r.w / cells, r.y + ci * r.h / cells, 0, 0};
+                c.w = r.x + (cj + 1) * r.w / cells - c.x;
+                c.h = r.y + (ci + 1) * r.h / cells - c.y;
+                SDL_RenderFillRect(R, &c);
+            }
+        int qy = r.y + (int)((long)q * r.h / T);
+        SDL_SetRenderDrawColor(R, 90, 190, 255, 255);
+        SDL_RenderDrawLine(R, r.x, qy, r.x + r.w - 1, qy);
+        SDL_RenderDrawRect(R, &r);
+        char nm[16];
+        snprintf(nm, sizeof(nm), "head %d", h + 1);
+        wtxt(g, nm, r.x, r.y + ATTN_MAT + 2, dim);
+    }
+}
+
+/* A click in the attention tab: a layer chip, a patch of the sample, or a row of a matrix picks what is shown. */
+static void attn_click(Gui *g, SDL_Rect box, SDL_Point p) {
+    const ModelInfo *m = &g->model;
+    if (g->attn_layer >= m->n_attn) g->attn_layer = 0;
+    const AttnViz *av = &m->attn[g->attn_layer];
+    AttnLayout L;
+    attn_layout(box, av, m->n_attn, &L);
+    if (m->n_attn > 1)
+        for (int k = 0; k < m->n_attn; ++k)
+            if (SDL_PointInRect(&p, &L.chip[k])) {
+                g->attn_layer = k;
+                g->attn_query = -1;
+                return;
+            }
+    if (av->gh * av->gw == av->tokens && SDL_PointInRect(&p, &L.img)) {
+        int cx = (p.x - L.img.x) * av->gw / L.img.w, cy = (p.y - L.img.y) * av->gh / L.img.h;
+        g->attn_query = cy * av->gw + cx;
+        return;
+    }
+    for (int h = 0; h < L.n_mat; ++h)
+        if (SDL_PointInRect(&p, &L.mat[h])) {
+            g->attn_query = (int)((long)(p.y - L.mat[h].y) * av->tokens / L.mat[h].h);
+            return;
+        }
+    for (int h = 0; h < L.n_head && av->gh * av->gw == av->tokens; ++h)
+        if (SDL_PointInRect(&p, &L.head[h])) {
+            int cx = (p.x - L.head[h].x) * av->gw / L.head[h].w, cy = (p.y - L.head[h].y) * av->gh / L.head[h].h;
+            g->attn_query = cy * av->gw + cx;
+            return;
+        }
+}
+
+/* -- weights in the model graph --------------------------------------------- */
+
+/* The tab of the weights window that shows model.layers[layer], or -1 when that layer has none. */
+static int tab_of_layer(const Gui *g, int layer) {
+    if (layer < 0 || layer >= g->model.n_viz || g->model.layers[layer].hidden) return -1;
+    int k = 0;
+    for (int i = 0; i < layer; ++i) k += !g->model.layers[i].hidden;
+    return k;
+}
+
+/* The weights-window tab a graph box opens: the attention view for an attention unit, else its first layer. */
+static int arch_group_tab(const Gui *g, const ArchGroup *q) {
+    if (!g->has_model) return -1;
+    if (q->has_attn) return tab_attn(g);
+    for (int k = 0; k < q->n_layers; ++k) {
+        int t = tab_of_layer(g, q->layers[k]);
+        if (t >= 0) return t;
+    }
+    return -1;
+}
+
+static SDL_Color diverge_color(float t) { /* -1 blue .. 0 dark .. +1 red, the weights window's convention */
+    SDL_Color bg = {24, 28, 40, 255}, hi = t > 0 ? (SDL_Color){236, 92, 92, 255} : (SDL_Color){84, 144, 246, 255};
+    return col_mix(bg, hi, fminf(1.0f, sqrtf(fabsf(t))));
+}
+
+/* A few pixels of one layer's weights: fc / 1x1-conv matrices as a red-blue heat map, conv filters as one cell per
+ * filter (mean |w|), an attention unit as the average attention matrix. Several layers share the strip. */
+static void draw_arch_thumb(Gui *g, SDL_Rect r, const ArchGroup *q) {
+    SDL_Renderer *R = g->ren;
+    int parts = q->has_attn ? 1 : q->n_layers;
+    if (parts < 1 || r.w < 8 || r.h < 6) return;
+    if (q->has_attn) {
+        if (!g->attn_valid) return;
+        for (int k = 0; k < g->model.n_attn; ++k) {
+            const AttnViz *av = &g->model.attn[k];
+            if (av->tid != q->attn_tid) continue;
+            int T = av->tokens, side = r.h < r.w ? r.h : r.w, cells = T < side ? T : side;
+            const float *m = g->attn + av->offset;
+            float mx = 1e-9f;
+            float *avg = (float *)calloc((size_t)T * T, sizeof(float));
+            if (!avg) return;
+            for (int h = 0; h < av->heads; ++h)
+                for (int i = 0; i < T * T; ++i) avg[i] += m[(size_t)h * T * T + i] / (float)av->heads;
+            for (int i = 0; i < T * T; ++i) mx = fmaxf(mx, avg[i]);
+            for (int ci = 0; ci < cells; ++ci)
+                for (int cj = 0; cj < cells; ++cj) {
+                    SDL_Color c = attn_color(avg[(size_t)(ci * T / cells) * T + cj * T / cells] / mx);
+                    SDL_SetRenderDrawColor(R, c.r, c.g, c.b, 255);
+                    int ox = r.x + (r.w - side) / 2; /* centred in the strip */
+                    SDL_Rect cell = {ox + cj * side / cells, r.y + ci * side / cells, 0, 0};
+                    cell.w = ox + (cj + 1) * side / cells - cell.x;
+                    cell.h = r.y + (ci + 1) * side / cells - cell.y;
+                    SDL_RenderFillRect(R, &cell);
+                }
+            free(avg);
+            return;
+        }
+        return;
+    }
+    int gap = 4, pw = (r.w - gap * (parts - 1)) / parts;
+    for (int part = 0; part < parts; ++part) {
+        int layer = q->layers[part];
+        if (layer < 0 || layer >= g->model.n_viz) continue;
+        const LayerViz *lv = &g->model.layers[layer];
+        const float *d = g->weights + lv->offset;
+        SDL_Rect pr = {r.x + part * (pw + gap), r.y, pw, r.h};
+        if (lv->kind == VIZ_MATRIX) {
+            int rows = lv->count, cols = lv->cols;
+            int nx = cols < pr.w ? cols : pr.w, ny = rows < pr.h ? rows : pr.h;
+            float mx = 1e-9f;
+            for (long i = 0; i < (long)rows * cols; ++i) mx = fmaxf(mx, fabsf(d[i]));
+            for (int cy = 0; cy < ny; ++cy)
+                for (int cx = 0; cx < nx; ++cx) {
+                    SDL_Color c = diverge_color(d[(size_t)(cy * rows / ny) * cols + cx * cols / nx] / mx);
+                    SDL_SetRenderDrawColor(R, c.r, c.g, c.b, 255);
+                    SDL_Rect cell = {pr.x + cx * pr.w / nx, pr.y + cy * pr.h / ny, 0, 0};
+                    cell.w = pr.x + (cx + 1) * pr.w / nx - cell.x;
+                    cell.h = pr.y + (cy + 1) * pr.h / ny - cell.y;
+                    SDL_RenderFillRect(R, &cell);
+                }
+        } else { /* CONV_GRID: one cell per filter */
+            int count = lv->count, kk = lv->ksize * lv->ksize;
+            int nc = (int)ceilf(sqrtf((float)count * (float)pr.w / (float)pr.h));
+            if (nc < 1) nc = 1;
+            if (nc > count) nc = count;
+            int nr = (count + nc - 1) / nc;
+            float *v = (float *)malloc(sizeof(float) * (size_t)count);
+            if (!v) continue;
+            float mx = 1e-9f;
+            for (int f = 0; f < count; ++f) {
+                float sum = 0.0f;
+                for (int i = 0; i < kk; ++i) sum += fabsf(d[(size_t)f * kk + i]);
+                v[f] = sum / (float)kk;
+                mx = fmaxf(mx, v[f]);
+            }
+            for (int f = 0; f < count; ++f) {
+                SDL_Color c = attn_color(v[f] / mx);
+                SDL_SetRenderDrawColor(R, c.r, c.g, c.b, 255);
+                SDL_Rect cell = {pr.x + (f % nc) * pr.w / nc, pr.y + (f / nc) * pr.h / nr, 0, 0};
+                cell.w = pr.x + (f % nc + 1) * pr.w / nc - cell.x;
+                cell.h = pr.y + (f / nc + 1) * pr.h / nr - cell.y;
+                SDL_RenderFillRect(R, &cell);
+            }
+            free(v);
+        }
+    }
+}
+
+/* A click on a box of the model graph opens the weights window on that layer (or the attention view). */
+static void arch_click(Gui *g, SDL_Point p) {
+    if (!g->has_model || g->run_cfg.n_blocks == 0) return;
+    ArchGroup gr[ARCH_MAX_GROUPS];
+    SDL_Rect box[ARCH_MAX_GROUPS];
+    int n = build_arch(&g->run_cfg, &g->run_shapes, g->arch_expanded, g->arch_attn_open, gr), bw, bh, ty, th;
+    arch_boxes(ARCH_BOX, gr, n, ARCH_SHOW_WEIGHTS && g->weights_valid, box, &bw, &bh, &ty, &th);
+    for (int u = 0; u < MAX_BLOCKS; ++u) { /* the label of an expanded unit's frame collapses it */
+        if (!g->arch_expanded[u]) continue;
+        int kind = 0;
+        SDL_Rect fr = arch_unit_frame(gr, n, box, u, ty, th, &kind), label = {fr.x, fr.y, 100, 16};
+        if (fr.w > 0 && SDL_PointInRect(&p, &label)) {
+            g->arch_expanded[u] = 0;
+            return;
+        }
+    }
+    for (int b = 0; b < MAX_BLOCKS; ++b) { /* the label of an opened attention block's frame closes it */
+        if (!g->arch_attn_open[b]) continue;
+        SDL_Rect fr = arch_attn_frame(gr, n, box, b, ty, th), label = {fr.x, fr.y, 70, 16};
+        if (fr.w > 0 && SDL_PointInRect(&p, &label)) {
+            g->arch_attn_open[b] = 0;
+            return;
+        }
+    }
+    for (int i = 0; i < n; ++i) { /* the [+] corner of a collapsed unit expands it, of an attention box opens it */
+        SDL_Rect corner = {box[i].x + box[i].w - 30, box[i].y + box[i].h - 20, 30, 20};
+        if (gr[i].collapsed && SDL_PointInRect(&p, &corner)) {
+            g->arch_expanded[gr[i].unit_add] = 1;
+            return;
+        }
+        if (gr[i].attn_b1 && gr[i].attn_sub == 0 && SDL_PointInRect(&p, &corner)) {
+            g->arch_attn_open[gr[i].attn_b1 - 1] = 1;
+            return;
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        SDL_Rect tp = {box[i].x, ty, box[i].w, th}; /* the thumbnail strip below the box */
+        int on_thumb = th >= 24 && (gr[i].n_layers > 0 || gr[i].has_attn) && SDL_PointInRect(&p, &tp);
+        if (!SDL_PointInRect(&p, &box[i]) && !on_thumb) continue;
+        int tab = arch_group_tab(g, &gr[i]);
+        if (tab < 0) return;
+        open_weights_window(g);
+        g->weights_tab = tab;
+        if (gr[i].has_attn)
+            for (int k = 0; k < g->model.n_attn; ++k)
+                if (g->model.attn[k].tid == gr[i].attn_tid) g->attn_layer = k;
+        return;
+    }
+}
+
+static void draw_weights_flip(Gui *g, SDL_Rect box, const char *label) {
+    if (!label) return;
+    SDL_Rect b = weights_flip_button(box);
+    SDL_Point mouse = {0, 0};
+    SDL_GetMouseState(&mouse.x, &mouse.y);
+    int over = SDL_GetMouseFocus() == g->weights_win && SDL_PointInRect(&mouse, &b);
+    rrect_bordered(g->weights_ren, b, 8, over ? (SDL_Color){52, 62, 92, 255} : (SDL_Color){COL_SURFACE2}, (SDL_Color){COL_BORDER_HI});
+    int tw = 0;
+    TTF_SizeText(g->font, label, &tw, NULL);
+    wtxt(g, label, b.x + (b.w - tw) / 2, b.y + 4, (SDL_Color){COL_TEXT});
+}
+
 static void render_weights_window(Gui *g) {
     if (!g->weights_win) return;
     g->wslot = 0;
@@ -3395,29 +4245,24 @@ static void render_weights_window(Gui *g) {
         return;
     }
 
-    int n = g->model.n_viz, nt = n + (g->model.n_act > 0 ? 1 : 0); /* the last tab is the network view */
-    if (g->weights_tab >= nt) g->weights_tab = 0;
-    for (int i = 0; i < nt; ++i) {
-        SDL_Rect tab = weights_tab_rect(i, nt);
-        int active = (g->weights_tab == i);
-        rrect_bordered(g->weights_ren, tab, 8, active ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_SURFACE},
-                       active ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_BORDER});
-        SDL_Color label_col = active ? (SDL_Color){10, 14, 28, 255} : (SDL_Color){COL_TEXT_DIM};
-        const char *name = i < n ? g->model.layers[i].name : "network";
-        int tw = 0;
-        TTF_SizeText(g->font, name, &tw, NULL);
-        wtxt(g, name, tab.x + (tab.w - tw) / 2, tab.y + 13, label_col);
-    }
-    SDL_Rect content_box = {20, WEIGHTS_TAB_Y + WEIGHTS_TAB_H + 16, WEIGHTS_CONTENT_W, WEIGHTS_CONTENT_H};
-    if (g->weights_tab == n) { /* only reachable when there are fc layers */
+    if (g->weights_tab >= tabs_total(g)) g->weights_tab = 0;
+    SDL_Rect content_box = WEIGHTS_CONTENT;
+    const char *flip = weights_flip_label(g);
+    if (g->weights_tab == tab_net(g)) {
         draw_network_view(g, content_box);
+        draw_weights_flip(g, content_box, flip);
+        SDL_RenderPresent(g->weights_ren);
+        return;
+    }
+    if (g->weights_tab == tab_attn(g)) {
+        draw_attention_view(g, content_box);
         SDL_RenderPresent(g->weights_ren);
         return;
     }
 
-    const LayerViz *lv = &g->model.layers[g->weights_tab];
+    const LayerViz *lv = &g->model.layers[vis_layer(g, g->weights_tab)];
     const float *data = g->weights + lv->offset;
-    SDL_Rect grid_box = {20, WEIGHTS_TAB_Y + WEIGHTS_TAB_H + 16, WEIGHTS_CONTENT_W, WEIGHTS_CONTENT_H};
+    SDL_Rect grid_box = WEIGHTS_CONTENT;
 
     char caption[96];
     if (lv->kind == VIZ_CONV_GRID) {
@@ -3435,6 +4280,7 @@ static void render_weights_window(Gui *g) {
     }
 
     draw_3d_view(g, grid_box, lv, data, caption);
+    draw_weights_flip(g, grid_box, flip);
 
     SDL_RenderPresent(g->weights_ren);
 }
@@ -3519,8 +4365,7 @@ static void draw_chart(Gui *g, SDL_Rect r) {
 }
 
 /* Segmentation: the sample, then the true mask and the predicted mask drawn over a dimmed copy of it. */
-static void draw_segmentation_sample(Gui *g, SDL_Rect box) {
-    draw_panel(g->ren, box);
+static void draw_segmentation_sample(Gui *g, SDL_Rect box) { /* box: the content area; the panel is drawn by draw_digit */
     if (!g->digit_tex || !g->sample || !g->mask_tex[0] || !g->mask_tex[1]) return;
     int w = g->digit_w, h = g->digit_h, c = g->digit_c;
     size_t plane = (size_t)w * h;
@@ -3578,8 +4423,7 @@ static void draw_segmentation_sample(Gui *g, SDL_Rect box) {
 }
 
 /* VAE: the sample the batch showed, next to the model's reconstruction of it. */
-static void draw_reconstruction_sample(Gui *g, SDL_Rect box) {
-    draw_panel(g->ren, box);
+static void draw_reconstruction_sample(Gui *g, SDL_Rect box) { /* box: the content area; the panel is drawn by draw_digit */
     if (!g->digit_tex || !g->sample || !g->mask_tex[0]) return;
     int w = g->digit_w, h = g->digit_h, c = g->digit_c;
     size_t px = (size_t)w * h;
@@ -3611,17 +4455,16 @@ static void draw_reconstruction_sample(Gui *g, SDL_Rect box) {
 }
 
 static void draw_digit(Gui *g, SDL_Rect box) {
-    if (g->run_cfg.task == TASK_SEGMENT) {
-        draw_segmentation_sample(g, box);
-        return;
-    }
-    if (g->run_cfg.task == TASK_GENERATE) {
-        draw_reconstruction_sample(g, box);
+    draw_panel(g->ren, box);
+    if (g->run_cfg.task == TASK_SEGMENT || g->run_cfg.task == TASK_GENERATE) {
+        /* these two lay out for a 166-px-tall box (tiles of a fixed width); centre that in the taller panel */
+        SDL_Rect inner = {box.x, box.y + (box.h > 166 ? (box.h - 166) / 2 : 0), box.w, 166};
+        if (g->run_cfg.task == TASK_SEGMENT) draw_segmentation_sample(g, inner);
+        else draw_reconstruction_sample(g, inner);
         return;
     }
     const Progress *p = &g->prog;
     int correct = p->true_label == p->pred_label;
-    draw_panel(g->ren, box);
     if (!g->digit_tex || !g->sample) return;
 
     void *pixels;
@@ -3849,12 +4692,61 @@ static void draw_generations(Gui *g) {
         }
 }
 
+/* The last batch of the last epoch has been reported: nothing is left to stop. */
+static int run_finished(const Gui *g) {
+    return g->has_record && g->prog.epochs > 0 && g->prog.epoch >= g->prog.epochs - 1 && g->prog.batch >= g->prog.batch_count - 1;
+}
+
+/* The GPU strip under the loss curve: how many SMs the device has and an estimate of how many are busy / free.
+ * NVML gives a time share (a kernel was running during util% of the last sample period), not a count of SMs, so the
+ * cells are "util% of the SMs" - an estimate, which is why every figure is written with a "~". */
+static void draw_gpu_panel(Gui *g, SDL_Rect box) {
+    draw_panel(g->ren, box);
+    SDL_Color dim = {COL_TEXT_DIM}, txtc = {COL_TEXT};
+    if (!g->gpu_valid) {
+        txt(g, g->font_small, "GPU: waiting for the trainer's first reading...", box.x + 12, box.y + 8, dim);
+        return;
+    }
+    const GpuStats *s = &g->gpu;
+    int stale = SDL_GetTicks() - g->gpu_at > 3000;
+    int sms = s->sm_total > 0 ? s->sm_total : 0;
+    char line[160];
+    snprintf(line, sizeof(line), "%s   %d SMs", s->name[0] ? s->name : "GPU", sms);
+    txt(g, g->font_small, line, box.x + 12, box.y + 6, txtc);
+
+    double busy = (s->util_gpu >= 0 && sms > 0) ? (double)s->util_gpu * sms / 100.0 : -1.0;
+    if (busy >= 0 && !stale)
+        snprintf(line, sizeof(line), "SMs busy ~%.0f   free ~%.0f   (GPU util %d%%)", busy, sms - busy, s->util_gpu);
+    else
+        snprintf(line, sizeof(line), stale ? "SM load: no run in progress" : "SM load unknown");
+    txt(g, g->font_small, line, box.x + 250, box.y + 6, busy >= 0 && !stale ? (SDL_Color){COL_LOSS} : dim);
+
+    char mem[96] = "";
+    if (s->mem_total_mb > 0) snprintf(mem, sizeof(mem), "VRAM %.1f / %.1f GB", s->mem_used_mb / 1024.0, s->mem_total_mb / 1024.0);
+    if (s->temp_c >= 0) snprintf(mem + strlen(mem), sizeof(mem) - strlen(mem), "  %d C", s->temp_c);
+    if (s->power_w >= 0) snprintf(mem + strlen(mem), sizeof(mem) - strlen(mem), "  %d W", s->power_w);
+    int tw = 0;
+    TTF_SizeText(g->font_small, mem, &tw, NULL);
+    txt(g, g->font_small, mem, box.x + box.w - 12 - tw, box.y + 6, dim);
+
+    /* one cell per SM (a device with more than 64 gets a cell per few SMs) */
+    int cells = sms > 64 ? 64 : (sms > 0 ? sms : 1);
+    double per = (double)sms / cells, fill = busy >= 0 && !stale ? busy / per : 0.0;
+    int gap = 3, cw = (box.w - 24 - gap * (cells - 1)) / cells;
+    SDL_Color off = {30, 35, 50, 255}, on = {96, 140, 255, 255};
+    for (int i = 0; i < cells; ++i) {
+        double f = fill - i;
+        f = f < 0 ? 0 : (f > 1 ? 1 : f);
+        SDL_Rect c = {box.x + 12 + i * (cw + gap), box.y + 28, cw, 18};
+        fill_rrect(g->ren, c, 3, col_mix(off, on, (float)f));
+    }
+}
+
 static void draw_dashboard(Gui *g) {
     SDL_Point mouse = {g->mouse_x, g->mouse_y};
-    SDL_Rect arch_box = {20, 20, 1110, 164};
-    draw_architecture(g, arch_box, &g->run_cfg, &g->run_shapes);
+    draw_architecture(g, ARCH_BOX, &g->run_cfg, &g->run_shapes);
 
-    SDL_Rect chart_box = {20, 194, 790, 486};
+    SDL_Rect chart_box = {20, 194, 790, 420};
     if (g->has_record) {
         draw_chart(g, chart_box);
     } else {
@@ -3864,16 +4756,11 @@ static void draw_dashboard(Gui *g) {
             chart_box.x + 220, chart_box.y + 250, (SDL_Color){COL_TEXT_DIM});
     }
 
-    SDL_Rect digit_box = {830, 194, 300, 166};
+    draw_gpu_panel(g, (SDL_Rect){20, 624, 790, 56});
+
+    SDL_Rect digit_box = {830, 194, 300, 246}; /* the sample; the weights open from the model graph, so no button */
     if (g->has_record) draw_digit(g, digit_box);
     else draw_panel(g->ren, digit_box);
-
-    SDL_Rect wb = WEIGHTS_BUTTON;
-    int wb_hover = SDL_PointInRect(&mouse, &wb);
-    rrect_bordered(g->ren, wb, 12, wb_hover ? col_mix((SDL_Color){COL_SURFACE}, (SDL_Color){COL_LOSS}, 0.16f) : (SDL_Color){COL_SURFACE},
-                   wb_hover ? (SDL_Color){COL_LOSS} : (SDL_Color){COL_BORDER_HI});
-    txt(g, g->font_big, "View layer weights", wb.x + 20, wb.y + 10, (SDL_Color){COL_LOSS});
-    txt(g, g->font_small, "a live 3D weights window", wb.x + 20, wb.y + 42, (SDL_Color){COL_TEXT_DIM});
 
     SDL_Rect pb = PRED_BUTTON;
     int pb_hover = SDL_PointInRect(&mouse, &pb);
@@ -3892,7 +4779,7 @@ static void draw_dashboard(Gui *g) {
     char line[96];
     if (g->has_record) {
         const Progress *p = &g->prog;
-        snprintf(line, sizeof(line), "epoch   %d / %d", p->epoch, p->epochs);
+        snprintf(line, sizeof(line), g->stopped ? "epoch   %d / %d   stopped" : (run_finished(g) ? "epoch   %d / %d   done" : "epoch   %d / %d"), p->epoch, p->epochs);
         txt(g, g->font_big, line, info_box.x + 14, info_box.y + 12, (SDL_Color){COL_TEXT});
         snprintf(line, sizeof(line), "batch %d / %d   %.1fs", p->batch, p->batch_count, p->elapsed);
         txt(g, g->font, line, info_box.x + 14, info_box.y + 44, (SDL_Color){COL_TEXT_DIM});
@@ -3914,10 +4801,33 @@ static void draw_dashboard(Gui *g) {
         txt(g, g->font_big, "not started", info_box.x + 14, info_box.y + 12, (SDL_Color){COL_TEXT_DIM});
     }
     draw_button(g, RESTART_BUTTON, "restart", g->font, SDL_PointInRect(&mouse, &RESTART_BUTTON), !g->worker_gone);
+    int can_stop = g->run_active && !g->stopped && !g->worker_gone && !run_finished(g);
+    draw_button(g, STOP_BUTTON, g->stopped ? "stopped" : (run_finished(g) ? "done" : "stop"), g->font, SDL_PointInRect(&mouse, &STOP_BUTTON) && can_stop, can_stop);
     draw_button(g, SETTINGS_BUTTON, "settings", g->font, SDL_PointInRect(&mouse, &SETTINGS_BUTTON), 1);
+
+    if (g->arch_tip_on) {
+        draw_shadow(g->ren, g->arch_tip_r, 8);
+        rrect_bordered(g->ren, g->arch_tip_r, 8, (SDL_Color){20, 23, 32, 245}, (SDL_Color){COL_BORDER_HI});
+        draw_wrapped(g, g->font_small, g->arch_tip, g->arch_tip_r.x + 10, g->arch_tip_r.y + 7, 34, 16, 5, (SDL_Color){COL_TEXT});
+    }
 }
 
 /* -- input --------------------------------------------------------------- */
+
+/* Asks the worker to stop the run in progress. */
+static int send_stop(Gui *g) {
+    TrainCmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.magic = TRAIN_MAGIC;
+    cmd.type = TRAIN_CMD_STOP;
+    ssize_t w = write(g->cmd_fd, &cmd, sizeof(cmd));
+    if (w != (ssize_t)sizeof(cmd)) {
+        g->worker_gone = 1;
+        return -1;
+    }
+    g->stopped = 1;
+    return 0;
+}
 
 static int send_cmd(Gui *g, const TrainConfig *cfg) {
     TrainCmd cmd;
@@ -3938,6 +4848,7 @@ static int send_cmd(Gui *g, const TrainConfig *cfg) {
  * until the worker's first fresh record arrives. */
 static void begin_run(Gui *g, const TrainConfig *cfg) {
     g->run_active = 1;
+    g->stopped = 0;
     g->worker_msg[0] = '\0';
     g->has_record = 0;
     g->weights_valid = 0;
@@ -4108,9 +5019,27 @@ static void setup_click(Gui *g, SDL_Point p) {
                 return;
             }
         }
+        for (int an = 0; an < MAX_NODES; ++an) { /* a click on a unit: its box expands, its frame's label collapses it */
+            if (!g->nodes[an].used || !g->unit_kind[an]) continue;
+            if (g->unit_collapsed[an]) {
+                SDL_Rect b = unit_box(g, an);
+                if (SDL_PointInRect(&pv, &b)) {
+                    g->unit_collapsed[an] = 0;
+                    graph_arrange(g); /* its blocks were all parked under the box: lay them out again */
+                    return;
+                }
+            } else {
+                SDL_Rect fr = unit_frame(g, an), label = {fr.x, fr.y, 150, 22};
+                if (SDL_PointInRect(&pv, &label)) {
+                    g->unit_collapsed[an] = 1;
+                    graph_arrange(g);
+                    return;
+                }
+            }
+        }
         g->focus = -1;
         for (int i = MAX_NODES - 1; i >= 0; --i) { /* topmost node first */
-            if (!g->nodes[i].used) continue;
+            if (!g->nodes[i].used || node_hidden(g, i)) continue;
             int type = g->nodes[i].type;
             if (type != NODE_OUTPUT && near_port(node_out_port(g, i), pv, rad)) {
                 g->drag = DRAG_LINK;
@@ -4324,29 +5253,37 @@ static int pump_events(Gui *g) {
                 } else if (SDL_PointInRect(&p, &PRED_BUTTON)) {
                     g->screen = SCREEN_PRED;
                     g->pred_return = SCREEN_RUN;
-                } else if (SDL_PointInRect(&p, &WEIGHTS_BUTTON)) {
-                    open_weights_window(g);
+                } else if (SDL_PointInRect(&p, &ARCH_BOX)) {
+                    arch_click(g, p);
                 } else if (SDL_PointInRect(&p, &RESTART_BUTTON)) {
                     if (!g->worker_gone && send_cmd(g, &g->run_cfg) == 0) begin_run(g, &g->run_cfg);
+                } else if (SDL_PointInRect(&p, &STOP_BUTTON)) {
+                    if (g->run_active && !g->stopped && !g->worker_gone && !run_finished(g)) send_stop(g);
                 } else if (SDL_PointInRect(&p, &SETTINGS_BUTTON)) {
                     g->screen = SCREEN_SETUP;
                     SDL_StartTextInput();
                 }
             } else if (g->weights_win && e.button.windowID == SDL_GetWindowID(g->weights_win) && g->has_model) {
                 SDL_Point p = {e.button.x, e.button.y};
-                int nt = g->model.n_viz + (g->model.n_act > 0 ? 1 : 0);
-                SDL_Rect content = {20, WEIGHTS_TAB_Y + WEIGHTS_TAB_H + 16, WEIGHTS_CONTENT_W, WEIGHTS_CONTENT_H};
+                SDL_Rect content = WEIGHTS_CONTENT;
+                const char *flip = weights_flip_label(g);
+                SDL_Rect fb = weights_flip_button(content);
+                if (flip && SDL_PointInRect(&p, &fb)) {
+                    if (g->weights_tab == tab_net(g)) g->weights_tab = g->net_back_tab < vis_count(g) ? g->net_back_tab : 0;
+                    else {
+                        g->net_back_tab = g->weights_tab;
+                        g->weights_tab = tab_net(g);
+                    }
+                    break;
+                }
                 SDL_Rect nb = net_mode_button(content);
-                if (g->weights_tab == g->model.n_viz && SDL_PointInRect(&p, &nb)) {
+                if (g->weights_tab == tab_net(g) && SDL_PointInRect(&p, &nb)) {
                     g->net_mode = !g->net_mode;
                     break;
                 }
-                for (int i = 0; i < nt; ++i) {
-                    SDL_Rect tab = weights_tab_rect(i, nt);
-                    if (SDL_PointInRect(&p, &tab)) {
-                        g->weights_tab = i;
-                        break;
-                    }
+                if (g->weights_tab == tab_attn(g) && g->attn_valid && SDL_PointInRect(&p, &content)) {
+                    attn_click(g, content, p);
+                    break;
                 }
             }
             break;

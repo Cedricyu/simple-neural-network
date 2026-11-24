@@ -5,7 +5,7 @@ CC        = gcc
 # (a struct layout, say) rebuilds everything that uses it instead of silently mixing old and new objects.
 CFLAGS    = -I./module -I./optimizer -I./tool -I./test -MMD -MP
 NVCCFLAGS = -I./module -I./optimizer -I./tool -I./test -MMD
-LDFLAGS   = -lm
+LDFLAGS   = -lm -ldl
 
 # === Directories ===
 MODULE_DIR = module
