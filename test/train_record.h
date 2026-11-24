@@ -37,8 +37,10 @@
  * (including out-of-memory), so a config that can't fit must be rejected up
  * front with a readable message rather than discovered mid-run. */
 #define MAX_BLOCKS 48
-#define MAX_VIZ_LAYERS 16 /* conv + linear blocks: the layers that have weights to show */
-#define MAX_CONV_CHANNELS 64
+#define MAX_VIZ_LAYERS 24 /* conv + linear blocks: the layers that have weights to show */
+#define MAX_CONV_CHANNELS 256 /* a transformer's packed q,k,v projection is 3x the embedding width */
+#define MAX_TOKENS 1024 /* positions (h*w) of a token sequence: attention is quadratic in it */
+#define MAX_HEADS 16
 #define MAX_KERNEL 7
 #define MAX_STRIDE 4
 #define MAX_PADDING 3
@@ -67,6 +69,13 @@
 #define BLK_CONCAT 10   /* in[0] and in[1] joined along the channels: same height and width, channels add up */
 #define BLK_RESHAPE 11  /* a,b,c = channels, height, width: a flat input of exactly a*b*c values becomes a feature map */
 #define BLK_REPARAM 12  /* the VAE sampling step: a flat input of 2*Z values (mu, logvar) -> Z values; f = KL weight */
+/* Transformer blocks. A token sequence is a (D, T, 1) "image": D features per token, T tokens, so the per-token
+ * linear layers are 1x1 convs and the residual connections are adds. */
+#define BLK_LAYERNORM 13 /* normalizes every position across its channels; learned scale and shift; any shape */
+#define BLK_GELU 14      /* the smooth relu of transformers; any shape */
+#define BLK_TOKENS 15    /* (C,H,W) -> (C,H*W,1): the patches of a conv become a sequence; needs an image */
+#define BLK_POS 16       /* adds a learned (C,H,W) position embedding; needs an image */
+#define BLK_ATTENTION 17 /* a = heads: self-attention over packed q,k,v (3D channels in, D out); needs an image */
 
 #define OPT_SGD 0
 #define OPT_ADAM 1
@@ -143,6 +152,11 @@ static inline const char *train_block_type_name(int type) {
     case BLK_CONCAT: return "concat";
     case BLK_RESHAPE: return "reshape";
     case BLK_REPARAM: return "reparam";
+    case BLK_LAYERNORM: return "layernorm";
+    case BLK_GELU: return "gelu";
+    case BLK_TOKENS: return "tokens";
+    case BLK_POS: return "pos";
+    case BLK_ATTENTION: return "attention";
     default: return "?";
     }
 }
@@ -181,6 +195,24 @@ static inline int train_block_infer(int type, const int *p, LayerShape in0, cons
     switch (type) {
     case BLK_RELU:
     case BLK_BATCHNORM:
+    case BLK_LAYERNORM:
+    case BLK_GELU:
+        return 0;
+    case BLK_TOKENS:
+        if (in0.flat) INFER_FAIL("tokens needs an image to cut into a sequence, but this output is %s (flat)", sa);
+        out->h = in0.h * in0.w;
+        out->w = 1;
+        return 0;
+    case BLK_POS:
+        if (in0.flat) INFER_FAIL("pos needs a token sequence or image, but this output is %s (flat)", sa);
+        return 0;
+    case BLK_ATTENTION:
+        if (in0.flat) INFER_FAIL("attention needs a token sequence, but this output is %s (flat) - use tokens first", sa);
+        if (!p || p[0] < 1 || p[0] > MAX_HEADS) return 1;
+        if (in0.c % (3 * p[0]) != 0)
+            INFER_FAIL("attention: %d channels do not split into q, k, v of %d heads (needs a multiple of %d)", in0.c, p[0], 3 * p[0]);
+        if (in0.h * in0.w > MAX_TOKENS) INFER_FAIL("attention: %d tokens is more than the limit %d", in0.h * in0.w, MAX_TOKENS);
+        out->c = in0.c / 3;
         return 0;
     case BLK_CONV:
         if (in0.flat) INFER_FAIL("conv needs an image, but this output is %s (flat)", sa);
@@ -477,6 +509,32 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
             cur.c /= 2;
             act_floats += (double)cur.c * 3;
             break;
+        case BLK_LAYERNORM:
+        case BLK_GELU:
+            act_floats += (double)cur.c * cur.h * cur.w;
+            break;
+        case BLK_TOKENS:
+            if (cur.flat) return train_cfg_fail(err, errsz, "tokens: needs an image input", 0, 0);
+            cur.h *= cur.w;
+            cur.w = 1;
+            if (cur.h > MAX_TOKENS) return train_cfg_fail(err, errsz, "tokens: %d tokens is more than the limit %d", cur.h, MAX_TOKENS);
+            act_floats += (double)cur.c * cur.h;
+            break;
+        case BLK_POS:
+            if (cur.flat) return train_cfg_fail(err, errsz, "pos: needs a token sequence or an image", 0, 0);
+            act_floats += (double)cur.c * cur.h * cur.w;
+            break;
+        case BLK_ATTENTION: {
+            if (cur.flat) return train_cfg_fail(err, errsz, "attention: needs a token sequence (use a tokens block first)", 0, 0);
+            if (b->a < 1 || b->a > MAX_HEADS) return train_cfg_fail(err, errsz, "attention: heads must be 1-%d", MAX_HEADS, 0);
+            if (cur.c % (3 * b->a) != 0)
+                return train_cfg_fail(err, errsz, "attention: %d channels do not split into q, k, v of %d heads", cur.c, b->a);
+            int tokens = cur.h * cur.w;
+            if (tokens > MAX_TOKENS) return train_cfg_fail(err, errsz, "attention: %d tokens is more than the limit %d", tokens, MAX_TOKENS);
+            cur.c /= 3;
+            act_floats += (double)cur.c * tokens + 2.0 * b->a * tokens * tokens; /* the output and the attention maps */
+            break;
+        }
         case BLK_GAP:
             if (cur.flat) return train_cfg_fail(err, errsz, "gap: needs an image input", 0, 0);
             cur.h = cur.w = 1;

@@ -15,9 +15,10 @@
 #include "seg_loss.h"
 #include "tensorops.cuh"
 #include "test.h"
+#include "transformer.cuh"
 #include "vae.cuh"
 
-#define MAX_TMP 8
+#define MAX_TMP 16
 
 typedef struct Scratch {
     Tensor *t[MAX_TMP];
@@ -79,8 +80,9 @@ static double loss_of(Tensor *out, const float *R, float *host) {
 }
 
 /* Returns the number of leaf elements whose analytic and numeric gradients disagree. */
+static float g_eps = 1e-2f; /* the finite-difference step; a deep nonlinear block needs a smaller one */
 static int check_op(const char *name, Tensor **leaves, int n_leaves, BuildFn build, void *user) {
-    const float eps = 1e-2f;
+    const float eps = g_eps;
     Scratch s = {{0}, 0};
     Tensor *out = build(leaves, user, &s);
     if (!out) {
@@ -230,6 +232,48 @@ static void randomize_bn(BatchNorm *bn) {
     for (int i = 0; i < c; ++i) h[i] = 0.5f * frand();
     tensor_set_data(bn->beta, h);
     free(h);
+}
+
+static Tensor *build_layernorm(Tensor **leaves, void *user, Scratch *s) {
+    return keep(s, layernorm_forward((LayerNorm *)user, leaves[0]));
+}
+
+static Tensor *build_gelu(Tensor **leaves, void *user, Scratch *s) {
+    (void)user;
+    return keep(s, tensor_gelu(leaves[0]));
+}
+
+static Tensor *build_posembed(Tensor **leaves, void *user, Scratch *s) {
+    (void)user;
+    return keep(s, posembed_forward(leaves[1], leaves[0]));
+}
+
+static int g_heads = 2;
+static Tensor *build_attention(Tensor **leaves, void *user, Scratch *s) {
+    (void)user;
+    return keep(s, attention_forward(leaves[0], g_heads));
+}
+
+/* A whole transformer block on a (B, D, T, 1) sequence: x + proj(attn(qkv(ln1(x)))), then + mlp(ln2(.)) with
+ * gelu - every path a residual shares the block's input with, so the gradients of both consumers must add up. */
+typedef struct TfBlock {
+    LayerNorm *ln1, *ln2;
+    Conv2D *qkv, *proj, *fc1, *fc2;
+} TfBlock;
+
+static Tensor *build_tf_block(Tensor **leaves, void *user, Scratch *s) {
+    TfBlock *tb = (TfBlock *)user;
+    Tensor *x = leaves[0];
+    Tensor *a = keep(s, layernorm_forward(tb->ln1, x));
+    a = keep(s, conv2d_forward(tb->qkv, a));
+    a = keep(s, attention_forward(a, g_heads));
+    a = keep(s, conv2d_forward(tb->proj, a));
+    Tensor *x1 = keep(s, tensor_add(x, a));
+    Tensor *m = keep(s, layernorm_forward(tb->ln2, x1));
+    m = keep(s, conv2d_forward(tb->fc1, m));
+    m = keep(s, tensor_gelu(m));
+    m = keep(s, conv2d_forward(tb->fc2, m));
+    return keep(s, tensor_add(x1, m));
 }
 
 /* The host-side segmentation loss: analytic gradient against finite differences of the loss itself. */
@@ -470,6 +514,77 @@ void test_graph_ops(void) {
             tensor_free(x);
             conv2d_free(cv);
         }
+    }
+
+    /* transformer pieces */
+    {
+        LayerNorm *ln = layernorm_new(5);
+        float gh[5], bh[5];
+        for (int i = 0; i < 5; ++i) {
+            gh[i] = 1.0f + 0.5f * frand();
+            bh[i] = 0.5f * frand();
+        }
+        tensor_set_data(ln->gamma, gh);
+        tensor_set_data(ln->beta, bh);
+        int xs[4] = {3, 5, 2, 2};
+        Tensor *x = make_leaf(4, xs, 1.0f, 0.3f);
+        Tensor *leaves[3] = {x, ln->gamma, ln->beta};
+        failures += check_op("layernorm (B,C,H,W)", leaves, 3, build_layernorm, ln);
+        tensor_free(x);
+        int xs2[2] = {4, 5};
+        Tensor *x2 = make_leaf(2, xs2, 1.0f, -0.2f);
+        Tensor *leaves2[3] = {x2, ln->gamma, ln->beta};
+        failures += check_op("layernorm (B,F)", leaves2, 3, build_layernorm, ln);
+        tensor_free(x2);
+        layernorm_free(ln);
+    }
+    {
+        int xs[4] = {2, 3, 2, 2};
+        Tensor *x = make_leaf(4, xs, 1.5f, 0.0f);
+        Tensor *leaves[1] = {x};
+        failures += check_op("gelu", leaves, 1, build_gelu, NULL);
+        tensor_free(x);
+    }
+    {
+        int xs[4] = {3, 2, 3, 1};
+        Tensor *x = make_leaf(4, xs, 1.0f, 0.0f);
+        Tensor *pos = make_leaf(3, (int[3]){2, 3, 1}, 1.0f, 0.0f);
+        Tensor *leaves[2] = {x, pos};
+        failures += check_op("position embedding", leaves, 2, build_posembed, NULL);
+        tensor_free(x);
+        tensor_free(pos);
+    }
+    {
+        static const int cfgs[4][4] = {{2, 12, 3, 1}, {1, 12, 4, 1}, {3, 18, 2, 2}, {2, 6, 5, 1}}; /* heads, channels, h, w */
+        static const char *names[4] = {"attention, 2 heads, 3 tokens", "attention, 1 head, 4 tokens",
+                                       "attention, 3 heads, 2x2 tokens", "attention, 2 heads of 1 channel"};
+        for (int t = 0; t < 4; ++t) {
+            g_heads = cfgs[t][0];
+            int xs[4] = {2, cfgs[t][1], cfgs[t][2], cfgs[t][3]};
+            Tensor *x = make_leaf(4, xs, 1.0f, 0.0f);
+            Tensor *leaves[1] = {x};
+            failures += check_op(names[t], leaves, 1, build_attention, NULL);
+            tensor_free(x);
+        }
+    }
+    {
+        enum { D = 4, T = 5 };
+        g_heads = 2;
+        TfBlock tb = {layernorm_new(D), layernorm_new(D), conv2d_new(D, 3 * D, 1, 1, 0, 1), conv2d_new(D, D, 1, 1, 0, 1),
+                      conv2d_new(D, 2 * D, 1, 1, 0, 1), conv2d_new(2 * D, D, 1, 1, 0, 1)};
+        int xs[4] = {3, D, T, 1};
+        Tensor *x = make_leaf(4, xs, 1.0f, 0.0f);
+        Tensor *leaves[5] = {x, tb.qkv->weight, tb.proj->weight, tb.fc1->weight, tb.ln1->gamma};
+        g_eps = 1e-3f;
+        failures += check_op("transformer block (ln, attn, mlp)", leaves, 5, build_tf_block, &tb);
+        g_eps = 1e-2f;
+        tensor_free(x);
+        layernorm_free(tb.ln1);
+        layernorm_free(tb.ln2);
+        conv2d_free(tb.qkv);
+        conv2d_free(tb.proj);
+        conv2d_free(tb.fc1);
+        conv2d_free(tb.fc2);
     }
 
     failures += check_seg_loss();

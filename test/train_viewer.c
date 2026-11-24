@@ -60,9 +60,9 @@ static const SDL_Rect BTN_BLOCKS = {418, 28, 96, 30};   /* opens the block menu 
 #define PROBLEM_CLASSIFY 0 /* one class per image */
 #define PROBLEM_SEGMENT 1  /* one class per pixel: needs a dataset with masks */
 #define PROBLEM_GENERATE 2 /* a VAE: reconstruct and generate images; needs no labels */
-#define NUM_PRESETS 6      /* ids: 0 cnn, 1 resnet, 4 mlp (classification) | 2 unet (segmentation) | 3 vae (generation) | 5 empty (all) */
+#define NUM_PRESETS 7      /* ids: 0 cnn, 1 resnet, 4 mlp, 6 vit (classification) | 2 unet (segmentation) | 3 vae (generation) | 5 empty (all) */
 #define PRESET_EMPTY 5
-static const char *PRESET_NAMES[NUM_PRESETS] = {"cnn", "resnet", "unet", "vae", "mlp", "empty"};
+static const char *PRESET_NAMES[NUM_PRESETS] = {"cnn", "resnet", "unet", "vae", "mlp", "empty", "vit"};
 static const SDL_Rect PROBLEM_BTN[3] = {{36, 21, 107, 31}, {149, 21, 107, 31}, {262, 21, 104, 31}};
 static SDL_Rect preset_rect(int i) {
     SDL_Rect r = {BTN_PRESETS.x - 54, BTN_PRESETS.y + BTN_PRESETS.h + 4 + i * 30, BTN_PRESETS.w + 54, 28};
@@ -70,7 +70,8 @@ static SDL_Rect preset_rect(int i) {
 }
 /* Blocks offered per problem: the VAE's view / vae blocks make no sense for classification, and a generator
  * has no use for global average pooling. */
-static const int PALETTE_CLS[8] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP};
+static const int PALETTE_CLS[13] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP,
+                                    BLK_LAYERNORM, BLK_GELU, BLK_TOKENS, BLK_POS, BLK_ATTENTION};
 static const int PALETTE_SEG[7] = {BLK_CONV, BLK_RELU, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT};
 static const int PALETTE_GEN[11] = {BLK_CONV,    BLK_RELU,   BLK_FLATTEN,  BLK_LINEAR,   BLK_ADD,     BLK_BATCHNORM,
                                     BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT, BLK_RESHAPE, BLK_REPARAM};
@@ -120,7 +121,7 @@ enum { F_DATASET, F_EPOCHS, F_BATCH, F_LR, F_OPT, F_MOMENTUM, F_NORMALIZE, F_AUG
 #define F_NODE(i, j) (NUM_GENERAL_FIELDS + (i)*4 + (j))
 #define NUM_FIELDS (NUM_GENERAL_FIELDS + MAX_NODES * 4)
 #define NODE_INPUT 0
-#define NODE_OUTPUT 15 /* node types are the BLK_* values plus these two */
+#define NODE_OUTPUT 100 /* node types are the BLK_* values plus these two */
 #define NODE_W 112
 #define NODE_GAP 24 /* horizontal space left between auto-placed nodes */
 #define DRAG_NONE 0
@@ -268,15 +269,16 @@ static SDL_Rect view_rect(const Gui *g) {
     return r;
 }
 
-static int palette_count(const Gui *g) { return g->problem == PROBLEM_GENERATE ? 11 : (g->problem == PROBLEM_SEGMENT ? 7 : 8); }
+static int palette_count(const Gui *g) { return g->problem == PROBLEM_GENERATE ? 11 : (g->problem == PROBLEM_SEGMENT ? 7 : 13); }
 static int palette_type(const Gui *g, int i) {
     return g->problem == PROBLEM_GENERATE ? PALETTE_GEN[i] : (g->problem == PROBLEM_SEGMENT ? PALETTE_SEG[i] : PALETTE_CLS[i]);
 }
 /* The problem's own presets, then "empty" last. */
-static int preset_count(const Gui *g) { return (g->problem == PROBLEM_CLASSIFY ? 3 : 1) + 1; }
+static int preset_count(const Gui *g) { return (g->problem == PROBLEM_CLASSIFY ? 4 : 1) + 1; }
 static int preset_at(const Gui *g, int i) {
     if (i == preset_count(g) - 1) return PRESET_EMPTY;
-    return g->problem == PROBLEM_CLASSIFY ? (i == 2 ? 4 : i) : (g->problem == PROBLEM_SEGMENT ? 2 : 3);
+    if (g->problem == PROBLEM_CLASSIFY) return i == 2 ? 4 : (i == 3 ? 6 : i); /* cnn, resnet, mlp, vit */
+    return g->problem == PROBLEM_SEGMENT ? 2 : 3;
 }
 
 /* Segmentation needs masks, so only datasets that have them are offered under that problem. */
@@ -699,6 +701,7 @@ static int node_height(int type) {
     case BLK_CONCAT: return 62;
     case BLK_RESHAPE: return 84;
     case BLK_REPARAM: return 72;
+    case BLK_ATTENTION: return 72;
     default: return 46;
     }
 }
@@ -711,6 +714,7 @@ static int node_nparams(int type) {
     case BLK_UPSAMPLE: return 1;
     case BLK_RESHAPE: return 3;
     case BLK_REPARAM: return 1;
+    case BLK_ATTENTION: return 1;
     default: return 0;
     }
 }
@@ -732,6 +736,11 @@ static const char *node_type_title(int type) {
     case BLK_CONCAT: return "concat";
     case BLK_RESHAPE: return "reshape";
     case BLK_REPARAM: return "reparam";
+    case BLK_LAYERNORM: return "ln";
+    case BLK_GELU: return "gelu";
+    case BLK_TOKENS: return "tokens";
+    case BLK_POS: return "pos";
+    case BLK_ATTENTION: return "attn";
     default: return "fc";
     }
 }
@@ -750,6 +759,11 @@ static SDL_Color node_accent(int type) {
     case BLK_CONCAT: return (SDL_Color){190, 120, 240, 255};
     case BLK_RESHAPE: return (SDL_Color){140, 170, 255, 255};
     case BLK_REPARAM: return (SDL_Color){240, 236, 160, 255};
+    case BLK_LAYERNORM: return (SDL_Color){72, 200, 176, 255};
+    case BLK_GELU: return (SDL_Color){120, 200, 110, 255};
+    case BLK_TOKENS: return (SDL_Color){120, 150, 235, 255};
+    case BLK_POS: return (SDL_Color){206, 170, 120, 255};
+    case BLK_ATTENTION: return (SDL_Color){244, 118, 118, 255};
     default: return (SDL_Color){150, 156, 168, 255};
     }
 }
@@ -837,6 +851,7 @@ static void node_set_defaults(Gui *g, int i) {
         field_set(g, F_NODE(i, 1), "7", FK_INT);
         field_set(g, F_NODE(i, 2), "7", FK_INT);
     } else if (t == BLK_REPARAM) field_set(g, F_NODE(i, 0), "1", FK_FLOAT);
+    else if (t == BLK_ATTENTION) field_set(g, F_NODE(i, 0), "4", FK_INT);
 }
 
 static int graph_add(Gui *g, int type, int x, int y) {
@@ -1178,6 +1193,44 @@ static void graph_preset_mlp(Gui *g) {
     graph_finish(g, x);
 }
 
+/* A small vision transformer: a strided conv cuts the image into patches (4x4, then 2x2 merges while there are more
+ * than 100 of them), tokens turns the patch grid into a sequence, a learned position embedding is added, and two
+ * pre-norm blocks follow - layernorm, packed q,k,v projection, 4-head attention, output projection, residual add;
+ * layernorm, an expanding 1x1 conv, gelu, a 1x1 conv back, residual add - then layernorm, global average
+ * pooling over the tokens and the classifier. The 1x1 convs are the per-token linear layers. */
+static void graph_preset_vit(Gui *g) {
+    graph_clear(g);
+    const DatasetInfo *d = form_dataset(g);
+    int h = d ? d->rows : 28, w = d ? d->cols : 28, dim = 32, heads = 4, depth = 2, mlp = 64;
+    int x = graph_add(g, NODE_INPUT, 0, 0);
+    x = gadd(g, BLK_CONV, dim, 4, 4, 0, x, -1);
+    h /= 4;
+    w /= 4;
+    while (h * w > 100 && h >= 2 && w >= 2) {
+        x = gadd(g, BLK_CONV, dim, 2, 2, 0, x, -1);
+        h /= 2;
+        w /= 2;
+    }
+    x = gadd(g, BLK_TOKENS, 0, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_POS, 0, 0, 0, 0, x, -1);
+    for (int k = 0; k < depth; ++k) {
+        int a = gadd(g, BLK_LAYERNORM, 0, 0, 0, 0, x, -1);
+        a = gadd(g, BLK_CONV, 3 * dim, 1, 1, 0, a, -1);
+        a = gadd(g, BLK_ATTENTION, heads, 0, 0, 0, a, -1);
+        a = gadd(g, BLK_CONV, dim, 1, 1, 0, a, -1);
+        x = gadd(g, BLK_ADD, 0, 0, 0, 0, x, a);
+        int m = gadd(g, BLK_LAYERNORM, 0, 0, 0, 0, x, -1);
+        m = gadd(g, BLK_CONV, mlp, 1, 1, 0, m, -1);
+        m = gadd(g, BLK_GELU, 0, 0, 0, 0, m, -1);
+        m = gadd(g, BLK_CONV, dim, 1, 1, 0, m, -1);
+        x = gadd(g, BLK_ADD, 0, 0, 0, 0, x, m);
+    }
+    x = gadd(g, BLK_LAYERNORM, 0, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_GAP, 0, 0, 0, 0, x, -1);
+    x = gadd(g, BLK_LINEAR, 10, 0, 0, 0, x, -1);
+    graph_finish(g, x);
+}
+
 /* A convolutional VAE sized to the selected dataset: stride-2 convs halve the image until the feature map is at
  * most 11 pixels across (28 -> 7, 64 -> 8, 128 -> 8; h and w should be multiples of 2^levels), an fc to the
  * 2*16 means / log-variances, the sampling block, an fc back up to a 32-channel map, and the same number of
@@ -1323,7 +1376,7 @@ static void form_layout(Gui *g) {
             g->fields[F_NODE(i, 2)].rect = (SDL_Rect){r.x + 74, r.y + 42, 30, 20};
         } else if (g->nodes[i].type == BLK_REPARAM) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 56, r.y + 28, 48, 20};
-        } else if (g->nodes[i].type == BLK_UPSAMPLE) {
+        } else if (g->nodes[i].type == BLK_UPSAMPLE || g->nodes[i].type == BLK_ATTENTION) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 60, r.y + 28, 34, 20};
         } else if (g->nodes[i].type == BLK_MAXPOOL) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 22, r.y + 28, 28, 20};
@@ -1504,7 +1557,7 @@ static int graph_compile(Gui *g) {
     static const char *conv_cols[4] = {"out channels", "kernel", "stride", "padding"};
     static const char *pool_cols[2] = {"window", "stride"};
     int id_of_node[MAX_NODES];
-    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0;
+    int n_conv = 0, n_lin = 0, n_bn = 0, n_add = 0, n_pool = 0, n_up = 0, n_cat = 0, n_ln = 0, n_attn = 0;
     for (int k = 0; k < n_order; ++k) {
         int node = order[k], type = g->nodes[node].type;
         if (type == NODE_INPUT) {
@@ -1531,6 +1584,8 @@ static int graph_compile(Gui *g) {
         else if (type == BLK_MAXPOOL) snprintf(nm, nsz, "pool%d", ++n_pool);
         else if (type == BLK_UPSAMPLE) snprintf(nm, nsz, "up%d", ++n_up);
         else if (type == BLK_CONCAT) snprintf(nm, nsz, "cat%d", ++n_cat);
+        else if (type == BLK_LAYERNORM) snprintf(nm, nsz, "ln%d", ++n_ln);
+        else if (type == BLK_ATTENTION) snprintf(nm, nsz, "attn%d", ++n_attn);
         if (type == BLK_REPARAM) {
             char *end;
             const char *t = g->fields[F_NODE(node, 0)].text;
@@ -1546,7 +1601,7 @@ static int graph_compile(Gui *g) {
         for (int j = 0; j < node_nparams(type) && type != BLK_REPARAM; ++j) {
             if (parse_int(&g->fields[F_NODE(node, j)], dst[j])) {
                 char what[48];
-                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : (type == BLK_UPSAMPLE ? "factor" : (type == BLK_RESHAPE ? (j == 0 ? "channels" : (j == 1 ? "height" : "width")) : "out features")));
+                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : (type == BLK_UPSAMPLE ? "factor" : (type == BLK_ATTENTION ? "heads" : type == BLK_RESHAPE ? (j == 0 ? "channels" : (j == 1 ? "height" : "width")) : "out features")));
                 snprintf(what, sizeof(what), "%s %s", nm, col);
                 g->form_err_node = node;
                 return form_fail(g, F_NODE(node, j), what);
@@ -1648,7 +1703,8 @@ static long count_parameters(const TrainConfig *c, const NetShapes *s) {
         LayerShape in = train_block_input(s, b);
         if (b->type == BLK_CONV) total += (long)b->a * in.c * b->b * b->b + b->a;
         else if (b->type == BLK_LINEAR) total += (long)in.c * b->a + b->a;
-        else if (b->type == BLK_BATCHNORM) total += 2L * in.c; /* scale + shift */
+        else if (b->type == BLK_BATCHNORM || b->type == BLK_LAYERNORM) total += 2L * in.c; /* scale + shift */
+        else if (b->type == BLK_POS) total += (long)in.c * in.h * in.w;
     }
     return total;
 }
@@ -1905,6 +1961,8 @@ static void draw_node(Gui *g, int i, SDL_Point mouse) {
         txt(g, g->font_small, "s", r.x + 58, r.y + 31, dim);
     } else if (n->type == BLK_UPSAMPLE) {
         txt(g, g->font_small, "factor", r.x + 8, r.y + 31, dim);
+    } else if (n->type == BLK_ATTENTION) {
+        txt(g, g->font_small, "heads", r.x + 8, r.y + 31, dim);
     } else if (n->type == BLK_RESHAPE) {
         txt(g, g->font_small, "channels  h   w", r.x + 8, r.y + 27, dim);
     } else if (n->type == BLK_REPARAM) {
@@ -1982,10 +2040,10 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
     for (int i = 0; i < nb; ++i) {
         const Block *k = &c->blocks[i];
         int in0 = k->in[0];
-        if ((k->type == BLK_RELU || k->type == BLK_BATCHNORM) && in0 > 0 && uses[in0] == 1 &&
+        if ((k->type == BLK_RELU || k->type == BLK_BATCHNORM || k->type == BLK_GELU) && in0 > 0 && uses[in0] == 1 &&
             out_id[gid_of_id[in0]] == in0) {
             int gi = gid_of_id[in0];
-            arch_append(gr[gi].fold, sizeof(gr[gi].fold), k->type == BLK_RELU ? "+relu" : "+bn");
+            arch_append(gr[gi].fold, sizeof(gr[gi].fold), k->type == BLK_RELU ? "+relu" : (k->type == BLK_GELU ? "+gelu" : "+bn"));
             out_id[gi] = i + 1;
             gid_of_id[i + 1] = gi;
             continue;
@@ -2017,6 +2075,11 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, ArchGroup *gr) {
         case BLK_MAXPOOL:
             snprintf(q->name, sizeof(q->name), "pool%d", ++n_pool);
             snprintf(q->params, sizeof(q->params), "%dx%d s%d", k->a, k->a, k->b);
+            break;
+        case BLK_LAYERNORM: snprintf(q->name, sizeof(q->name), "ln"); break;
+        case BLK_ATTENTION:
+            snprintf(q->name, sizeof(q->name), "attn");
+            snprintf(q->params, sizeof(q->params), "%d heads", k->a);
             break;
         default: snprintf(q->name, sizeof(q->name), "%s", train_block_type_name(k->type)); break;
         }
@@ -2163,6 +2226,11 @@ static const char *palette_label(int type) {
     case BLK_UPSAMPLE: return "up";
     case BLK_CONCAT: return "cat";
     case BLK_RESHAPE: return "view";
+    case BLK_LAYERNORM: return "ln";
+    case BLK_GELU: return "gelu";
+    case BLK_TOKENS: return "tokens";
+    case BLK_POS: return "pos";
+    case BLK_ATTENTION: return "attn";
     default: return "vae";
     }
 }
@@ -2407,7 +2475,7 @@ static void draw_graph(Gui *g) {
         SDL_Rect bg = {BTN_PRESETS.x - 58, BTN_PRESETS.y + BTN_PRESETS.h + 1, BTN_PRESETS.w + 62, preset_count(g) * 30 + 8};
         draw_shadow(g->ren, bg, 9);
         rrect_bordered(g->ren, bg, 9, (SDL_Color){COL_SURFACE2}, (SDL_Color){COL_LOSS});
-        static const char *hint[NUM_PRESETS] = {"4 conv + fc", "residual", "per-pixel masks", "generative", "fc layers only", "blank canvas"};
+        static const char *hint[NUM_PRESETS] = {"4 conv + fc", "residual", "per-pixel masks", "generative", "fc layers only", "blank canvas", "transformer"};
         for (int i = 0; i < preset_count(g); ++i) {
             SDL_Rect r = preset_rect(i);
             int id = preset_at(g, i);
@@ -3939,6 +4007,11 @@ static void load_preset(Gui *g, int i) {
     else if (i == 1) graph_preset_resnet(g);
     else if (i == 2) graph_preset_unet(g);
     else if (i == 4) graph_preset_mlp(g);
+    else if (i == 6) {
+        graph_preset_vit(g);
+        field_set(g, F_OPT, "1", FK_INT); /* transformers train with Adam */
+        field_set(g, F_LR, "0.001", FK_FLOAT);
+    }
     else graph_preset_vae(g);
 }
 

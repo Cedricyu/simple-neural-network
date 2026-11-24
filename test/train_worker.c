@@ -37,6 +37,7 @@
 #include "tensor.cuh"
 #include "tensorops.cuh"
 #include "train_record.h"
+#include "transformer.cuh"
 #include "vae.cuh"
 
 /* fc weights up to this many floats are streamed in full; bigger ones are
@@ -54,6 +55,8 @@ typedef struct Net {
     Conv2D *conv[MAX_BLOCKS];
     Linear *lin[MAX_BLOCKS];
     BatchNorm *bn[MAX_BLOCKS];
+    LayerNorm *ln[MAX_BLOCKS];
+    Tensor *pos[MAX_BLOCKS]; /* position embeddings (learned parameters) */
     int rep_block; /* index of the VAE sampling block, or -1 */
 } Net;
 
@@ -107,7 +110,8 @@ static void net_init(Net *n, const TrainConfig *c, const NetShapes *s) {
         else if (b->type == BLK_BATCHNORM) {
             n->bn[i] = batchnorm_new(in.c);
             n->has_bn = 1;
-        }
+        } else if (b->type == BLK_LAYERNORM) n->ln[i] = layernorm_new(in.c);
+        else if (b->type == BLK_POS) n->pos[i] = posembed_new(in.c, in.h, in.w);
     }
 }
 
@@ -116,6 +120,8 @@ static void net_free(Net *n) {
         if (n->conv[i]) conv2d_free(n->conv[i]);
         if (n->lin[i]) linear_free(n->lin[i]);
         if (n->bn[i]) batchnorm_free(n->bn[i]);
+        if (n->ln[i]) layernorm_free(n->ln[i]);
+        if (n->pos[i]) tensor_free(n->pos[i]);
     }
 }
 
@@ -160,6 +166,11 @@ static void net_forward_ex(Net *n, Tensor *x, ForwardCache *c, int training, Ten
         case BLK_UPSAMPLE: out = upsample_nearest_forward(in, b->a); break;
         case BLK_CONCAT: out = tensor_concat_channels(in, val[b->in[1]]); break;
         case BLK_RESHAPE: out = tensor_reshape4(in, b->a, b->b, b->c); break;
+        case BLK_LAYERNORM: out = layernorm_forward(n->ln[i], in); break;
+        case BLK_GELU: out = tensor_gelu(in); break;
+        case BLK_TOKENS: out = tensor_reshape4(in, in->shape[1], in->shape[2] * in->shape[3], 1); break;
+        case BLK_POS: out = posembed_forward(n->pos[i], in); break;
+        case BLK_ATTENTION: out = attention_forward(in, b->a); break;
         case BLK_REPARAM: {
             int B = in->shape[0], Z = in->shape[1] / 2;
             float *e = (float *)calloc((size_t)B * Z, sizeof(float));
@@ -199,6 +210,11 @@ static void net_zero_grad(Net *n) {
             tensor_zero_grad(n->bn[i]->gamma);
             tensor_zero_grad(n->bn[i]->beta);
         }
+        if (n->ln[i]) {
+            tensor_zero_grad(n->ln[i]->gamma);
+            tensor_zero_grad(n->ln[i]->beta);
+        }
+        if (n->pos[i]) tensor_zero_grad(n->pos[i]);
     }
 }
 
@@ -222,6 +238,11 @@ static void net_update(Net *n, const TrainConfig *cfg, int step) {
             update_param(n->bn[i]->gamma, cfg, step);
             update_param(n->bn[i]->beta, cfg, step);
         }
+        if (n->ln[i]) {
+            update_param(n->ln[i]->gamma, cfg, step);
+            update_param(n->ln[i]->beta, cfg, step);
+        }
+        if (n->pos[i]) update_param(n->pos[i], cfg, step);
     }
 }
 
@@ -278,7 +299,21 @@ static void build_model_info(const TrainConfig *c, const NetShapes *s, ModelInfo
     for (int i = 0; i < c->n_blocks; ++i) {
         const Block *b = &c->blocks[i];
         LayerShape in = train_block_input(s, b);
-        if (b->type == BLK_CONV) {
+        if (b->type == BLK_CONV && b->b == 1 && in.c > 1) {
+            /* a 1x1 conv is a per-position linear layer (a transformer's q,k,v / mlp projections): show it as the
+             * (in x out) matrix an fc layer would have */
+            LayerViz *lv = &info->layers[v++];
+            lv->kind = VIZ_MATRIX;
+            lv->in_dim = in.c;
+            lv->out_dim = b->a;
+            lv->pool = effective_pool(lv->in_dim, lv->out_dim, c->fc_pool);
+            lv->count = lv->in_dim / lv->pool;
+            lv->cols = lv->out_dim;
+            lv->full_detail = (lv->pool == 1);
+            lv->offset = offset;
+            snprintf(lv->name, sizeof(lv->name), "conv%d", ++n_conv);
+            offset += lv->count * lv->cols;
+        } else if (b->type == BLK_CONV) {
             LayerViz *lv = &info->layers[v++];
             lv->kind = VIZ_CONV_GRID;
             lv->count = b->a;
@@ -338,7 +373,16 @@ static void gather_viz(const Net *n, const ModelInfo *info, float *out, float *s
         if (n->conv[i]) {
             const LayerViz *lv = &info->layers[v++];
             const Conv2D *cv = n->conv[i];
-            if (lv->full_detail) {
+            if (lv->kind == VIZ_MATRIX) { /* 1x1 conv: weight is (out, in); the view wants (in, out) */
+                int ind = lv->in_dim, outd = lv->out_dim;
+                float *t = (float *)malloc(sizeof(float) * (size_t)ind * outd);
+                tensor_to_host(conv2d_tensor(n->conv[i]), scratch);
+                for (int o = 0; o < outd; ++o)
+                    for (int k = 0; k < ind; ++k) t[(size_t)k * outd + o] = scratch[(size_t)o * ind + k];
+                if (lv->full_detail) memcpy(out + lv->offset, t, sizeof(float) * (size_t)ind * outd);
+                else reduce_fc_viz(t, ind, outd, lv->pool, out + lv->offset);
+                free(t);
+            } else if (lv->full_detail) {
                 tensor_to_host(conv2d_tensor(n->conv[i]), out + lv->offset);
             } else {
                 tensor_to_host(conv2d_tensor(n->conv[i]), scratch);
