@@ -1,8 +1,8 @@
 # tinyDL
 
 A small deep-learning framework written in plain C + CUDA (no C++/STL in the framework itself):
-reverse-mode autograd, Linear / Conv2D / BatchNorm / pooling / upsampling / residual add / channel concat,
-SGD with momentum, classification, segmentation and a VAE, and a live SDL2 GUI where you build a model by
+reverse-mode autograd, Linear / Conv2D / BatchNorm / LayerNorm / attention / pooling / upsampling / residual add / channel concat,
+SGD with momentum and Adam, classification (CNNs, ResNets, a small vision transformer), segmentation and a VAE, and a live SDL2 GUI where you build a model by
 wiring blocks together (a CNN, a ResNet, a U-Net, a VAE), train it, and watch the loss, the predictions /
 generated images and the weights while it runs.
 
@@ -15,21 +15,11 @@ enough to read in an afternoon.
 
 ```bash
 sudo apt install -y libsdl2-dev libsdl2-ttf-dev      # GUI only
-# download a dataset (see "Datasets" below), e.g. Fashion-MNIST, then:
-make train_gui
-```
-
-The GUI opens in a 1150x700 window; press `F11` to switch to fullscreen (the whole picture is scaled to fit your
-screen, keeping its proportions) and back, or start fullscreen with `./train_viewer --fullscreen`.
-
-Requirements: an NVIDIA GPU, the CUDA Toolkit (`nvcc` on `PATH`) and `gcc`. If `nvcc --version` is
-newer than the CUDA version `nvidia-smi` reports (common on WSL2), build with a matching toolkit:
-`make NVCC=/usr/local/cuda-12.9/bin/nvcc`.
 
 ## Layout
 
 ```plaintext
-module/   tensor + autograd, ops (matmul, relu, flatten, add, concat, reshape), Linear, Conv2D, BatchNorm, pooling, upsample, VAE sampling, CUDA kernels
+module/   tensor + autograd, ops (matmul, relu, flatten, add, concat, reshape), Linear, Conv2D, BatchNorm, pooling, upsample, VAE sampling, CUDA kernels; transformer.cu: layer norm, gelu, position embedding, patchify, grayscale, attention
 test/     tests, plus the GUI: train_worker.c (CUDA trainer), train_viewer.c (SDL2), train_record.h (shared config)
 tool/     dataset converters (NEU-CLS, CIFAR-10, brain MRI), GPU info
 ```
@@ -51,289 +41,17 @@ make test        # builds test_main and runs it
 - **`test_mnist`** — a 4-layer strided ConvNet on MNIST, ~97% test accuracy in 3 epochs. Skipped with a
   message if `data/mnist/` is missing.
 
-## Live training GUI
+## Documentation
 
-`make train_gui` opens the **settings screen**. The first choice, at the top left, is the **problem**, always
-yours to make:
-
-| problem | what the model predicts | dataset | presets | dashboard |
-|---|---|---|---|---|
-| **Classification** | one class per image | any (a dataset's labels) | `cnn`, `resnet`, `mlp`, `vit` | loss, accuracy, test accuracy |
-| **Segmentation** | one class per pixel | one with masks | `unet` | scan / true mask / predicted mask, Dice and IoU |
-| **Generation** | new images (a VAE) | any (no labels used) | `vae` | input / reconstruction, generations page |
-
-Everything below follows from it: the task the trainer runs, the datasets the dropdown offers (Segmentation lists
-only datasets with masks), the blocks on offer, the presets, and the default training settings (switching
-problem clears the model, since another problem's model would not fit; a preset or your own graph is yours to pick).
-Below the problem selector are the training parameters, and on the right a **node editor** for the model. Everything is validated continuously: every block shows the shape it outputs,
-the parameter count updates live, and anything that can't run (shape mismatch, a model that doesn't end
-in one output per class, a batch that won't fit in GPU memory, ...) is shown in red with the offending
-block outlined, instead of reaching the GPU. Start switches to the live dashboard; **restart** re-runs,
-**settings** goes back to the form.
-
-| field | meaning |
+| page | what is in it |
 |---|---|
-| problem | Classification, Segmentation or Generation (see above); switching clears the model and loads that problem's training settings |
-| dataset | folders under `data/`; image size, channels and class count are read from the files, and picking one loads its suggested settings |
-| epochs, batch size, learning rate, seed | the loss is the mean over the batch, so SGD learning rates are the usual ones (0.01-0.1; the default is 0.01) |
-| optimizer | 0 = SGD with momentum, 1 = Adam (betas 0.9 / 0.999) |
-| momentum | SGD momentum, 0 = plain SGD (ignored by Adam) |
-| normalize | 1 = standardize pixels per channel |
-| augment | 0 = none, 1 = random horizontal + vertical flips, 2 = horizontal flip + shift by up to 4 px |
-| fc viz pool, weights every N | weights viewer only |
-
-### Model editor
-
-The model is a graph: a node reads the output of whatever its input dot is wired to, and one output
-can feed several nodes, so branches and skip connections work.
-
-| block | parameters | needs |
-|---|---|---|
-| conv | out channels 1-64, kernel 1-7, stride 1-4, padding 0-3 | an image |
-| relu | | anything |
-| bn | learned scale and shift per channel; batch size >= 2 | anything |
-| pool | max pool, window 1-4, stride 1-4 | an image |
-| gap | global average pool, gives C values (already flat) | an image |
-| up | nearest-neighbour upsample, factor 1-4 | an image |
-| add | two inputs, summed | two tensors of the same shape |
-| cat | two inputs joined along the channels | two images of the same height and width |
-| flatten | (C,H,W) to C*H*W values | an image |
-| fc | out features 1-4096; on a token sequence it is applied to every token | a flat input, or a token sequence |
-| view | reshape a flat vector into a (channels, height, width) map | a flat input of exactly c*h*w values |
-| ln | layer norm: every position is normalized across its channels; learned scale and shift | anything |
-| gelu | | anything |
-| patch | cuts the image into non-overlapping patches (size 1-32) and projects each to `width` values: a token sequence (width, H/size * W/size, 1) | an image whose sides are multiples of the size |
-| tokens | (C,H,W) to a sequence of H*W tokens, shape (C,H*W,1) | an image |
-| pos | learned position embedding, one value per position and channel | an image / token sequence |
-| attn | multi-head self-attention with its own q,k,v and output projections (they are not convolutions and are not drawn); parameter = heads; D channels in and out | a token sequence, channels a multiple of heads |
-| vae | the VAE sampling step: 2*Z values (mean, log-variance) in, Z values out; parameter = KL weight | a flat input; at most one per model |
-
-The graph must end in one value per class (classification: an fc block), in a map with one channel per class at
-the full image size (segmentation dataset: a 1x1 conv), or, if it contains a `vae` block, in an image the size
-of the input. Limits are 48 blocks and 16 conv + fc layers.
-
-- **Build** — the editor starts empty (just `input` and `output`). Open the `blocks` menu (top left) and click a block to
-  drop it on the canvas, or drag it where you want it. Blocks arrive unwired - pull the wires yourself; or drag it onto the canvas. Drag from an output dot
-  to an input dot to wire; grab a wired input dot to move its wire; `x` deletes a block and re-joins its
-  neighbours; `arrange` lays the nodes out in evaluation order and zooms to fit them all.
-- **Zoom and pan** — scroll to zoom around the cursor (35%-200%), drag the background to pan, shift + scroll to pan
-  sideways; the bar at the canvas's bottom right has `-` / `+` and `fit` (show every node). A big graph such as the
-  U-Net is shown whole after `arrange` or loading a preset, and you zoom in to edit a block.
-- **Presets** (the menu next to `arrange`; nothing is loaded until you pick one, `empty` clears the canvas) —
-  Classification: `cnn` (4 conv + fc), `resnet`
-  (stem, an identity residual block, a stride-2 block with a 1x1-conv shortcut, global average pool, fc) and `mlp`
-  (flatten and three fc layers) and `vit` (a small vision transformer, below);
-  Segmentation: `unet` (two downsampling levels, nearest upsampling + concat skips, 1x1 conv head); Generation:
-  `vae` (below). The `blocks` menu follows the problem too: Classification has `flat`, `fc`, `gap` but no
-  `up` / `cat`; Segmentation has `up` / `cat` but no `flat` / `fc` / `gap`; `view` and `vae` appear only under
-  Generation.
-- **Errors** — a block that breaks a rule gets a red border and a callout under it saying why (the status line
-  repeats it). Two common mistakes have a one-click fix in the callout: an fc / `view` / `vae` block fed an image
-  (`insert a flatten block`) and a last fc whose width is not the class count (`set out to N`).
-- **Inside an attention block** — the `[+]` at the bottom right of an `attn` node opens a read-only popover with its
-  three steps (`q,k,v` fc, `attention`, `output proj` fc); a click on `q,k,v` or `output proj` shows the fc inside it
-  (shapes, weight count, and the q | k | v split of the first one). It only shows the structure: the block is still
-  one block with a single parameter, the heads.
-- **Units** — a residual unit (the blocks between a fork and the add that joins the two paths again, such as
-  `ln - attn - add` or `ln - fc - gelu - fc - add`) gets a labelled frame (`attn block`, `mlp block`, `res block`),
-  and `arrange` puts every expanded unit on a row of its own. Click `[-]` on a frame to collapse the unit into one
-  box (a click on the box, `[+]`, expands it again): its blocks are neither drawn nor clickable, but still part of the
-  model, and the wires attach to the box. The `resnet` and `vit` presets start collapsed.
-- **Read the graph** — wires are blue between neighbours in evaluation order and pink for skips and
-  branches; hover a block to light up everything it reads and everything that reads it.
-
-![The resnet preset in the node editor](docs/gui_resnet_editor.png)
-
-### Transformer
-
-A token sequence is a `(D, T, 1)` tensor: D features per token, T tokens. `patch` turns an image into one,
-`fc` then works on every token, `add` is the residual connection, and `attn` is one block (module `Attention` in
-`module/transformer.cu`) that holds its own q,k,v and output projection weights; no convolution is involved. The
-`vit` preset (Classification) is a pre-norm vision transformer:
-
-```
-patch 4x4 -> 32 - pos
-  [ ln - attn (4 heads) - add(x)
-    ln - fc 64 - gelu - fc 32 - add ]      one such block; stack more by hand
-ln - gap (mean over tokens) - fc
-```
-
-Loading it also selects Adam 0.001. On Fashion-MNIST (D = 32, 49 tokens, 11.1k parameters) it reaches 86.0% test accuracy after 6 epochs (about 6.5 s each, no augmentation
-or dropout). The weights of `patch` and the mlp's `fc` layers show in the weights viewer as in x out matrices; the
-weights of `attn`'s projections are not shown, the attention tab shows what it does instead.
-
-The weights window shows an **attention** view when you click an `attn` box: for the dashboard's sample it shows the
-sample with its token grid, and for the token you pick (click a patch; the blue box) what that token attends to,
-as the average over heads on the big image and per head beside it, plus every head's full token x token matrix
-(rows: the token that looks, columns: the token looked at; a click on a row picks that token). Each head is captioned
-with the channels it owns (`ch 8-15`: every head has its own slice of the q, k and v channels - a head is not "the q
-head" or "the k-v pair") and two words on how it behaves for the sample on screen: `self` / `local` / `mid` / `far`
-(how far from itself it looks, on the token grid) and `focused` / `mixed` / `spread` (how concentrated its weights are).
-They describe behaviour at that moment; what a head is for is learned and not fixed. Several `attn` blocks
-get a chip each. The maps are sent with every batch, so they change as the model trains; layers whose maps would
-exceed 262144 values (heads x tokens x tokens) are left out. Attention is quadratic in the number of tokens (limit 1024). There is no dropout,
-class token or causal masking; this is the vision (classification) transformer only.
-
-### Training dashboard
-
-A **model graph** across the top (a box per layer with its output shape; relu / bn / gelu / tokens / pos are folded
-into the box before them as `+bn +relu`, and a residual unit - the blocks between a fork and the add that joins it
-again - collapses into one `attn` / `mlp block` / `res block` box; click its `[+]` corner to draw the blocks inside (framed,
-with the residual skip as a pink arc; click the frame's `[-]` label to fold it again; an `attn` box has its own `[+]`
-that opens it into its three steps - `q,k,v` projection, `attention`, `output proj` - with their shapes; the two
-projections have a `[+]` too, which turns them into the `fc` they are, 32 -> 96 and 32 -> 32), hover a collapsed box to list
-what is inside; other
-skips, such as a U-Net's, are pink arcs; hover a box to trace its wires). A click on a box with weights opens the
-weights window on that layer (the box of the layer the open window shows is outlined). Live weight thumbnails under
-the boxes exist but are switched off (`ARCH_SHOW_WEIGHTS` in `train_viewer.c`), the loss curve, the current sample
-(green border = predicted correctly), the running test accuracy, and the weights viewer. For segmentation
-the sample box shows the scan, the true mask and the predicted mask side by side, and the numbers are the
-batch's Dice and the test split's Dice / IoU. If the loss turns NaN, or a classifier's loss sits at
-ln(#classes) (the network predicts one answer for everything, usually dead ReLUs after a too-high learning
-rate), a red banner over the loss curve says so and suggests a fix.
-
-The **stop** button (next to restart and settings) ends the run after the current batch: the dashboard keeps the last
-curve and numbers, marked `stopped`, and `restart` starts again from scratch. Once the last batch has been reported
-the button reads `done`.
-
-A **GPU strip** under the loss curve shows the device (name, number of SMs), an estimate of how many SMs are busy
-and how many are free, the video memory in use, temperature and power, updated about twice a second. The worker reads
-them through NVML (`libnvidia-ml`, loaded at run time; without it only the SM count is shown). Be aware of what NVML
-reports: *GPU utilization* is the share of time during which at least one kernel was running, not a count of busy
-SMs, so "busy ~N of M" is that percentage times the SM count - an estimate (a small kernel that occupies a few SMs all
-the time reads as 100%). The memory figure is for the whole device, every process included.
-
-![Training window with the ResNet dependency graph](docs/gui_resnet_run.png)
-
-Segmentation (brain tumour U-Net; the nested pink arcs are the two encoder-decoder skips):
-
-![Training window segmenting brain tumours](docs/gui_unet_run.png)
-
-### Predictions page
-
-"View predictions" (on the dashboard, or from the settings screen while a run exists) opens a page that shows
-what the model says about a fixed set of samples spread over the test split (the training split if there is
-none): 48 images with predicted / true class and confidence (green border = right, red = wrong), or for
-segmentation 36 slices as scan / true mask / predicted mask with each slice's Dice (two thirds of them contain
-tumour). The worker refreshes the set after every epoch, so the page can be left open to watch the model
-improve, or opened after training has finished; `prev` / `next` or the arrow keys turn pages.
-
-![Predictions page (brain tumour segmentation)](docs/gui_predictions.png)
-
-### Generative model (VAE)
-
-Choose **Generation** at the top: the model must contain exactly one `vae` block (a Classification problem
-with a `vae` block, or a Generation one without, is reported in red). No labels are used, so any image dataset
-works, and the `vae` preset is rebuilt for each: a convolutional encoder (stride-2 convs until the map is at most
-11 pixels across, an fc to 2x16 numbers), the sampling step, and the mirrored decoder (fc, `view`, upsample + conv
-stages). The decoder's output is read as logits: the loss is binary cross
-entropy against the raw pixels, summed over the pixels, plus the KL weight times the KL divergence, averaged over
-the batch; the KL gradient is added by the sampling block's backward pass, so the reconstruction and the KL
-need no separate machinery. Everything after the sampling block may read only the latent, which is what lets
-the trainer run the decoder alone on random latents.
-
-"View generations" shows, refreshed every epoch: test images above their reconstructions, 28 new images decoded from
-fixed random latents (the same latents every epoch, so you can watch them sharpen), and two interpolations
-between the latents of pairs of test images. The dashboard shows the input and reconstruction of the latest
-batch, and the chart is per pixel.
-
-![Generations page (Fashion-MNIST VAE)](docs/gui_vae_generations.png)
-
-On Fashion-MNIST (15 epochs, about 8 s each, Adam with lr 0.001, which the preset selects) the test reconstruction
-loss settles at about 0.282 per pixel with a KL of ~17 nats, i.e. roughly 221 + 17 = 238 nats per image. That is
-close to what convolutional VAEs with a Bernoulli decoder reach on this dataset, so the plateau is the model
-(a 16-dimensional latent and a KL weight of 1), not the optimizer: plain SGD with momentum reaches 0.285. The
-look is the usual one for a plain VAE: reconstructions are recognisable (garment type and shape) but soft, and
-new images are blurry garment-like shapes. Lowering the KL weight (the `vae` block's field) trades sample quality
-for sharper reconstructions.
-
-### Optimizers
-
-SGD with momentum is the default; Adam is one field away. Measured here, Adam is a little faster but not
-dramatically: on the brain-tumour U-Net (lr 0.001 against SGD's 0.01) the test Dice after 5 / 10 / 15 epochs was
-0.74 / 0.81 / 0.81 with Adam and 0.72 / 0.76 / 0.78 with SGD, within the run-to-run spread of a few points (single
-runs). Adam's real advantage here is that it needs little learning-rate tuning: its steps are about the learning
-rate whatever the gradient's scale, which matters for losses that sum over pixels.
-
-### Weights viewer
-
-Clicking a box of the model graph on the training screen opens a second window on that layer's weights - there is
-no tab bar, the model graph is the navigation (click another box to look at another layer). It is drawn in 3D and
-updated live: conv filters as bars (height = weight, blue < 0 < red), fc matrices as a height-field surface.
-Drag to rotate, scroll to zoom, `0` resets.
-
-A fully-connected weight matrix has no spatial structure (its rows are arbitrary features), so a height field of it
-looks like noise. The **network** view, reached with the `network >` button in the corner of an fc layer's weights
-(`< weights` goes back), shows the fc layers as neurons instead:
-
-- each layer is a column of neurons (a strip of thin cells when there are many), **brightness = that neuron's
-  activation for the sample the dashboard is showing**, updated every batch; a classifier's last layer is labelled
-  with the class names and probabilities, the winner ringed;
-- the **strongest 90 connections** between neighbouring layers are drawn as lines: by default weight x activation, i.e.
-  what pushes the next neuron up (red) or down (blue) *for this sample*, so you can see which hidden neurons drive a
-  decision; the button in the corner switches to the plain weight;
-- a layer fed by a flatten, the raw input or the VAE's latent hangs off a single block (too many inputs to draw), each
-  line as strong as that neuron's weight norm, with the sample shown under it;
-- layers whose weights were sent pooled (more than 32768 weights) draw no connections.
-
-The `mlp` preset (flatten, fc 64, fc 32, fc) is the model this view is made for.
-
-![fc1 weights in 3D](docs/weights_fc1.png)
-
-### Two processes
-
-`train_worker` (pure CUDA: trains, streams progress) and `train_viewer` (pure SDL2: form and dashboard)
-are separate executables talking over two FIFOs (`/tmp/tinydl_train.fifo`, `/tmp/tinydl_train_cmd.fifo`),
-so a GUI bug can't take down a training run and vice versa. The worker re-validates every config it
-receives with the same `train_cfg_derive()` the form uses.
-
-## Datasets
-
-A dataset is a folder `data/<name>/` with IDX files (`train-images-idx3-ubyte`, `train-labels-idx1-ubyte`,
-and optionally `t10k-*` for a test split evaluated every epoch). Images are grey or colour, up to
-128x128, 2-16 classes. Colour images use a 4-dimensional variant (magic `0x00000804`: count, channels,
-rows, cols, each image stored channel by channel). Optional `classes.txt` names the classes; optional
-`defaults.txt` (`key value` lines: `epochs`, `batch_size`, `lr`, `momentum`, `normalize`, `augment`, `optimizer`)
-is loaded into the form when the dataset is picked.
-
-| dataset | get it | result |
-|---|---|---|
-| MNIST | `curl` below | ~97% (`test_mnist`) |
-| Fashion-MNIST (GUI default) | `curl` below | ~88% in 3 epochs |
-| NEU-CLS (steel defects, 6 classes, 1440 images) | `python3 tool/prepare_neu_cls.py` | ~90% (CNN), 88-93% (ResNet) |
-| CIFAR-10 (colour, 10 classes) | `python3 tool/prepare_cifar10.py` | ~73% after 10 epochs (ResNet, width 32) |
-| Brain MRI tumour segmentation (LGG, 3929 slices) | `python3 tool/prepare_brain_mri.py` | test Dice ~0.82, IoU ~0.70 (U-Net, 30 epochs) |
-
-```bash
-# MNIST (Fashion-MNIST: BASE=http://fashion-mnist.s3-website.eu-central-1.amazonaws.com, into data/fashion-mnist)
-mkdir -p data/mnist && cd data/mnist
-BASE=https://ossci-datasets.s3.amazonaws.com/mnist
-for f in train-images-idx3-ubyte train-labels-idx1-ubyte t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
-  curl -sS -o "$f.gz" "$BASE/$f.gz" && gunzip -f "$f.gz"
-done
-cd -
-
-pip install pyarrow numpy pillow          # for the converters
-```
-
-Notes from training the harder sets: NEU-CLS needs per-epoch shuffling (the files are sorted by class),
-standardization, momentum 0.9, flips and lr ~6e-3 for the CNN (its `defaults.txt` has them); a residual
-network does not beat the CNN on 1440 images. The CIFAR-10 run was stopped at epoch 10 of 15
-(about 50 s/epoch), so ~73% is a partial result, not a tuned one.
-
-**Segmentation datasets** have a third pair of files, `train-masks-idx3-ubyte` / `t10k-masks-idx3-ubyte` (IDX
-magic `0x803`: count, rows, cols, then one class index per pixel); their presence is what makes the trainer treat a
-folder as segmentation. The loss is per-pixel cross entropy plus a soft Dice term (the tumour is only ~1% of the
-pixels, so cross entropy alone settles on "all background"), computed on the host like the classification loss.
-Augmentation moves the mask exactly like the image.
-
-`tool/prepare_brain_mri.py` converts the [LGG brain MRI set](https://huggingface.co/datasets/gymprathap/Brain-Tumor-Segmentation)
-(110 TCGA patients, 3-channel FLAIR slices with a tumour mask) to 64x64 (`--size 128` for more detail), split
-**by patient** (88 train / 22 test) so that neighbouring slices of one patient never land on both sides of the
-split. The U-Net preset has 119k parameters and trains at about 11 s per epoch at 64x64; the numbers above are
-from one 30-epoch run on the held-out patients (they move by a few points from epoch to epoch).
-
-![NEU-CLS samples, one class per row](docs/neu_cls_samples.png)
+| [Live training GUI](docs/gui.md) | the settings screen, the three problems, every training field, optimizers, the two-process design |
+| [Model editor](docs/model-editor.md) | the blocks (basic, preprocessing, advanced), wiring, presets, errors, residual units |
+| [Transformer](docs/transformer.md) | tokens, `patch` / `attn`, the `vit` preset, the attention view |
+| [Training dashboard](docs/dashboard.md) | the model graph, loss curve, GPU strip, stop button, the predictions page |
+| [Weights viewer](docs/weights-viewer.md) | conv filters in 3D, a conv layer's result for the current sample, the fc network view |
+| [Generative model (VAE)](docs/vae.md) | the `vae` block, the generations page, results |
+| [Datasets](docs/datasets.md) | the file format, how to get each dataset, segmentation datasets |
 
 ## Development
 
