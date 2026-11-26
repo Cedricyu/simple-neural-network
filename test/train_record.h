@@ -75,7 +75,8 @@
 #define BLK_GELU 14      /* the smooth relu of transformers; any shape */
 #define BLK_TOKENS 15    /* (C,H,W) -> (C,H*W,1): the patches of a conv become a sequence; needs an image */
 #define BLK_POS 16       /* adds a learned (C,H,W) position embedding; needs an image */
-#define BLK_PATCH 18     /* a = patch size, b = embedding width: cuts an image into patches and projects each to b values - a token sequence (b, H/a*W/a, 1); needs an image with sides a multiple of a */
+#define BLK_GRAY 19      /* preprocessing: colour to gray, (3,H,W) -> (1,H,W); no parameters, reads the input image directly */
+#define BLK_PATCH 18     /* a = patch size: cuts an image into non-overlapping a x a patches and flattens each into one token - (C*a*a, H/a*W/a, 1). No parameters: it only re-indexes, the projection to the model's width is the fc after it; needs an image with sides a multiple of a */
 #define MAX_PATCH 32
 #define BLK_ATTENTION 17 /* a = heads: multi-head self-attention with its own q,k,v and output projections (D channels in and out, D a multiple of heads); needs an image */
 
@@ -161,9 +162,14 @@ static inline const char *train_block_type_name(int type) {
     case BLK_POS: return "pos";
     case BLK_ATTENTION: return "attention";
     case BLK_PATCH: return "patch";
+    case BLK_GRAY: return "gray";
     default: return "?";
     }
 }
+
+/* Preprocessing blocks prepare the data instead of being part of the network: no weights, nothing to learn, and they read
+ * the input image itself (wire 0), so what they produce is a fixed function of each sample. */
+static inline int train_block_is_preprocess(int type) { return type == BLK_PATCH || type == BLK_GRAY; }
 
 static inline int train_shape_equal(LayerShape a, LayerShape b) {
     return a.flat == b.flat && a.c == b.c && a.h == b.h && a.w == b.w;
@@ -237,13 +243,17 @@ static inline int train_block_infer(int type, const int *p, LayerShape in0, cons
         if ((double)in0.c * p[0] > MAX_FC_WEIGHTS) INFER_FAIL("fc: %d x %d weights is too large", in0.c, p[0]);
         out->c = p[0];
         return 0;
+    case BLK_GRAY:
+        if (in0.flat || in0.c != 3) INFER_FAIL("gray needs a colour image (3 channels), but this input is %s", sa);
+        out->c = 1;
+        return 0;
     case BLK_PATCH:
         if (in0.flat) INFER_FAIL("patch needs an image, but this output is %s (flat)", sa);
-        if (!p || p[0] < 1 || p[1] < 1) return 1;
+        if (!p || p[0] < 1) return 1;
         if (p[0] > MAX_PATCH) INFER_FAIL("patch: size must be 1-%d", MAX_PATCH);
         if (in0.h % p[0] != 0 || in0.w % p[0] != 0) INFER_FAIL("patch: the image %dx%d is not a multiple of the patch size %d", in0.h, in0.w, p[0]);
         if ((in0.h / p[0]) * (in0.w / p[0]) > MAX_TOKENS) INFER_FAIL("patch: %d tokens is more than the limit %d", (in0.h / p[0]) * (in0.w / p[0]), MAX_TOKENS);
-        out->c = p[1];
+        out->c = in0.c * p[0] * p[0];
         out->h = (in0.h / p[0]) * (in0.w / p[0]);
         out->w = 1;
         return 0;
@@ -365,6 +375,9 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
             return train_cfg_fail(err, errsz, "block %d has no valid input wire", i + 1, 0);
         cur = train_node_shape(s, b->in[0]);
         uses[b->in[0]]++;
+        if (train_block_is_preprocess(b->type) && b->in[0] != 0)
+            return train_cfg_fail(err, errsz, b->type == BLK_GRAY ? "block %d (gray) is preprocessing: it must read the input image directly"
+                                                                : "block %d (patch) is preprocessing: it must read the input image directly", i + 1, 0);
         /* VAE: everything after the sampling step may only read the latent (so the decoder can be run on
          * its own, from a random z) */
         if (rep_id >= 0 && (b->in[0] < rep_id || ((b->type == BLK_ADD || b->type == BLK_CONCAT) && b->in[1] >= 0 && b->in[1] < rep_id)))
@@ -420,19 +433,21 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
             act_floats += (double)b->a * (cur.flat ? 1 : cur.h * cur.w);
             break;
         }
+        case BLK_GRAY:
+            if (cur.flat || cur.c != 3) return train_cfg_fail(err, errsz, "gray: needs a colour image (3 channels), but the input has %d", cur.flat ? 0 : cur.c, 0);
+            cur.c = 1;
+            act_floats += (double)cur.h * cur.w;
+            break;
         case BLK_PATCH: {
             n_patch++;
             if (cur.flat) return train_cfg_fail(err, errsz, "patch%d: needs an image input", n_patch, 0);
             if (b->a < 1 || b->a > MAX_PATCH) return train_cfg_fail(err, errsz, "patch%d: size must be 1-%d", n_patch, MAX_PATCH);
-            if (b->b < 1 || b->b > MAX_FC_WIDTH) return train_cfg_fail(err, errsz, "patch%d: width must be 1-%d", n_patch, MAX_FC_WIDTH);
             if (cur.h % b->a != 0 || cur.w % b->a != 0)
                 return train_cfg_fail(err, errsz, "patch: the image side is not a multiple of the patch size %d", b->a, 0);
             int tokens = (cur.h / b->a) * (cur.w / b->a);
             if (tokens > MAX_TOKENS) return train_cfg_fail(err, errsz, "patch: %d tokens is more than the limit %d", tokens, MAX_TOKENS);
-            if ((double)cur.c * b->a * b->a * b->b > MAX_FC_WEIGHTS)
-                return train_cfg_fail(err, errsz, "patch%d: the projection is too large", n_patch, 0);
-            act_floats += (double)cur.c * cur.h * cur.w + (double)b->b * tokens; /* the patches and their projection */
-            cur.c = b->b;
+            act_floats += (double)cur.c * cur.h * cur.w; /* the patches */
+            cur.c *= b->a * b->a;
             cur.h = tokens;
             cur.w = 1;
             break;
@@ -573,7 +588,7 @@ static inline int train_cfg_derive(const TrainConfig *c, NetShapes *s, char *err
         default:
             return train_cfg_fail(err, errsz, "block %d has an unknown type", i + 1, 0);
         }
-        if (n_conv + n_lin + n_patch > MAX_VIZ_LAYERS)
+        if (n_conv + n_lin > MAX_VIZ_LAYERS)
             return train_cfg_fail(err, errsz, "at most %d conv + linear layers", MAX_VIZ_LAYERS, 0);
         s->out[i] = cur;
         s->n_ok = i + 1;
@@ -629,7 +644,7 @@ typedef struct MsgHeader {
 } MsgHeader;
 
 #define MSG_MODEL 1    /* ModelInfo - sent once at the start of every run */
-#define MSG_PROGRESS 2 /* Progress, train_sample_bytes() of sample pixels, info.total_act_floats activations, info.total_attn_floats attention probabilities, then (if has_weights) info.total_floats weights */
+#define MSG_PROGRESS 2 /* Progress, train_sample_bytes() of sample pixels, info.total_act_floats activations, info.total_attn_floats attention probabilities, info.total_fmap_floats conv outputs, then (if has_weights) info.total_floats weights */
 #define MSG_ERROR 3    /* char[]: a NUL-terminated human-readable reason */
 #define MSG_GENERATED 5 /* GenHeader, then the images listed there (img_c*img_h*img_w bytes each); sent after every epoch */
 #define MSG_GPU 6      /* GpuStats - the device's load, sent about twice a second while a run is going */
@@ -713,6 +728,8 @@ typedef struct ActLayer {
     int tid;       /* the tensor the values are read from: the layer's output, or the relu after it */
     int relu;      /* 1 = the values are after a relu */
     char src[12];  /* when prev < 0: what feeds the layer ("input", "flatten", "gap", "latent z", ...) */
+    int src_offset; /* when prev < 0 and in_dim fits: float offset of the layer's input values (right after its output values), else -1 */
+    int src_tid;    /* the tensor those input values are read from */
 } ActLayer;
 
 /* One entry per attention block (up to MAX_ATTN_VIZ, as long as all maps stay under ATTN_MAX_FLOATS): the
@@ -729,6 +746,18 @@ typedef struct AttnViz {
     int block;   /* index of the attention block, whose packed q,k,v the worker keeps for the maps */
 } AttnViz;
 
+/* One entry per conv layer drawn as filters (as long as all stay under FMAP_MAX_FLOATS): the layer's output - what the
+ * convolution produced - for the sample the dashboard shows, [channel][y][x], sent with every Progress message after the
+ * attention maps. */
+#define MAX_FMAP_VIZ MAX_VIZ_LAYERS
+#define FMAP_MAX_FLOATS 262144
+typedef struct FmapViz {
+    int ch, h, w;
+    int offset;     /* float offset of this layer's maps in the feature-map payload */
+    int tid;        /* the tensor the maps are read from: the conv block's output */
+    int viz_index;  /* index into ModelInfo.layers of the conv layer's filters */
+} FmapViz;
+
 typedef struct ModelInfo {
     TrainConfig cfg;
     int n_viz;
@@ -740,6 +769,9 @@ typedef struct ModelInfo {
     int n_attn;
     AttnViz attn[MAX_ATTN_VIZ];
     int total_attn_floats;
+    int n_fmap;
+    FmapViz fmap[MAX_FMAP_VIZ];
+    int total_fmap_floats;
 } ModelInfo;
 
 /* What the dashboard shows about the GPU (see gpu_stats.h for what each number means; -1 = unknown). */

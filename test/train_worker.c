@@ -59,7 +59,6 @@ typedef struct Net {
     BatchNorm *bn[MAX_BLOCKS];
     LayerNorm *ln[MAX_BLOCKS];
     Attention *attn[MAX_BLOCKS];
-    PatchEmbed *patch[MAX_BLOCKS];
     Tensor *pos[MAX_BLOCKS]; /* position embeddings (learned parameters) */
     int rep_block; /* index of the VAE sampling block, or -1 */
 } Net;
@@ -118,7 +117,6 @@ static void net_init(Net *n, const TrainConfig *c, const NetShapes *s) {
         } else if (b->type == BLK_LAYERNORM) n->ln[i] = layernorm_new(in.c);
         else if (b->type == BLK_POS) n->pos[i] = posembed_new(in.c, in.h, in.w);
         else if (b->type == BLK_ATTENTION) n->attn[i] = attention_new(in.c, b->a);
-        else if (b->type == BLK_PATCH) n->patch[i] = patchembed_new(in.c, b->a, b->b);
     }
 }
 
@@ -130,7 +128,6 @@ static void net_free(Net *n) {
         if (n->ln[i]) layernorm_free(n->ln[i]);
         if (n->pos[i]) tensor_free(n->pos[i]);
         if (n->attn[i]) attention_free(n->attn[i]);
-        if (n->patch[i]) patchembed_free(n->patch[i]);
     }
 }
 
@@ -171,12 +168,8 @@ static void net_forward_ex(Net *n, Tensor *x, ForwardCache *c, int training, Ten
         case BLK_LINEAR: /* a token sequence (4D) gets the same layer on every token */
             out = in->ndim == 4 ? tensor_token_linear(in, linear_tensor(n->lin[i]), n->lin[i]->bias) : linear_forward(n->lin[i], in);
             break;
-        case BLK_PATCH: {
-            Tensor *keep[1];
-            out = patchembed_forward(n->patch[i], in, keep);
-            if (out) cache_add(c, keep[0]);
-            break;
-        }
+        case BLK_GRAY: out = tensor_grayscale(in); break; /* preprocessing: no weights, reads the input only */
+        case BLK_PATCH: out = tensor_patchify(in, b->a); break; /* only re-indexes: nothing to learn here */
         case BLK_ADD: out = tensor_add(in, val[b->in[1]]); break;
         case BLK_BATCHNORM: out = batchnorm_forward(n->bn[i], in, training); break;
         case BLK_MAXPOOL: out = maxpool2d_forward(in, b->a, b->b); break;
@@ -242,10 +235,6 @@ static void net_zero_grad(Net *n) {
             tensor_zero_grad(n->ln[i]->beta);
         }
         if (n->pos[i]) tensor_zero_grad(n->pos[i]);
-        if (n->patch[i]) {
-            tensor_zero_grad(n->patch[i]->w);
-            tensor_zero_grad(n->patch[i]->b);
-        }
         if (n->attn[i]) {
             tensor_zero_grad(n->attn[i]->wqkv);
             tensor_zero_grad(n->attn[i]->bqkv);
@@ -280,10 +269,6 @@ static void net_update(Net *n, const TrainConfig *cfg, int step) {
             update_param(n->ln[i]->beta, cfg, step);
         }
         if (n->pos[i]) update_param(n->pos[i], cfg, step);
-        if (n->patch[i]) {
-            update_param(n->patch[i]->w, cfg, step);
-            update_param(n->patch[i]->b, cfg, step);
-        }
         if (n->attn[i]) {
             update_param(n->attn[i]->wqkv, cfg, step);
             update_param(n->attn[i]->bqkv, cfg, step);
@@ -341,7 +326,7 @@ static int effective_pool(int in_dim, int out_dim, int requested) {
 static void build_model_info(const TrainConfig *c, const NetShapes *s, ModelInfo *info) {
     memset(info, 0, sizeof(*info));
     info->cfg = *c;
-    int offset = 0, v = 0, n_conv = 0, n_lin = 0, n_patch = 0, act_of_block[MAX_BLOCKS];
+    int offset = 0, v = 0, n_conv = 0, n_lin = 0, act_of_block[MAX_BLOCKS];
     for (int i = 0; i < c->n_blocks; ++i) act_of_block[i] = -1;
     for (int i = 0; i < c->n_blocks; ++i) {
         const Block *b = &c->blocks[i];
@@ -370,18 +355,19 @@ static void build_model_info(const TrainConfig *c, const NetShapes *s, ModelInfo
             lv->offset = offset;
             snprintf(lv->name, sizeof(lv->name), "conv%d", ++n_conv);
             offset += lv->count * lv->ksize * lv->ksize;
-        } else if (b->type == BLK_PATCH) { /* the patch projection, an (in x out) matrix like an fc layer's */
-            LayerViz *lv = &info->layers[v++];
-            lv->kind = VIZ_MATRIX;
-            lv->in_dim = in.c * b->a * b->a;
-            lv->out_dim = b->b;
-            lv->pool = effective_pool(lv->in_dim, lv->out_dim, c->fc_pool);
-            lv->count = lv->in_dim / lv->pool;
-            lv->cols = lv->out_dim;
-            lv->full_detail = (lv->pool == 1);
-            lv->offset = offset;
-            snprintf(lv->name, sizeof(lv->name), "patch%d", ++n_patch);
-            offset += lv->count * lv->cols;
+            /* what the convolution produced, for the sample on the dashboard (if it fits the budget) */
+            LayerShape os = s->out[i];
+            long need = (long)os.c * os.h * os.w;
+            if (!os.flat && info->n_fmap < MAX_FMAP_VIZ && info->total_fmap_floats + need <= FMAP_MAX_FLOATS) {
+                FmapViz *fv = &info->fmap[info->n_fmap++];
+                fv->ch = os.c;
+                fv->h = os.h;
+                fv->w = os.w;
+                fv->offset = info->total_fmap_floats;
+                fv->tid = i + 1;
+                fv->viz_index = v - 1;
+                info->total_fmap_floats += (int)need;
+            }
         } else if (b->type == BLK_LINEAR) {
             LayerViz *lv = &info->layers[v++];
             lv->kind = VIZ_MATRIX;
@@ -418,6 +404,13 @@ static void build_model_info(const TrainConfig *c, const NetShapes *s, ModelInfo
             if (id > 0 && c->blocks[id - 1].type == BLK_LINEAR) al->prev = act_of_block[id - 1];
             else if (id == 0) snprintf(al->src, sizeof(al->src), "input");
             else snprintf(al->src, sizeof(al->src), "%s", c->blocks[id - 1].type == BLK_REPARAM ? "latent z" : train_block_type_name(c->blocks[id - 1].type));
+            /* a layer fed by something other than an fc layer also sends its input values, so the view can draw them */
+            al->src_offset = -1;
+            al->src_tid = b->in[0];
+            if (al->prev < 0 && al->in_dim <= MAX_FC_WIDTH) {
+                al->src_offset = info->total_act_floats;
+                info->total_act_floats += al->in_dim;
+            }
         }
     }
     info->n_viz = v;
@@ -484,14 +477,6 @@ static void gather_viz(const Net *n, const ModelInfo *info, float *out, float *s
                 reduce_filter_magnitude(scratch, cv->out_channels, cv->in_channels, cv->kernel_size,
                                         out + lv->offset);
             }
-        } else if (n->patch[i]) {
-            const LayerViz *lv = &info->layers[v++];
-            if (lv->full_detail) {
-                tensor_to_host(n->patch[i]->w, out + lv->offset);
-            } else {
-                tensor_to_host(n->patch[i]->w, scratch);
-                reduce_fc_viz(scratch, lv->in_dim, lv->out_dim, lv->pool, out + lv->offset);
-            }
         } else if (n->lin[i]) {
             const LayerViz *lv = &info->layers[v++];
             if (lv->full_detail) {
@@ -536,16 +521,38 @@ static void gather_attention(const ModelInfo *info, const ForwardCache *c, int s
     }
 }
 
+static void gather_fmaps(const ModelInfo *info, const ForwardCache *c, int shown, float *out, float *tmp) {
+    for (int k = 0; k < info->n_fmap; ++k) {
+        const FmapViz *fv = &info->fmap[k];
+        size_t n = (size_t)fv->ch * fv->h * fv->w;
+        const Tensor *t = c->val[fv->tid];
+        if (!t || t->ndim != 4 || t->shape[1] != fv->ch || t->shape[2] != fv->h || t->shape[3] != fv->w || shown >= t->shape[0]) {
+            memset(out + fv->offset, 0, sizeof(float) * n);
+            continue;
+        }
+        tensor_to_host((Tensor *)t, tmp);
+        memcpy(out + fv->offset, tmp + (size_t)shown * n, sizeof(float) * n);
+    }
+}
+
 static void gather_activations(const ModelInfo *info, const ForwardCache *c, int shown, float *out, float *tmp) {
     for (int k = 0; k < info->n_act; ++k) {
         const ActLayer *al = &info->act[k];
         const Tensor *t = c->val[al->tid];
         if (!t || t->ndim != 2 || t->shape[1] != al->dim || shown >= t->shape[0]) {
             memset(out + al->offset, 0, sizeof(float) * (size_t)al->dim);
+        } else {
+            tensor_to_host((Tensor *)t, tmp);
+            memcpy(out + al->offset, tmp + (size_t)shown * al->dim, sizeof(float) * (size_t)al->dim);
+        }
+        if (al->src_offset < 0) continue;
+        t = c->val[al->src_tid];
+        if (!t || t->ndim != 2 || t->shape[1] != al->in_dim || shown >= t->shape[0]) {
+            memset(out + al->src_offset, 0, sizeof(float) * (size_t)al->in_dim);
             continue;
         }
         tensor_to_host((Tensor *)t, tmp);
-        memcpy(out + al->offset, tmp + (size_t)shown * al->dim, sizeof(float) * (size_t)al->dim);
+        memcpy(out + al->src_offset, tmp + (size_t)shown * al->in_dim, sizeof(float) * (size_t)al->in_dim);
     }
 }
 
@@ -558,8 +565,6 @@ static size_t max_weight_floats(const Net *n) {
             sz = (size_t)c->out_channels * c->in_channels * c->kernel_size * c->kernel_size;
         } else if (n->lin[i]) {
             sz = (size_t)n->lin[i]->in_features * n->lin[i]->out_features;
-        } else if (n->patch[i]) {
-            sz = (size_t)n->patch[i]->in_c * n->patch[i]->patch * n->patch[i]->patch * n->patch[i]->dim;
         }
         if (sz > m) m = sz;
     }
@@ -1166,8 +1171,18 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
     float *attn_tmp = (float *)malloc(sizeof(float) * max_attn_tmp);
     size_t max_act_tmp = 1;
     for (int k = 0; k < info.n_act; ++k)
-        if ((size_t)batch_size * info.act[k].dim > max_act_tmp) max_act_tmp = (size_t)batch_size * info.act[k].dim;
+    {
+        size_t wide = info.act[k].src_offset >= 0 && info.act[k].in_dim > info.act[k].dim ? (size_t)info.act[k].in_dim : (size_t)info.act[k].dim;
+        if ((size_t)batch_size * wide > max_act_tmp) max_act_tmp = (size_t)batch_size * wide;
+    }
     float *act_tmp = (float *)malloc(sizeof(float) * max_act_tmp);
+    float *fmap = (float *)calloc((size_t)(info.total_fmap_floats > 0 ? info.total_fmap_floats : 1), sizeof(float));
+    size_t max_fmap_tmp = 1;
+    for (int k = 0; k < info.n_fmap; ++k) {
+        size_t sz = (size_t)batch_size * info.fmap[k].ch * info.fmap[k].h * info.fmap[k].w;
+        if (sz > max_fmap_tmp) max_fmap_tmp = sz;
+    }
+    float *fmap_tmp = (float *)malloc(sizeof(float) * max_fmap_tmp);
     float *scratch = (float *)malloc(sizeof(float) * max_weight_floats(&net));
     unsigned char *pixels = (unsigned char *)malloc(sample_bytes);
     /* Samples are visited in a fresh random order every epoch: datasets are
@@ -1306,6 +1321,7 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
             net_update(&net, cfg, batch_no + 1);
             gather_activations(&info, &cache, shown, acts, act_tmp); /* before the pass's tensors are freed */
             gather_attention(&info, &cache, shown, attn, attn_tmp);
+            gather_fmaps(&info, &cache, shown, fmap, fmap_tmp);
             free_cache(&cache);
 
             epoch_loss += batch_loss;
@@ -1372,11 +1388,11 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
             }
             if (prog.has_weights) gather_viz(&net, &info, viz, scratch);
 
-            const void *parts[5] = {&prog, pixels, acts, attn, viz};
-            size_t sizes[5] = {sizeof(prog), sample_bytes, sizeof(float) * (size_t)info.total_act_floats,
-                               sizeof(float) * (size_t)info.total_attn_floats,
+            const void *parts[6] = {&prog, pixels, acts, attn, fmap, viz};
+            size_t sizes[6] = {sizeof(prog), sample_bytes, sizeof(float) * (size_t)info.total_act_floats,
+                               sizeof(float) * (size_t)info.total_attn_floats, sizeof(float) * (size_t)info.total_fmap_floats,
                                prog.has_weights ? sizeof(float) * (size_t)info.total_floats : 0};
-            if (send_msgv(fifo, MSG_PROGRESS, parts, sizes, 5) != 0 || send_gpu_if_due(fifo, 0) != 0) {
+            if (send_msgv(fifo, MSG_PROGRESS, parts, sizes, 6) != 0 || send_gpu_if_due(fifo, 0) != 0) {
                 fprintf(stderr, "train_worker: viewer disconnected, stopping.\n");
                 result = RUN_GONE;
                 break;
@@ -1417,6 +1433,8 @@ static int run_training(TrainConfig *cfg, FILE *fifo, int cmd_fd) {
     free(attn);
     free(attn_tmp);
     free(act_tmp);
+    free(fmap);
+    free(fmap_tmp);
     free(scratch);
     free(pixels);
     free(perm);

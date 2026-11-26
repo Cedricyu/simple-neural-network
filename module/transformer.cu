@@ -594,30 +594,51 @@ Tensor *tensor_patchify_backward(Tensor *x, Tensor *out, Tensor *grad_out) {
     return dx;
 }
 
-PatchEmbed *patchembed_new(int in_c, int patch, int dim) {
-    PatchEmbed *self = (PatchEmbed *)malloc(sizeof(PatchEmbed));
-    if (!self) return NULL;
-    self->in_c = in_c;
-    self->patch = patch;
-    self->dim = dim;
-    self->w = xavier_param(in_c * patch * patch, dim);
-    self->b = zero_param(dim);
-    return self;
+/* ---- grayscale ---- */
+
+/* The weight of channel c of C: the usual luma weights for RGB, an equal share otherwise. */
+__device__ static float gray_weight(int c, int C) {
+    if (C == 3) return c == 0 ? 0.299f : (c == 1 ? 0.587f : 0.114f);
+    return 1.0f / (float)C;
 }
 
-void patchembed_free(PatchEmbed *self) {
-    if (!self) return;
-    tensor_free(self->w);
-    tensor_free(self->b);
-    free(self);
+__global__ void gray_kernel(const float *x, float *y, int B, int C, int HW) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B * HW) return;
+    int b = i / HW, p = i % HW;
+    float s = 0.0f;
+    for (int c = 0; c < C; ++c) s += gray_weight(c, C) * x[((size_t)b * C + c) * HW + p];
+    y[i] = s;
 }
 
-Tensor *patchembed_forward(PatchEmbed *self, Tensor *x, Tensor *keep[1]) {
-    keep[0] = NULL;
-    Tensor *patches = tensor_patchify(x, self->patch);
-    if (!patches) return NULL;
-    keep[0] = patches;
-    return tensor_token_linear(patches, self->w, self->b);
+__global__ void gray_back_kernel(const float *g, float *dx, int B, int C, int HW) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B * C * HW) return;
+    int b = i / (C * HW), c = (i / HW) % C, p = i % HW;
+    dx[i] = gray_weight(c, C) * g[(size_t)b * HW + p];
+}
+
+Tensor *tensor_grayscale(Tensor *x) {
+    if (x->ndim != 4) {
+        printf("tensor_grayscale: expected (B, C, H, W)\n");
+        return NULL;
+    }
+    int B = x->shape[0], C = x->shape[1], HW = x->shape[2] * x->shape[3];
+    int shape[4] = {B, 1, x->shape[2], x->shape[3]};
+    Tensor *out = tensor_create(4, shape, x->requires_grad);
+    gray_kernel<<<(B * HW + 255) / 256, 256>>>(x->data, out->data, B, C, HW);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (x->requires_grad) tensor_add_dependency_with_ctx(out, x, out, tensor_grayscale_backward);
+    return out;
+}
+
+Tensor *tensor_grayscale_backward(Tensor *x, Tensor *out, Tensor *grad_out) {
+    (void)out;
+    int B = x->shape[0], C = x->shape[1], HW = x->shape[2] * x->shape[3];
+    Tensor *dx = tensor_create(4, x->shape, 0);
+    gray_back_kernel<<<(B * C * HW + 255) / 256, 256>>>(grad_out->data, dx->data, B, C, HW);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return dx;
 }
 
 /* ---- attention ---- */

@@ -50,17 +50,10 @@ Tensor *tensor_token_linear_backward_bias(Tensor *bias, Tensor *ctx, Tensor *gra
 Tensor *tensor_patchify(Tensor *x, int p);
 Tensor *tensor_patchify_backward(Tensor *x, Tensor *out, Tensor *grad_out);
 
-/* The patch embedding of a vision transformer: patchify, then one linear projection (C*p*p -> D) shared by every
- * patch. keep[0] = the patches, owned by the caller like the intermediates of attention_layer_forward. */
-typedef struct PatchEmbed {
-    int in_c, patch, dim;
-    Tensor *w; /* (C*p*p, D) */
-    Tensor *b; /* (D) */
-} PatchEmbed;
-
-PatchEmbed *patchembed_new(int in_c, int patch, int dim);
-void patchembed_free(PatchEmbed *self);
-Tensor *patchembed_forward(PatchEmbed *self, Tensor *x, Tensor *keep[1]);
+/* Colour to gray: (B, C, H, W) -> (B, 1, H, W), the weighted sum of the channels (0.299 R + 0.587 G + 0.114 B for three
+ * channels, their mean otherwise). No parameters. */
+Tensor *tensor_grayscale(Tensor *x);
+Tensor *tensor_grayscale_backward(Tensor *x, Tensor *out, Tensor *grad_out);
 
 /* A multi-head self-attention layer with its own weights - the module an `attn` block is. D channels in and out
  * (D a multiple of `heads`); it projects every token to queries, keys and values with one (D, 3D) matrix, runs
