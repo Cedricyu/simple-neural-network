@@ -30,6 +30,11 @@
 # Outputs
 *.tmp
 
+# Installers and profiler reports
+*.deb
+*.nsys-rep
+*.ncu-rep
+
 # Doc Outputs
 **/docs/_build/*
 **/generated/*
