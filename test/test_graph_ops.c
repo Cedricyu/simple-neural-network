@@ -258,11 +258,16 @@ static Tensor *build_patchify(Tensor **leaves, void *user, Scratch *s) {
     return keep(s, tensor_patchify(leaves[0], 2));
 }
 
-static Tensor *build_patchembed(Tensor **leaves, void *user, Scratch *s) {
-    Tensor *mid[1];
-    Tensor *out = patchembed_forward((PatchEmbed *)user, leaves[0], mid);
-    keep(s, mid[0]);
-    return keep(s, out);
+static Tensor *build_grayscale(Tensor **leaves, void *user, Scratch *s) {
+    (void)user;
+    return keep(s, tensor_grayscale(leaves[0]));
+}
+
+/* the patch embedding of a vision transformer, as the blocks build it: cut into patches, then one fc on every token */
+static Tensor *build_patch_then_fc(Tensor **leaves, void *user, Scratch *s) {
+    (void)user;
+    Tensor *patches = keep(s, tensor_patchify(leaves[0], 2));
+    return keep(s, tensor_token_linear(patches, leaves[1], leaves[2]));
 }
 
 static int g_heads = 2;
@@ -611,13 +616,17 @@ void test_graph_ops(void) {
         Tensor *x = make_leaf(4, xs, 1.0f, 0.0f);
         Tensor *leaves[1] = {x};
         failures += check_op("patchify 2x2", leaves, 1, build_patchify, NULL);
-        PatchEmbed *pe = patchembed_new(2, 2, 5);
-        float bh[5];
-        for (int i = 0; i < 5; ++i) bh[i] = 0.3f * frand();
-        tensor_set_data(pe->b, bh);
-        Tensor *l2[3] = {x, pe->w, pe->b};
-        failures += check_op("patch embedding (2x2 patches -> 5)", l2, 3, build_patchembed, pe);
-        patchembed_free(pe);
+        int cs[4] = {2, 3, 3, 3};
+        Tensor *rgb = make_leaf(4, cs, 1.0f, 0.0f);
+        Tensor *cl[1] = {rgb};
+        failures += check_op("grayscale (3 channels)", cl, 1, build_grayscale, NULL);
+        tensor_free(rgb);
+        int ws[2] = {8, 5}, bs[1] = {5}; /* 2 channels x 2 x 2 = 8 numbers per patch -> 5 */
+        Tensor *w = make_leaf(2, ws, 1.0f, 0.0f), *b = make_leaf(1, bs, 0.5f, 0.0f);
+        Tensor *l2[3] = {x, w, b};
+        failures += check_op("patch, then fc on every token", l2, 3, build_patch_then_fc, NULL);
+        tensor_free(w);
+        tensor_free(b);
         tensor_free(x);
     }
     {

@@ -70,19 +70,19 @@ static SDL_Rect preset_rect(int i) {
     SDL_Rect r = {BTN_PRESETS.x - 54, BTN_PRESETS.y + BTN_PRESETS.h + 4 + i * 30, BTN_PRESETS.w + 54, 28};
     return r;
 }
+/* Menu-only types: a block made of other blocks. Placing one drops several wired nodes (see graph_place_unit). */
+#define UNIT_RES 200  /* conv - bn - relu - conv - bn - add: a ResNet residual block (the skip wire is left to you) */
+#define UNIT_ATTN 201 /* ln - attn - add */
+#define UNIT_MLP 202  /* ln - fc - gelu - fc - add */
+static int is_unit_type(int t) { return t >= UNIT_RES && t <= UNIT_MLP; }
 /* Blocks offered per problem: the VAE's view / vae blocks make no sense for classification, and a generator
  * has no use for global average pooling. */
-static const int PALETTE_CLS[14] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP,
-                                    BLK_LAYERNORM, BLK_GELU, BLK_PATCH, BLK_TOKENS, BLK_POS, BLK_ATTENTION};
-static const int PALETTE_SEG[7] = {BLK_CONV, BLK_RELU, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT};
-static const int PALETTE_GEN[11] = {BLK_CONV,    BLK_RELU,   BLK_FLATTEN,  BLK_LINEAR,   BLK_ADD,     BLK_BATCHNORM,
-                                    BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT, BLK_RESHAPE, BLK_REPARAM};
+static const int PALETTE_CLS[18] = {BLK_CONV, BLK_RELU, BLK_FLATTEN, BLK_LINEAR, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_GAP,
+                                    BLK_LAYERNORM, BLK_GELU, BLK_PATCH, BLK_GRAY, BLK_TOKENS, BLK_POS, BLK_ATTENTION, UNIT_RES, UNIT_ATTN, UNIT_MLP};
+static const int PALETTE_SEG[8] = {BLK_CONV, BLK_RELU, BLK_ADD, BLK_BATCHNORM, BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT, UNIT_RES};
+static const int PALETTE_GEN[12] = {BLK_CONV,    BLK_RELU,   BLK_FLATTEN,  BLK_LINEAR,   BLK_ADD,     BLK_BATCHNORM,
+                                    BLK_MAXPOOL, BLK_UPSAMPLE, BLK_CONCAT, BLK_RESHAPE, BLK_REPARAM, UNIT_RES};
 
-/* The block menu hangs under its button, one row per block type. */
-static SDL_Rect palette_rect(int i) {
-    SDL_Rect r = {BTN_BLOCKS.x, BTN_BLOCKS.y + BTN_BLOCKS.h + 6 + i * 31, 120, 28};
-    return r;
-}
 static const SDL_Rect BTN_START = {880, 582, 250, 98};
 static const SDL_Rect BTN_BACK = {410, 646, 230, 34};
 
@@ -171,6 +171,7 @@ typedef struct Gui {
     SDL_Texture *mask_tex[2]; /* segmentation: true / predicted mask of the shown sample, RGBA, digit_w x digit_h */
     int preset_open;          /* the preset menu under the presets button is showing */
     int palette_open;         /* the block menu under the blocks button is showing */
+    int palette_adv;          /* ... with its advanced section unfolded */
     int problem;              /* PROBLEM_CLASSIFY or PROBLEM_GENERATE: chosen first, decides the task, palette and presets */
 
     /* the latest MSG_PREDICTIONS: a header followed by n records, kept so the page can be opened any time */
@@ -251,6 +252,11 @@ typedef struct Gui {
     int weights_tab; /* index of the visible weight tab (hidden layers skipped), then the network (neuron) view and the attention view when the model has them; persists across close/reopen */
     float *acts;     /* the live activations of every fc layer for the dashboard's sample (ModelInfo.act offsets) */
     int acts_valid;
+    float *fmap;     /* what every conv layer produced for that sample (ModelInfo.fmap offsets) */
+    int fmap_valid;
+    int conv_result; /* the weights window shows a conv layer's result for the sample instead of its filters */
+    SDL_Texture *fmap_tex; /* the maps of the shown conv layer as one mosaic (belongs to the weights renderer) */
+    int fmap_tex_w, fmap_tex_h;
     GpuStats gpu;      /* the latest MSG_GPU */
     int gpu_valid;
     Uint32 gpu_at;     /* SDL_GetTicks() when it arrived */
@@ -266,7 +272,6 @@ typedef struct Gui {
     int attn_valid;
     int attn_layer;  /* attention tab: which attention block */
     int attn_query;  /* attention tab: the query token, or -1 for the middle of the grid */
-    int net_back_tab; /* the weight tab the network view's "< weights" button returns to */
     int net_mode;    /* network view edges: 0 = contribution to this sample (weight x activation), 1 = the weight itself */
     SDL_Texture *net_img_tex; /* the sample, drawn in the network view (weights window renderer) */
     int net_img_w, net_img_h;
@@ -292,9 +297,75 @@ static SDL_Rect view_rect(const Gui *g) {
     return r;
 }
 
-static int palette_count(const Gui *g) { return g->problem == PROBLEM_GENERATE ? 11 : (g->problem == PROBLEM_SEGMENT ? 7 : 14); }
+/* The menu has three sections. Basic blocks are single operations - the layers and functions a network is made of.
+ * Preprocessing blocks (patch, gray) prepare the input and are not part of the network. Advanced blocks contain other
+ * blocks: attn (fc layers around attention) and the res / attn / mlp blocks, each of which drops a few wired blocks
+ * at once. */
+static int block_advanced(int type) { return type == BLK_ATTENTION || is_unit_type(type); }
+static int block_prep(int type) { return train_block_is_preprocess(type); }
+/* The problem's blocks in menu order - basic, then preprocessing, then advanced - with the size of each section;
+ * returns how many in all. */
+static int palette_all(const Gui *g, int *out, int *n_basic, int *n_prep) {
+    const int *src = g->problem == PROBLEM_GENERATE ? PALETTE_GEN : (g->problem == PROBLEM_SEGMENT ? PALETTE_SEG : PALETTE_CLS);
+    int n = g->problem == PROBLEM_GENERATE ? 12 : (g->problem == PROBLEM_SEGMENT ? 8 : 18), k = 0;
+    for (int i = 0; i < n; ++i)
+        if (!block_advanced(src[i]) && !block_prep(src[i])) out[k++] = src[i];
+    *n_basic = k;
+    for (int i = 0; i < n; ++i)
+        if (block_prep(src[i])) out[k++] = src[i];
+    *n_prep = k - *n_basic;
+    for (int i = 0; i < n; ++i)
+        if (block_advanced(src[i])) out[k++] = src[i];
+    return n;
+}
+/* The rows showing in the menu: basic and preprocessing, and the advanced ones while that section is unfolded. */
+static int palette_count(const Gui *g) {
+    int o[24], nb, np;
+    int n = palette_all(g, o, &nb, &np);
+    return g->palette_adv ? n : nb + np;
+}
 static int palette_type(const Gui *g, int i) {
-    return g->problem == PROBLEM_GENERATE ? PALETTE_GEN[i] : (g->problem == PROBLEM_SEGMENT ? PALETTE_SEG[i] : PALETTE_CLS[i]);
+    int o[24], nb, np;
+    palette_all(g, o, &nb, &np);
+    return o[i];
+}
+static int palette_has_advanced(const Gui *g) {
+    int o[24], nb, np;
+    return palette_all(g, o, &nb, &np) > nb + np;
+}
+/* The block menu hangs under its button. Column one: the basic rows. Column two: the preprocessing rows, then a fold
+ * button, and - unfolded - the advanced rows under it. */
+static SDL_Rect palette_rect(const Gui *g, int i) {
+    int o[24], nb, np;
+    palette_all(g, o, &nb, &np);
+    int top = BTN_BLOCKS.y + BTN_BLOCKS.h + 26;
+    SDL_Rect r = {BTN_BLOCKS.x, top, 120, 28};
+    if (i < nb) {
+        r.y = top + i * 31;
+    } else if (i < nb + np) {
+        r.x += 130;
+        r.y = top + (i - nb) * 31;
+    } else {
+        r.x += 130;
+        r.y = top + np * 31 + 33 + (i - nb - np) * 31;
+    }
+    return r;
+}
+static SDL_Rect palette_fold_rect(const Gui *g) {
+    int o[24], nb, np;
+    palette_all(g, o, &nb, &np);
+    SDL_Rect r = {BTN_BLOCKS.x + 130, BTN_BLOCKS.y + BTN_BLOCKS.h + 26 + np * 31 + 3, 120, 26};
+    return r;
+}
+static int palette_menu_width(const Gui *g) {
+    int o[24], nb, np;
+    return palette_all(g, o, &nb, &np) > nb ? 262 : 132;
+}
+static int palette_menu_height(const Gui *g) {
+    int o[24], nb, np;
+    int n = palette_all(g, o, &nb, &np);
+    int col1 = nb * 31, col2 = n > nb ? np * 31 + (palette_has_advanced(g) ? 33 + (g->palette_adv ? (n - nb - np) * 31 : 0) : 0) : 0;
+    return 26 + (col1 > col2 ? col1 : col2) + 8;
 }
 /* The problem's own presets, then "empty" last. */
 static int preset_count(const Gui *g) { return (g->problem == PROBLEM_CLASSIFY ? 4 : 1) + 1; }
@@ -389,6 +460,7 @@ static void gui_shutdown(Gui *g) {
     if (g->win) SDL_DestroyWindow(g->win);
     free(g->weights);
     free(g->acts);
+    free(g->fmap);
     free(g->sample);
     free(g->pred_data);
     free(g->gen_data);
@@ -725,7 +797,8 @@ static int node_height(int type) {
     case BLK_RESHAPE: return 84;
     case BLK_REPARAM: return 72;
     case BLK_ATTENTION: return 72;
-    case BLK_PATCH: return 84;
+    case BLK_PATCH: return 88;
+    case BLK_GRAY: return 58;
     default: return 46;
     }
 }
@@ -739,7 +812,7 @@ static int node_nparams(int type) {
     case BLK_RESHAPE: return 3;
     case BLK_REPARAM: return 1;
     case BLK_ATTENTION: return 1;
-    case BLK_PATCH: return 2;
+    case BLK_PATCH: return 1;
     default: return 0;
     }
 }
@@ -767,12 +840,16 @@ static const char *node_type_title(int type) {
     case BLK_POS: return "pos";
     case BLK_ATTENTION: return "attn";
     case BLK_PATCH: return "patch";
+    case BLK_GRAY: return "gray";
     default: return "fc";
     }
 }
 
 static SDL_Color node_accent(int type) {
     switch (type) {
+    case UNIT_RES: return (SDL_Color){57, 135, 229, 255};
+    case UNIT_ATTN: return (SDL_Color){244, 118, 118, 255};
+    case UNIT_MLP: return (SDL_Color){120, 200, 110, 255};
     case BLK_CONV: return (SDL_Color){57, 135, 229, 255};
     case BLK_RELU: return (SDL_Color){96, 181, 120, 255};
     case BLK_FLATTEN: return (SDL_Color){176, 138, 224, 255};
@@ -791,6 +868,7 @@ static SDL_Color node_accent(int type) {
     case BLK_POS: return (SDL_Color){206, 170, 120, 255};
     case BLK_ATTENTION: return (SDL_Color){244, 118, 118, 255};
     case BLK_PATCH: return (SDL_Color){110, 160, 245, 255};
+    case BLK_GRAY: return (SDL_Color){168, 172, 184, 255};
     default: return (SDL_Color){150, 156, 168, 255};
     }
 }
@@ -897,10 +975,7 @@ static void node_set_defaults(Gui *g, int i) {
         field_set(g, F_NODE(i, 2), "7", FK_INT);
     } else if (t == BLK_REPARAM) field_set(g, F_NODE(i, 0), "1", FK_FLOAT);
     else if (t == BLK_ATTENTION) field_set(g, F_NODE(i, 0), "4", FK_INT);
-    else if (t == BLK_PATCH) {
-        field_set(g, F_NODE(i, 0), "4", FK_INT);
-        field_set(g, F_NODE(i, 1), "32", FK_INT);
-    }
+    else if (t == BLK_PATCH) field_set(g, F_NODE(i, 0), "4", FK_INT);
 }
 
 static int graph_add(Gui *g, int type, int x, int y) {
@@ -962,20 +1037,29 @@ static void graph_free_spot(const Gui *g, int ignore, int type, int *x, int *y) 
 
 /* Clicking a palette block drops it, unwired, on the first free spot of the visible canvas; the wires are the
  * user's to pull (dragging a block from the menu puts it wherever it is released instead). */
+static int unit_node_count(int unit);
+static int graph_place_unit(Gui *g, int unit, int x, int y);
+/* A node, or - for a menu-only unit type - its whole row of wired nodes, with the first at (x, y). */
+static int graph_add_at(Gui *g, int type, int x, int y) { return is_unit_type(type) ? graph_place_unit(g, type, x, y) : graph_add(g, type, x, y); }
+
 static int graph_place(Gui *g, int type) {
     SDL_Rect v = view_rect(g);
-    int x0 = -(int)floorf(g->pan_x) + 14, y0 = -(int)floorf(g->pan_y) + 14, h = node_height(type);
-    for (int y = y0; y + h < y0 + v.h - 70; y += 100) {
-        for (int x = x0; x + NODE_W < x0 + v.w - 8; x += NODE_W + NODE_GAP) {
+    int span = is_unit_type(type) ? unit_node_count(type) : 1;
+    int x0 = -(int)floorf(g->pan_x) + 14, y0 = -(int)floorf(g->pan_y) + 14, h = is_unit_type(type) ? 100 : node_height(type);
+    int w = span * (NODE_W + NODE_GAP) - NODE_GAP;
+    /* a unit wider than the view is not held to it: it takes the first free row below, however far down */
+    int y_end = w > v.w - 22 ? y0 + 100 * MAX_NODES : y0 + v.h - 70;
+    for (int y = y0; y + h < y_end; y += 100) {
+        for (int x = x0; x + w < x0 + (w > v.w - 22 ? w + 1 : v.w - 8); x += NODE_W + NODE_GAP) {
             int hit = 0;
             for (int i = 0; i < MAX_NODES && !hit; ++i)
                 if (g->nodes[i].used &&
-                    rects_overlap(x - 6, y - 6, NODE_W + 12, h + 12, g->nodes[i].x, g->nodes[i].y, NODE_W, node_height(g->nodes[i].type)))
+                    rects_overlap(x - 6, y - 6, w + 12, h + 12, g->nodes[i].x, g->nodes[i].y, NODE_W, node_height(g->nodes[i].type)))
                     hit = 1;
-            if (!hit) return graph_add(g, type, x, y);
+            if (!hit) return graph_add_at(g, type, x, y);
         }
     }
-    return graph_add(g, type, x0, y0);
+    return graph_add_at(g, type, x0, y0);
 }
 
 /* Depth-first walk backwards from `node` along the input wires; every node is appended to order[]
@@ -1222,6 +1306,41 @@ static int gadd(Gui *g, int type, int a, int b, int c, int d, int in0, int in1) 
     return n;
 }
 
+/* The blocks a menu unit is made of, in order; each reads the one before it. The last is an add whose second input (the
+ * skip) is left unwired, like the first block's input: the wires from outside are the user's. */
+typedef struct UnitPart {
+    int type, a, b, c, d;
+} UnitPart;
+static int unit_parts(int unit, UnitPart *out) {
+    static const UnitPart res[] = {{BLK_CONV, 16, 3, 1, 1}, {BLK_BATCHNORM, 0, 0, 0, 0}, {BLK_RELU, 0, 0, 0, 0},
+                                   {BLK_CONV, 16, 3, 1, 1}, {BLK_BATCHNORM, 0, 0, 0, 0}, {BLK_ADD, 0, 0, 0, 0}};
+    static const UnitPart att[] = {{BLK_LAYERNORM, 0, 0, 0, 0}, {BLK_ATTENTION, 4, 0, 0, 0}, {BLK_ADD, 0, 0, 0, 0}};
+    static const UnitPart mlp[] = {{BLK_LAYERNORM, 0, 0, 0, 0}, {BLK_LINEAR, 64, 0, 0, 0}, {BLK_GELU, 0, 0, 0, 0},
+                                   {BLK_LINEAR, 32, 0, 0, 0}, {BLK_ADD, 0, 0, 0, 0}};
+    const UnitPart *src = unit == UNIT_RES ? res : (unit == UNIT_ATTN ? att : mlp);
+    int n = unit == UNIT_RES ? 6 : (unit == UNIT_ATTN ? 3 : 5);
+    for (int i = 0; i < n; ++i) out[i] = src[i];
+    return n;
+}
+static int unit_node_count(int unit) {
+    UnitPart parts[8];
+    return unit_parts(unit, parts);
+}
+/* Drops the unit as a row of nodes wired to each other; returns the first node. */
+static int graph_place_unit(Gui *g, int unit, int x, int y) {
+    UnitPart parts[8];
+    int n = unit_parts(unit, parts), prev = -1, first = -1;
+    for (int k = 0; k < n; ++k) {
+        int node = gadd(g, parts[k].type, parts[k].a, parts[k].b, parts[k].c, parts[k].d, prev, -1);
+        if (node < 0) break;
+        g->nodes[node].x = x + k * (NODE_W + NODE_GAP);
+        g->nodes[node].y = y;
+        if (first < 0) first = node;
+        prev = node;
+    }
+    return first;
+}
+
 static void graph_finish(Gui *g, int last) {
     int out = graph_add(g, NODE_OUTPUT, 0, 0);
     g->nodes[out].in[0] = last;
@@ -1334,7 +1453,7 @@ static void graph_preset_mlp(Gui *g) {
 }
 
 /* A small vision transformer: a patch block cuts the image into patches (the smallest size from 4 that divides it and
- * leaves at most 100 tokens) and projects each to 32 values, a learned position embedding is added, and one pre-norm
+ * leaves at most 100 tokens; nothing is learned there), an fc projects each patch to 32 values, a learned position embedding is added, and one pre-norm
  * block follows (depth = 1; raise it here) - layernorm, 4-head self-attention, residual add; layernorm, an fc that
  * widens every token, gelu, an fc back, residual add - then layernorm, global average pooling over the tokens and the
  * classifier. No convolution anywhere: fc applies to every token of a sequence. */
@@ -1350,7 +1469,8 @@ static void graph_preset_vit(Gui *g) {
         if (h % p == 0 && w % p == 0) patch = p;
     if (!patch) patch = 4;
     int x = graph_add(g, NODE_INPUT, 0, 0);
-    x = gadd(g, BLK_PATCH, patch, dim, 0, 0, x, -1);
+    x = gadd(g, BLK_PATCH, patch, 0, 0, 0, x, -1); /* cutting the image into patches has nothing to learn ... */
+    x = gadd(g, BLK_LINEAR, dim, 0, 0, 0, x, -1);  /* ... the fc on every patch does */
     x = gadd(g, BLK_POS, 0, 0, 0, 0, x, -1);
     for (int k = 0; k < depth; ++k) {
         int a = gadd(g, BLK_LAYERNORM, 0, 0, 0, 0, x, -1);
@@ -1517,8 +1637,7 @@ static void form_layout(Gui *g) {
         } else if (g->nodes[i].type == BLK_UPSAMPLE || g->nodes[i].type == BLK_ATTENTION) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 60, r.y + 28, 34, 20};
         } else if (g->nodes[i].type == BLK_PATCH) {
-            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 34, r.y + 28, 30, 20};
-            g->fields[F_NODE(i, 1)].rect = (SDL_Rect){r.x + 34, r.y + 50, 48, 20};
+            g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 40, r.y + 28, 34, 20};
         } else if (g->nodes[i].type == BLK_MAXPOOL) {
             g->fields[F_NODE(i, 0)].rect = (SDL_Rect){r.x + 22, r.y + 28, 28, 20};
             g->fields[F_NODE(i, 1)].rect = (SDL_Rect){r.x + 72, r.y + 28, 28, 20};
@@ -1607,6 +1726,10 @@ static int link_check(Gui *g, int from, int to, int port, char *why, size_t whys
     int seen[MAX_NODES] = {0};
     if (graph_depends(g, from, to, seen)) {
         snprintf(why, whysz, "that would make a loop");
+        return 0;
+    }
+    if (train_block_is_preprocess(tt) && g->nodes[from].type != NODE_INPUT) {
+        snprintf(why, whysz, "patch is preprocessing: it prepares the input, so it must read the input node directly");
         return 0;
     }
     int state[MAX_NODES] = {0};
@@ -1743,7 +1866,7 @@ static int graph_compile(Gui *g) {
         for (int j = 0; j < node_nparams(type) && type != BLK_REPARAM; ++j) {
             if (parse_int(&g->fields[F_NODE(node, j)], dst[j])) {
                 char what[48];
-                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : (type == BLK_UPSAMPLE ? "factor" : (type == BLK_ATTENTION ? "heads" : type == BLK_PATCH ? (j == 0 ? "patch size" : "width") : type == BLK_RESHAPE ? (j == 0 ? "channels" : (j == 1 ? "height" : "width")) : "out features")));
+                const char *col = type == BLK_CONV ? conv_cols[j] : (type == BLK_MAXPOOL ? pool_cols[j] : (type == BLK_UPSAMPLE ? "factor" : (type == BLK_ATTENTION ? "heads" : type == BLK_PATCH ? "patch size" : type == BLK_RESHAPE ? (j == 0 ? "channels" : (j == 1 ? "height" : "width")) : "out features")));
                 snprintf(what, sizeof(what), "%s %s", nm, col);
                 g->form_err_node = node;
                 return form_fail(g, F_NODE(node, j), what);
@@ -1847,7 +1970,6 @@ static long count_parameters(const TrainConfig *c, const NetShapes *s) {
         LayerShape in = train_block_input(s, b);
         if (b->type == BLK_CONV) total += (long)b->a * in.c * b->b * b->b + b->a;
         else if (b->type == BLK_LINEAR) total += (long)in.c * b->a + b->a;
-        else if (b->type == BLK_PATCH) total += (long)in.c * b->a * b->a * b->b + b->b;
         else if (b->type == BLK_BATCHNORM || b->type == BLK_LAYERNORM) total += 2L * in.c; /* scale + shift */
         else if (b->type == BLK_POS) total += (long)in.c * in.h * in.w;
         else if (b->type == BLK_ATTENTION) total += 4L * in.c * in.c + 4L * in.c; /* q,k,v (D x 3D) and output (D x D) projections, with biases */
@@ -2110,9 +2232,11 @@ static void draw_node(Gui *g, int i, SDL_Point mouse) {
     } else if (n->type == BLK_ATTENTION) {
         txt(g, g->font_small, "heads", r.x + 8, r.y + 31, dim);
         txt(g, g->font_small, g->attn_inspect1 == i + 1 ? "[-]" : "[+]", r.x + r.w - 28, r.y + r.h - 18, (SDL_Color){COL_TEXT_DIM});
+    } else if (n->type == BLK_GRAY) {
+        txt(g, g->font_small, "preprocessing", r.x + 8, r.y + 24, (SDL_Color){COL_TEXT_DIM});
     } else if (n->type == BLK_PATCH) {
-        txt(g, g->font_small, "size", r.x + 6, r.y + 31, dim);
-        txt(g, g->font_small, "width", r.x + 6, r.y + 53, dim);
+        txt(g, g->font_small, "size", r.x + 8, r.y + 31, dim);
+        txt(g, g->font_small, "preprocessing", r.x + 8, r.y + 52, (SDL_Color){COL_TEXT_DIM});
     } else if (n->type == BLK_RESHAPE) {
         txt(g, g->font_small, "channels  h   w", r.x + 8, r.y + 27, dim);
     } else if (n->type == BLK_REPARAM) {
@@ -2238,8 +2362,8 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, const int *expan
         if (unit_of[i] >= 0) { /* inside a collapsed unit: keep the layer numbering, remember what it was */
             char nm[24];
             int u = unit_of[i];
-            if ((k->type == BLK_CONV || k->type == BLK_LINEAR || k->type == BLK_PATCH) && unit_nlay[u] < 4) unit_lay[u][unit_nlay[u]++] = n_wl;
-            if (k->type == BLK_CONV || k->type == BLK_LINEAR || k->type == BLK_PATCH) n_wl++;
+            if ((k->type == BLK_CONV || k->type == BLK_LINEAR) && unit_nlay[u] < 4) unit_lay[u][unit_nlay[u]++] = n_wl;
+            if (k->type == BLK_CONV || k->type == BLK_LINEAR) n_wl++;
             if (k->type == BLK_ATTENTION) {
                 unit_attn[u] = k->in[0];
                 unit_heads[u] = k->a;
@@ -2358,10 +2482,13 @@ static int build_arch(const TrainConfig *c, const NetShapes *s, const int *expan
             snprintf(q->name, sizeof(q->name), "fc%d", ++n_lin);
             q->layers[q->n_layers++] = n_wl++;
             break;
+        case BLK_GRAY:
+            snprintf(q->name, sizeof(q->name), "gray");
+            snprintf(q->params, sizeof(q->params), "preprocessing");
+            break;
         case BLK_PATCH:
             snprintf(q->name, sizeof(q->name), "patch");
-            snprintf(q->params, sizeof(q->params), "%dx%d > %d", k->a, k->a, k->b);
-            q->layers[q->n_layers++] = n_wl++;
+            snprintf(q->params, sizeof(q->params), "%dx%d, preprocessing", k->a, k->a);
             break;
         case BLK_ADD: snprintf(q->name, sizeof(q->name), "add%d", ++n_add); break;
         case BLK_UPSAMPLE:
@@ -2618,6 +2745,9 @@ static void draw_architecture(Gui *g, SDL_Rect r, const TrainConfig *cfg, const 
 
 static const char *palette_label(int type) {
     switch (type) {
+    case UNIT_RES: return "res block";
+    case UNIT_ATTN: return "attn block";
+    case UNIT_MLP: return "mlp block";
     case BLK_CONV: return "conv";
     case BLK_RELU: return "relu";
     case BLK_FLATTEN: return "flat";
@@ -2635,6 +2765,7 @@ static const char *palette_label(int type) {
     case BLK_POS: return "pos";
     case BLK_ATTENTION: return "attn";
     case BLK_PATCH: return "patch";
+    case BLK_GRAY: return "gray";
     default: return "vae";
     }
 }
@@ -3019,11 +3150,24 @@ static void draw_graph(Gui *g) {
     }
 
     if (g->palette_open) { /* the block menu floats over the canvas */
-        SDL_Rect bg = {BTN_BLOCKS.x - 6, BTN_BLOCKS.y + BTN_BLOCKS.h + 1, 132, palette_count(g) * 31 + 10};
+        SDL_Rect bg = {BTN_BLOCKS.x - 6, BTN_BLOCKS.y + BTN_BLOCKS.h + 1, palette_menu_width(g), palette_menu_height(g)};
         draw_shadow(g->ren, bg, 9);
         rrect_bordered(g->ren, bg, 9, (SDL_Color){COL_SURFACE}, (SDL_Color){COL_LOSS});
+        txt(g, g->font_small, "basic", BTN_BLOCKS.x + 4, BTN_BLOCKS.y + BTN_BLOCKS.h + 8, (SDL_Color){COL_TEXT_DIM});
+        {
+            int o[24], nb, np;
+            palette_all(g, o, &nb, &np);
+            if (np > 0) txt(g, g->font_small, "preprocessing", BTN_BLOCKS.x + 134, BTN_BLOCKS.y + BTN_BLOCKS.h + 8, (SDL_Color){COL_TEXT_DIM});
+        }
+        if (palette_has_advanced(g)) { /* the advanced section folds under the preprocessing rows */
+            SDL_Rect fr = palette_fold_rect(g);
+            SDL_SetRenderDrawColor(g->ren, 62, 70, 94, 255);
+            SDL_RenderDrawLine(g->ren, fr.x, fr.y - 1, fr.x + fr.w, fr.y - 1);
+            txt(g, g->font_small, g->palette_adv ? "advanced  <" : "advanced  >", fr.x + 4, fr.y + 5,
+                SDL_PointInRect(&mouse, &fr) ? (SDL_Color){COL_TEXT} : (SDL_Color){COL_TEXT_DIM});
+        }
         for (int i = 0; i < palette_count(g); ++i) {
-            SDL_Rect pr = palette_rect(i);
+            SDL_Rect pr = palette_rect(g, i);
             draw_chip(g, pr, palette_label(palette_type(g, i)), node_accent(palette_type(g, i)), SDL_PointInRect(&mouse, &pr));
         }
     }
@@ -3165,7 +3309,7 @@ static int model_info_ok(const ModelInfo *m) {
     if (train_cfg_derive(&m->cfg, &s, err, sizeof(err)) != 0) return 0;
     int weighted = 0;
     for (int i = 0; i < m->cfg.n_blocks; ++i)
-        if (m->cfg.blocks[i].type == BLK_CONV || m->cfg.blocks[i].type == BLK_LINEAR || m->cfg.blocks[i].type == BLK_PATCH) weighted++;
+        if (m->cfg.blocks[i].type == BLK_CONV || m->cfg.blocks[i].type == BLK_LINEAR) weighted++;
     if (m->n_viz != weighted || m->n_viz > MAX_VIZ_LAYERS) return 0;
     long used = 0;
     for (int i = 0; i < m->n_viz; ++i) {
@@ -3193,6 +3337,12 @@ static int model_info_ok(const ModelInfo *m) {
             al->prev < -1 || al->prev >= k)
             return 0;
         act_used += al->dim;
+        if (al->src_offset >= 0) { /* the layer's input values follow its output values */
+            if (al->src_offset != act_used || al->in_dim < 1 || al->in_dim > MAX_FC_WIDTH || al->src_tid < 0 || al->src_tid > m->cfg.n_blocks) return 0;
+            act_used += al->in_dim;
+        } else if (al->src_offset != -1) {
+            return 0;
+        }
     }
     if (act_used != m->total_act_floats) return 0;
     long attn_used = 0;
@@ -3204,7 +3354,17 @@ static int model_info_ok(const ModelInfo *m) {
             return 0;
         attn_used += (long)av->heads * av->tokens * av->tokens;
     }
-    return attn_used == m->total_attn_floats && attn_used <= ATTN_MAX_FLOATS;
+    if (attn_used != m->total_attn_floats || attn_used > ATTN_MAX_FLOATS) return 0;
+    long fmap_used = 0;
+    if (m->n_fmap < 0 || m->n_fmap > MAX_FMAP_VIZ) return 0;
+    for (int k = 0; k < m->n_fmap; ++k) {
+        const FmapViz *fv = &m->fmap[k];
+        if (fv->ch < 1 || fv->h < 1 || fv->w < 1 || fv->offset != fmap_used || fv->viz_index < 0 || fv->viz_index >= m->n_viz ||
+            m->layers[fv->viz_index].kind != VIZ_CONV_GRID || fv->tid < 1 || fv->tid > m->cfg.n_blocks)
+            return 0;
+        fmap_used += (long)fv->ch * fv->h * fv->w;
+    }
+    return fmap_used == m->total_fmap_floats && fmap_used <= FMAP_MAX_FLOATS;
 }
 
 /* The sample texture and pixel buffer follow the dataset's image size, which
@@ -3261,6 +3421,9 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         free(g->attn);
         g->attn = (float *)calloc((size_t)(info.total_attn_floats > 0 ? info.total_attn_floats : 1), sizeof(float));
         g->attn_valid = 0;
+        free(g->fmap);
+        g->fmap = (float *)calloc((size_t)(info.total_fmap_floats > 0 ? info.total_fmap_floats : 1), sizeof(float));
+        g->fmap_valid = 0;
         memset(g->arch_expanded, 0, sizeof(g->arch_expanded));
         memset(g->arch_attn_open, 0, sizeof(g->arch_attn_open));
         memset(g->arch_proj_open, 0, sizeof(g->arch_proj_open));
@@ -3283,8 +3446,9 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         size_t img_bytes = train_sample_bytes(&g->run_cfg);
         size_t abytes = sizeof(float) * (size_t)g->model.total_act_floats;
         size_t tbytes = sizeof(float) * (size_t)g->model.total_attn_floats;
-        size_t base = sizeof(Progress) + img_bytes + abytes + tbytes;
-        if (!g->sample || !g->acts || !g->attn || bytes < base || (bytes != base && bytes != base + wbytes)) return;
+        size_t fbytes = sizeof(float) * (size_t)g->model.total_fmap_floats;
+        size_t base = sizeof(Progress) + img_bytes + abytes + tbytes + fbytes;
+        if (!g->sample || !g->acts || !g->attn || !g->fmap || bytes < base || (bytes != base && bytes != base + wbytes)) return;
         Progress prog;
         memcpy(&prog, p, sizeof(prog));
         if (prog.has_weights) {
@@ -3299,6 +3463,8 @@ static void handle_message(Gui *g, uint32_t type, const unsigned char *p, uint32
         g->acts_valid = 1;
         if (tbytes) memcpy(g->attn, p + sizeof(Progress) + img_bytes + abytes, tbytes);
         g->attn_valid = 1;
+        if (fbytes) memcpy(g->fmap, p + sizeof(Progress) + img_bytes + abytes + tbytes, fbytes);
+        g->fmap_valid = 1;
         g->prog = prog;
         g->has_record = 1;
         gui_push_point(g, prog.loss);
@@ -3410,18 +3576,31 @@ static SDL_Rect weights_flip_button(SDL_Rect box) {
     return r;
 }
 /* Its label, or NULL when this view has nothing to flip to. */
+/* The conv layer's entry in ModelInfo.fmap, or -1 (not a conv tab, or its result did not fit the budget). */
+static int tab_fmap(const Gui *g) {
+    if (g->weights_tab >= vis_count(g)) return -1;
+    int li = vis_layer(g, g->weights_tab);
+    for (int k = 0; k < g->model.n_fmap; ++k)
+        if (g->model.fmap[k].viz_index == li) return k;
+    return -1;
+}
+/* fc layers have no picture of their weights, only the neurons: their tab is the network view. */
+static void weights_tab_normalize(Gui *g) {
+    if (g->weights_tab < vis_count(g) && g->model.layers[vis_layer(g, g->weights_tab)].kind != VIZ_CONV_GRID && tab_net(g) >= 0)
+        g->weights_tab = tab_net(g);
+}
 static const char *weights_flip_label(const Gui *g) {
-    if (g->model.n_act <= 0) return NULL;
-    if (g->weights_tab == tab_net(g)) return "< weights";
-    if (g->weights_tab == tab_attn(g) || g->weights_tab >= vis_count(g)) return NULL;
-    const char *name = g->model.layers[vis_layer(g, g->weights_tab)].name;
-    return name[0] == 'f' && name[1] == 'c' ? "network >" : NULL; /* fc layers: their neurons */
+    if (g->weights_tab >= vis_count(g)) return NULL;
+    if (tab_fmap(g) >= 0) return g->conv_result ? "< filters" : "result >"; /* conv layers: what they produced */
+    return NULL;
 }
 
 static void close_weights_window(Gui *g) {
     if (!g->weights_win) return;
     if (g->net_img_tex) SDL_DestroyTexture(g->net_img_tex); /* belongs to the weights renderer */
     g->net_img_tex = NULL;
+    if (g->fmap_tex) SDL_DestroyTexture(g->fmap_tex);
+    g->fmap_tex = NULL;
     for (int i = 0; i < NUM_WLABEL_SLOTS; ++i) {
         if (g->weights_label_tex[i]) SDL_DestroyTexture(g->weights_label_tex[i]);
         g->weights_label_tex[i] = NULL;
@@ -3675,56 +3854,14 @@ static void resample_avg(const float *src, int sr, int sc, int dr, int dc, float
     }
 }
 
-/* fc weight matrix: a height-field surface, averaged down to a grid the
- * software renderer can redraw every frame. */
-static void build_matrix_3d(const Cam *cam, const LayerViz *lv, const float *data) {
-    static float grid[VIEW3D_GRID_MAX * VIEW3D_GRID_MAX];
-    int rows = lv->count, cols = lv->cols;
-    int R = rows < VIEW3D_GRID_MAX ? rows : VIEW3D_GRID_MAX;
-    int C = cols < VIEW3D_GRID_MAX ? cols : VIEW3D_GRID_MAX;
-    if (R < 2) R = 2;
-    if (C < 2) C = 2;
-    resample_avg(data, rows, cols, R, C, grid);
-
-    float hmax = 1e-12f;
-    for (int i = 0; i < R * C; ++i) hmax = fmaxf(hmax, fabsf(grid[i]));
-    float ratio = (float)cols / (float)rows;
-    float hx = ratio >= 1.0f ? 1.0f : fmaxf(0.25f, ratio);
-    float hz = ratio >= 1.0f ? fmaxf(0.25f, 1.0f / ratio) : 1.0f;
-    float height = VIEW3D_HEIGHT * 0.6f;
-    faces_reserve((R - 1) * (C - 1) + 8);
-
-    add_floor(cam, -hx, hx, -hz, hz);
-    for (int r = 0; r < R - 1; ++r) {
-        for (int c = 0; c < C - 1; ++c) {
-            V3 corner[4];
-            SDL_Color col[4];
-            static const int dr[4] = {0, 0, 1, 1}, dc[4] = {0, 1, 1, 0};
-            for (int k = 0; k < 4; ++k) {
-                int rr = r + dr[k], cc = c + dc[k];
-                float t = grid[rr * C + cc] / hmax;
-                corner[k] = (V3){-hx + 2.0f * hx * cc / (C - 1), t * height, hz - 2.0f * hz * rr / (R - 1)};
-                col[k] = color_signed(t * 2.0f); /* most weights are small next to the largest: stretch the colours */
-            }
-            add_surface_quad(cam, corner[0], corner[1], corner[2], corner[3], col, 0);
-        }
-    }
-}
-
 static void draw_3d_view(Gui *g, SDL_Rect box, const LayerViz *lv, const float *data, const char *caption) {
     draw_panel(g->weights_ren, box);
 
     Cam cam = {cosf(g->yaw), sinf(g->yaw), cosf(g->pitch), sinf(g->pitch), 600.0f * g->zoom3d, box.x + box.w * 0.5f,
                box.y + box.h * 0.5f + 20.0f};
     g_faces_n = 0;
-    int n_data;
-    if (lv->kind == VIZ_CONV_GRID) {
-        build_conv_3d(&cam, lv, data);
-        n_data = lv->count * lv->ksize * lv->ksize;
-    } else {
-        build_matrix_3d(&cam, lv, data);
-        n_data = lv->count * lv->cols;
-    }
+    build_conv_3d(&cam, lv, data);
+    int n_data = lv->count * lv->ksize * lv->ksize;
     flush_faces(g, box);
 
     SDL_Color dim = {COL_TEXT_DIM};
@@ -3741,9 +3878,7 @@ static void draw_3d_view(Gui *g, SDL_Rect box, const LayerViz *lv, const float *
     char stats[96];
     snprintf(stats, sizeof(stats), "min % .5f  max % .5f  mean % .5f  rms %.5f", vmin, vmax, vmean, vrms);
     wtxt(g, stats, box.x + 10, box.y + box.h - 22, dim);
-    const char *legend = (lv->kind == VIZ_CONV_GRID && !lv->full_detail)
-                             ? "height = mean |w| (blue low, yellow high)"
-                             : "height = weight (blue < 0, red > 0)";
+    const char *legend = !lv->full_detail ? "height = mean |w| (blue low, yellow high)" : "height = weight (blue < 0, red > 0)";
     wtxt(g, legend, box.x + 10, box.y + box.h - 42, dim);
 }
 
@@ -3821,7 +3956,7 @@ static void draw_network_view(Gui *g, SDL_Rect box) {
     const ModelInfo *m = &g->model;
     draw_panel(R, box);
     SDL_Color dim = {COL_TEXT_DIM};
-    wtxt(g, "fully-connected layers as neurons", box.x + 10, box.y + 8, (SDL_Color){COL_TEXT});
+    wtxt(g, "fc layer = n x m matrix: n dots left, m dots right", box.x + 10, box.y + 8, (SDL_Color){COL_TEXT});
     wtxt(g, "brightness = activation for the dashboard's sample", box.x + 10, box.y + 28, dim);
 
     SDL_Rect mb = net_mode_button(box);
@@ -3831,13 +3966,13 @@ static void draw_network_view(Gui *g, SDL_Rect box) {
     TTF_SizeText(g->font, mlabel, &tw, NULL);
     wtxt(g, mlabel, mb.x + (mb.w - tw) / 2, mb.y + 6, (SDL_Color){COL_TEXT});
 
-    /* columns: a source block wherever a layer is not fed by another fc layer, then the layer itself */
+    /* columns: n dots for what feeds a layer (unless the fc layer before it already is that column), then its m dots */
     int ncol = 0, layer_col[MAX_VIZ_LAYERS], col_layer[2 * MAX_VIZ_LAYERS + 1], col_dim[2 * MAX_VIZ_LAYERS + 1];
     const char *col_label[2 * MAX_VIZ_LAYERS + 1];
     for (int k = 0; k < m->n_act; ++k) {
         const ActLayer *al = &m->act[k];
         if (al->prev < 0 || layer_col[al->prev] != ncol - 1) {
-            col_layer[ncol] = -1;
+            col_layer[ncol] = -1 - k; /* the input of layer k */
             col_dim[ncol] = al->in_dim;
             col_label[ncol] = al->src;
             ncol++;
@@ -3858,9 +3993,9 @@ static void draw_network_view(Gui *g, SDL_Rect box) {
     int col_x[2 * MAX_VIZ_LAYERS + 1];
     for (int c = 0; c < ncol; ++c) col_x[c] = left + c * (right - left) / (ncol - 1);
 
-    /* this sample's activation of every neuron (class scores become probabilities), normalised per layer */
-    static float act_buf[MAX_VIZ_LAYERS][MAX_FC_WIDTH];
-    float act_max[MAX_VIZ_LAYERS];
+    /* this sample's values at every dot (class scores become probabilities), normalised per column */
+    static float act_buf[MAX_VIZ_LAYERS][MAX_FC_WIDTH], src_buf[MAX_VIZ_LAYERS][MAX_FC_WIDTH];
+    float act_max[MAX_VIZ_LAYERS], src_max[MAX_VIZ_LAYERS];
     for (int k = 0; k < m->n_act; ++k) {
         const ActLayer *al = &m->act[k];
         for (int i = 0; i < al->dim; ++i) act_buf[k][i] = g->acts_valid ? g->acts[al->offset + i] : 0.0f;
@@ -3873,112 +4008,92 @@ static void draw_network_view(Gui *g, SDL_Rect box) {
         } else {
             act_max[k] = act_norm(act_buf[k], al->dim);
         }
+        src_max[k] = 1.0f;
+        if (al->src_offset >= 0) {
+            for (int i = 0; i < al->in_dim; ++i) src_buf[k][i] = g->acts_valid ? g->acts[al->src_offset + i] : 0.0f;
+            src_max[k] = act_norm(src_buf[k], al->in_dim);
+        }
     }
 
-    /* neuron positions: circles up to 24 neurons, otherwise a strip of thin cells */
-    /* edges */
-    int hint_pooled = 0;
+    /* edges: the strongest 90 entries of each layer's matrix, from its n dots to its m dots. A matrix that was sent
+     * pooled (several input rows averaged into one) draws each row at the middle of the dots it stands for. */
     for (int k = 0; k < m->n_act; ++k) {
         const ActLayer *al = &m->act[k];
         const LayerViz *lv = &m->layers[al->viz_index];
         const float *w = g->weights + lv->offset;
-        int dc = layer_col[k];
-        if (al->prev >= 0 && layer_col[al->prev] == dc - 1) {
-            if (!lv->full_detail) { hint_pooled = 1; continue; }
-            int sc = dc - 1, in = lv->in_dim, out = lv->out_dim;
-            const float *asrc = act_buf[al->prev];
-            EdgeV *e = (EdgeV *)malloc(sizeof(EdgeV) * (size_t)in * (size_t)out);
-            if (!e) continue;
-            int ne = 0;
-            for (int i = 0; i < in; ++i)
-                for (int j = 0; j < out; ++j) {
-                    float v = w[(size_t)i * out + j];
-                    if (g->net_mode == 0 && g->acts_valid) v *= asrc[i];
-                    e[ne].i = i; e[ne].j = j; e[ne].v = v;
-                    ne++;
-                }
-            qsort(e, (size_t)ne, sizeof(EdgeV), cmp_edge_abs_desc);
-            int keep = ne < 90 ? ne : 90;
-            float vmax = keep > 0 ? fmaxf(fabsf(e[0].v), 1e-9f) : 1.0f;
-            for (int q = keep - 1; q >= 0; --q) { /* weakest first, so the strong lines end up on top */
-                float t = fabsf(e[q].v) / vmax;
-                SDL_Color c = e[q].v > 0 ? (SDL_Color){236, 92, 92, 255} : (SDL_Color){84, 144, 246, 255};
-                SDL_SetRenderDrawColor(R, c.r, c.g, c.b, (Uint8)(36 + 200 * t));
-                int x0 = col_x[sc] + 8, y0 = (int)net_y(col_dim[sc], e[q].i, top, bottom), x1 = col_x[dc] - 8, y1 = (int)net_y(col_dim[dc], e[q].j, top, bottom);
-                SDL_RenderDrawLine(R, x0, y0, x1, y1);
-                if (t > 0.5f) SDL_RenderDrawLine(R, x0, y0 + 1, x1, y1 + 1);
+        int dc = layer_col[k], sc = dc - 1, rows = lv->count, outs = lv->out_dim, pool = lv->pool > 0 ? lv->pool : 1;
+        const float *asrc = NULL; /* the activation of each input dot, when known */
+        if (al->prev >= 0 && layer_col[al->prev] == sc) asrc = act_buf[al->prev];
+        else if (al->src_offset >= 0) asrc = src_buf[k];
+        EdgeV *e = (EdgeV *)malloc(sizeof(EdgeV) * (size_t)rows * (size_t)outs);
+        if (!e) continue;
+        int ne = 0;
+        for (int i = 0; i < rows; ++i) {
+            float a = 1.0f;
+            if (g->net_mode == 0 && g->acts_valid && asrc) {
+                int lo = i * pool, hi = lo + pool < al->in_dim ? lo + pool : al->in_dim;
+                float s = 0.0f;
+                for (int q = lo; q < hi; ++q) s += asrc[q];
+                a = hi > lo ? s / (float)(hi - lo) : 0.0f;
             }
-            free(e);
-        } else {
-            /* hangs off a source block: one line per neuron, as strong as the neuron's weight norm */
-            int sc = dc - 1, rows = lv->count, cols = lv->cols;
-            float *norm = (float *)malloc(sizeof(float) * (size_t)cols);
-            if (!norm) continue;
-            float nmax = 1e-9f;
-            for (int j = 0; j < cols; ++j) {
-                double sq = 0.0;
-                for (int r = 0; r < rows; ++r) sq += (double)w[(size_t)r * cols + j] * w[(size_t)r * cols + j];
-                norm[j] = (float)sqrt(sq / (double)(rows > 0 ? rows : 1));
-                nmax = fmaxf(nmax, norm[j]);
+            for (int j = 0; j < outs; ++j) {
+                e[ne].i = i; e[ne].j = j; e[ne].v = w[(size_t)i * outs + j] * a;
+                ne++;
             }
-            int bx = col_x[sc] + 17, by = (top + bottom) / 2;
-            for (int j = 0; j < cols; ++j) {
-                float t = norm[j] / nmax;
-                SDL_SetRenderDrawColor(R, 150, 160, 190, (Uint8)(14 + 90 * t * t));
-                SDL_RenderDrawLine(R, bx, by, col_x[dc] - 8, (int)net_y(col_dim[dc], j, top, bottom));
-            }
-            free(norm);
         }
+        qsort(e, (size_t)ne, sizeof(EdgeV), cmp_edge_abs_desc);
+        int keep = ne < 90 ? ne : 90;
+        float vmax = keep > 0 ? fmaxf(fabsf(e[0].v), 1e-9f) : 1.0f;
+        for (int q = keep - 1; q >= 0; --q) { /* weakest first, so the strong lines end up on top */
+            float t = fabsf(e[q].v) / vmax;
+            SDL_Color c = e[q].v > 0 ? (SDL_Color){236, 92, 92, 255} : (SDL_Color){84, 144, 246, 255};
+            SDL_SetRenderDrawColor(R, c.r, c.g, c.b, (Uint8)(36 + 200 * t));
+            int si = e[q].i * pool + pool / 2;
+            if (si >= al->in_dim) si = al->in_dim - 1;
+            int x0 = col_x[sc] + 8, y0 = (int)net_y(col_dim[sc], si, top, bottom), x1 = col_x[dc] - 8, y1 = (int)net_y(col_dim[dc], e[q].j, top, bottom);
+            SDL_RenderDrawLine(R, x0, y0, x1, y1);
+            if (t > 0.5f) SDL_RenderDrawLine(R, x0, y0 + 1, x1, y1 + 1);
+        }
+        free(e);
     }
 
-    /* the sample itself above the first source block */
-    if (sample_texture(g)) {
-        int tile = 64; /* under the source block, where there is room */
-        SDL_Rect dst = {col_x[0] - tile / 2, (top + bottom) / 2 + 72, tile, tile};
-        SDL_RenderCopy(R, g->net_img_tex, NULL, &dst);
-        wtxt(g, "this sample", dst.x - 2, dst.y + tile + 3, dim);
-    }
-
-    /* neurons and labels */
+    /* the dots: circles up to 24, otherwise a strip of thin cells */
     for (int c = 0; c < ncol; ++c) {
-        int k = col_layer[c];
+        int k = col_layer[c] >= 0 ? col_layer[c] : -1 - col_layer[c], is_src = col_layer[c] < 0;
+        const ActLayer *al = &m->act[k];
+        const float *vals = is_src ? (al->src_offset >= 0 ? src_buf[k] : NULL) : act_buf[k];
+        float vmax = is_src ? src_max[k] : act_max[k];
+        int n = col_dim[c], is_out = !is_src && k == m->n_act - 1 && out_is_classes;
         char hdr[40];
-        if (k < 0) {
-            snprintf(hdr, sizeof(hdr), "%s  %d", col_label[c], col_dim[c]);
-            int bh = 120;
-            SDL_Rect blk = {col_x[c] - 17, (top + bottom) / 2 - bh / 2, 34, bh};
-            rrect_bordered(R, blk, 8, (SDL_Color){COL_SURFACE2}, (SDL_Color){COL_BORDER_HI});
-        } else {
-            const ActLayer *al = &m->act[k];
-            snprintf(hdr, sizeof(hdr), "%s  %d%s", col_label[c], al->dim, al->relu ? "  relu" : "");
-            int amax_idx = 0;
-            for (int i = 1; i < al->dim; ++i)
-                if (act_buf[k][i] > act_buf[k][amax_idx]) amax_idx = i;
-            for (int i = 0; i < al->dim; ++i) {
-                float t = fabsf(act_buf[k][i]) / act_max[k];
-                SDL_Color col = neuron_color(t);
-                float y = net_y(col_dim[c], i, top, bottom);
-                if (col_dim[c] <= 24) {
-                    fill_circle_aa(R, col_x[c], (int)y, 9, (SDL_Color){COL_BORDER_HI});
-                    fill_circle_aa(R, col_x[c], (int)y, 8, col);
-                    if (k == m->n_act - 1 && out_is_classes) {
-                        char nb[CLASS_NAME_LEN + 8], lab[48];
-                        snprintf(lab, sizeof(lab), "%s %.0f%%", class_name(&g->run_ds, i, nb, sizeof(nb)), act_buf[k][i] * 100.0f);
-                        wtxt(g, lab, col_x[c] + 16, (int)y - 7, i == amax_idx ? (SDL_Color){255, 214, 102, 255} : dim);
-                        if (i == amax_idx) {
-                            SDL_SetRenderDrawColor(R, 255, 214, 102, 255);
-                            for (int d = 0; d < 360; d += 6) {
-                                float a = (float)d * 0.0174533f;
-                                SDL_RenderDrawPoint(R, col_x[c] + (int)(12.0f * cosf(a)), (int)y + (int)(12.0f * sinf(a)));
-                            }
+        if (is_src) snprintf(hdr, sizeof(hdr), "%s  %d", col_label[c], n);
+        else snprintf(hdr, sizeof(hdr), "%s  %d%s", col_label[c], n, al->relu ? "  relu" : "");
+        int amax_idx = 0;
+        if (vals)
+            for (int i = 1; i < n; ++i)
+                if (vals[i] > vals[amax_idx]) amax_idx = i;
+        for (int i = 0; i < n; ++i) {
+            SDL_Color col = neuron_color(vals ? fabsf(vals[i]) / vmax : 0.12f);
+            float y = net_y(n, i, top, bottom);
+            if (n <= 24) {
+                fill_circle_aa(R, col_x[c], (int)y, 9, (SDL_Color){COL_BORDER_HI});
+                fill_circle_aa(R, col_x[c], (int)y, 8, col);
+                if (is_out) {
+                    char nb[CLASS_NAME_LEN + 8], lab[48];
+                    snprintf(lab, sizeof(lab), "%s %.0f%%", class_name(&g->run_ds, i, nb, sizeof(nb)), vals[i] * 100.0f);
+                    wtxt(g, lab, col_x[c] + 16, (int)y - 7, i == amax_idx ? (SDL_Color){255, 214, 102, 255} : dim);
+                    if (i == amax_idx) {
+                        SDL_SetRenderDrawColor(R, 255, 214, 102, 255);
+                        for (int d = 0; d < 360; d += 6) {
+                            float a = (float)d * 0.0174533f;
+                            SDL_RenderDrawPoint(R, col_x[c] + (int)(12.0f * cosf(a)), (int)y + (int)(12.0f * sinf(a)));
                         }
                     }
-                } else {
-                    float ch = (float)(bottom - top) / (float)col_dim[c];
-                    SDL_Rect cell = {col_x[c] - 7, (int)(y - ch * 0.5f), 14, ch < 1.0f ? 1 : (int)ch};
-                    SDL_SetRenderDrawColor(R, col.r, col.g, col.b, 255);
-                    SDL_RenderFillRect(R, &cell);
                 }
+            } else {
+                float ch = (float)(bottom - top) / (float)n;
+                SDL_Rect cell = {col_x[c] - 7, (int)(y - ch * 0.5f), 14, ch < 1.0f ? 1 : (int)ch};
+                SDL_SetRenderDrawColor(R, col.r, col.g, col.b, 255);
+                SDL_RenderFillRect(R, &cell);
             }
         }
         int hw = 0;
@@ -3986,13 +4101,12 @@ static void draw_network_view(Gui *g, SDL_Rect box) {
         wtxt(g, hdr, col_x[c] - hw / 2, top - 22, (SDL_Color){COL_TEXT});
     }
 
-    wtxt(g, g->net_mode == 0 ? "red line: pushes the next neuron up for this sample"
+    wtxt(g, g->net_mode == 0 ? "red line: pushes the next dot up for this sample"
                              : "red line: positive weight",
          box.x + 10, box.y + box.h - 54, dim);
     wtxt(g, g->net_mode == 0 ? "blue line: pushes it down   (strongest 90 lines)" : "blue line: negative weight   (strongest 90 lines)",
          box.x + 10, box.y + box.h - 38, dim);
-    if (hint_pooled) wtxt(g, "(a layer whose weights were sent pooled has its lines hidden)", box.x + 10, box.y + box.h - 20, dim);
-    else if (!g->acts_valid) wtxt(g, "waiting for the first batch...", box.x + 10, box.y + box.h - 20, dim);
+    if (!g->acts_valid) wtxt(g, "waiting for the first batch...", box.x + 10, box.y + box.h - 20, dim);
 }
 
 /* -- attention view --------------------------------------------------------- */
@@ -4225,7 +4339,13 @@ static int arch_group_tab(const Gui *g, const ArchGroup *q) {
     if (!g->has_model) return -1;
     if (q->has_attn) return tab_attn(g);
     for (int k = 0; k < q->n_layers; ++k) {
-        int t = tab_of_layer(g, q->layers[k]);
+        int li = q->layers[k];
+        if (li >= 0 && li < g->model.n_viz && g->model.layers[li].kind != VIZ_CONV_GRID) { /* fc: its neurons, if it has any */
+            for (int a = 0; a < g->model.n_act; ++a)
+                if (g->model.act[a].viz_index == li) return tab_net(g);
+            continue;
+        }
+        int t = tab_of_layer(g, li);
         if (t >= 0) return t;
     }
     return -1;
@@ -4381,6 +4501,74 @@ static void arch_click(Gui *g, SDL_Point p) {
     }
 }
 
+/* An RGBA picture w x h drawn into `box` (stretched, nearest-neighbour) through the weights window's mosaic texture. */
+static void draw_rgba_image(Gui *g, SDL_Rect box, const unsigned char *rgba, int w, int h) {
+    SDL_Renderer *R = g->weights_ren;
+    if (!g->fmap_tex || g->fmap_tex_w != w || g->fmap_tex_h != h) {
+        if (g->fmap_tex) SDL_DestroyTexture(g->fmap_tex);
+        g->fmap_tex = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
+        if (g->fmap_tex) SDL_SetTextureScaleMode(g->fmap_tex, SDL_ScaleModeNearest);
+        g->fmap_tex_w = w;
+        g->fmap_tex_h = h;
+    }
+    if (!g->fmap_tex) return;
+    SDL_UpdateTexture(g->fmap_tex, NULL, rgba, w * 4);
+    SDL_RenderCopy(R, g->fmap_tex, NULL, &box);
+}
+
+static void put_rgba(unsigned char *p, SDL_Color c) {
+    p[0] = c.r;
+    p[1] = c.g;
+    p[2] = c.b;
+    p[3] = 255;
+}
+
+/* A conv layer's result for the sample on the dashboard: one small image per output channel, tiled. Each map is scaled
+ * to its own min..max, so a weak channel is as readable as a strong one. */
+static void draw_fmap_view(Gui *g, SDL_Rect box, const FmapViz *fv, const char *name) {
+    draw_panel(g->weights_ren, box);
+    SDL_Color dim = {COL_TEXT_DIM};
+    char cap[128];
+    snprintf(cap, sizeof(cap), "%s - result for the dashboard sample: %d maps %dx%d", name, fv->ch, fv->w, fv->h);
+    wtxt(g, cap, box.x + 10, box.y + 8, (SDL_Color){COL_TEXT});
+    wtxt(g, "each map scaled to its own min..max", box.x + 10, box.y + 28, dim);
+    SDL_Rect area = {box.x + 10, box.y + 56, box.w - 20, box.h - 56 - 44};
+    int best_cols = 1;
+    float best_s = 0.0f;
+    for (int cols = 1; cols <= fv->ch; ++cols) {
+        int rows = (fv->ch + cols - 1) / cols;
+        float s = fminf((float)area.w / (float)(cols * (fv->w + 1)), (float)area.h / (float)(rows * (fv->h + 1)));
+        if (s > best_s) { best_s = s; best_cols = cols; }
+    }
+    int cols = best_cols, rows = (fv->ch + cols - 1) / cols;
+    int mw = cols * (fv->w + 1) - 1, mh = rows * (fv->h + 1) - 1;
+    unsigned char *img = (unsigned char *)malloc((size_t)mw * mh * 4);
+    if (!img) return;
+    for (int i = 0; i < mw * mh; ++i) put_rgba(img + 4 * i, (SDL_Color){24, 28, 40, 255});
+    const float *data = g->fmap + fv->offset;
+    for (int c = 0; c < fv->ch; ++c) {
+        const float *m = data + (size_t)c * fv->h * fv->w;
+        float lo = m[0], hi = m[0];
+        for (int i = 1; i < fv->h * fv->w; ++i) {
+            if (m[i] < lo) lo = m[i];
+            if (m[i] > hi) hi = m[i];
+        }
+        float span = hi - lo > 1e-12f ? hi - lo : 1.0f;
+        int ox = (c % cols) * (fv->w + 1), oy = (c / cols) * (fv->h + 1);
+        for (int y = 0; y < fv->h; ++y)
+            for (int x = 0; x < fv->w; ++x) {
+                float t = g->fmap_valid ? (m[y * fv->w + x] - lo) / span : 0.0f;
+                unsigned char v = (unsigned char)(t * 255.0f);
+                put_rgba(img + 4 * ((size_t)(oy + y) * mw + ox + x), (SDL_Color){v, v, v, 255});
+            }
+    }
+    float s = best_s >= 1.0f ? floorf(best_s) : best_s;
+    SDL_Rect dst = {area.x + (int)((area.w - mw * s) / 2), area.y + (int)((area.h - mh * s) / 2), (int)(mw * s), (int)(mh * s)};
+    draw_rgba_image(g, dst, img, mw, mh);
+    free(img);
+    if (!g->fmap_valid) wtxt(g, "waiting for the first batch...", box.x + 10, box.y + box.h - 22, dim);
+}
+
 static void draw_weights_flip(Gui *g, SDL_Rect box, const char *label) {
     if (!label) return;
     SDL_Rect b = weights_flip_button(box);
@@ -4407,11 +4595,11 @@ static void render_weights_window(Gui *g) {
     }
 
     if (g->weights_tab >= tabs_total(g)) g->weights_tab = 0;
+    weights_tab_normalize(g);
     SDL_Rect content_box = WEIGHTS_CONTENT;
     const char *flip = weights_flip_label(g);
     if (g->weights_tab == tab_net(g)) {
         draw_network_view(g, content_box);
-        draw_weights_flip(g, content_box, flip);
         SDL_RenderPresent(g->weights_ren);
         return;
     }
@@ -4425,22 +4613,21 @@ static void render_weights_window(Gui *g) {
     const float *data = g->weights + lv->offset;
     SDL_Rect grid_box = WEIGHTS_CONTENT;
 
-    char caption[96];
-    if (lv->kind == VIZ_CONV_GRID) {
-        if (lv->full_detail)
-            snprintf(caption, sizeof(caption), "%s - %d filters (%dx%d, full detail)", lv->name, lv->count, lv->ksize,
-                     lv->ksize);
-        else
-            snprintf(caption, sizeof(caption), "%s - %d maps (%dx%d, mean |w| over in-ch)", lv->name, lv->count,
-                     lv->ksize, lv->ksize);
-    } else if (lv->pool == 1) {
-        snprintf(caption, sizeof(caption), "%s weight (%d->%d, full detail)", lv->name, lv->in_dim, lv->out_dim);
-    } else {
-        snprintf(caption, sizeof(caption), "%s weight (%d->%d, pooled %d rows/px)", lv->name, lv->in_dim, lv->out_dim,
-                 lv->pool);
+    if (lv->kind != VIZ_CONV_GRID) { /* an fc layer with no neuron view (it works on tokens): nothing to draw */
+        draw_panel(g->weights_ren, grid_box);
+        wtxt(g, "this layer works on every token alike - it has no neuron view", grid_box.x + 10, grid_box.y + 8, (SDL_Color){COL_TEXT_DIM});
+        SDL_RenderPresent(g->weights_ren);
+        return;
     }
+    char caption[96];
+    if (lv->full_detail)
+        snprintf(caption, sizeof(caption), "%s - %d filters (%dx%d, full detail)", lv->name, lv->count, lv->ksize, lv->ksize);
+    else
+        snprintf(caption, sizeof(caption), "%s - %d maps (%dx%d, mean |w| over in-ch)", lv->name, lv->count, lv->ksize, lv->ksize);
 
-    draw_3d_view(g, grid_box, lv, data, caption);
+    int fk = tab_fmap(g);
+    if (g->conv_result && fk >= 0) draw_fmap_view(g, grid_box, &g->model.fmap[fk], lv->name);
+    else draw_3d_view(g, grid_box, lv, data, caption);
     draw_weights_flip(g, grid_box, flip);
 
     SDL_RenderPresent(g->weights_ren);
@@ -5092,8 +5279,15 @@ static void setup_click(Gui *g, SDL_Point p) {
     g->drag = DRAG_NONE;
     if (g->palette_open) {
         /* the block menu sits on top of the canvas: a row starts placing that block, any other click closes it */
+        if (palette_has_advanced(g)) {
+            SDL_Rect fr = palette_fold_rect(g);
+            if (SDL_PointInRect(&p, &fr)) { /* fold / unfold the advanced section; the menu stays open */
+                g->palette_adv = !g->palette_adv;
+                return;
+            }
+        }
         for (int i = 0; i < palette_count(g); ++i) {
-            SDL_Rect pr = palette_rect(i);
+            SDL_Rect pr = palette_rect(g, i);
             if (SDL_PointInRect(&p, &pr)) {
                 g->focus = -1;
                 g->drag = DRAG_PAL;
@@ -5309,7 +5503,7 @@ static void setup_release(Gui *g, SDL_Point p_screen) {
         if (!g->drag_moved) {
             graph_place(g, g->drag_type);
         } else if (SDL_PointInRect(&p_screen, &GRAPH_VIEW)) {
-            graph_add(g, g->drag_type, p.x - (int)floorf(g->pan_x) - NODE_W / 2, p.y - (int)floorf(g->pan_y) - 12);
+            graph_add_at(g, g->drag_type, p.x - (int)floorf(g->pan_x) - NODE_W / 2, p.y - (int)floorf(g->pan_y) - 12);
             g->palette_open = 0; /* dropped on the canvas: the menu has done its job */
         }
     }
@@ -5458,14 +5652,11 @@ static int pump_events(Gui *g) {
             } else if (g->weights_win && e.button.windowID == SDL_GetWindowID(g->weights_win) && g->has_model) {
                 SDL_Point p = {e.button.x, e.button.y};
                 SDL_Rect content = WEIGHTS_CONTENT;
+                weights_tab_normalize(g);
                 const char *flip = weights_flip_label(g);
                 SDL_Rect fb = weights_flip_button(content);
                 if (flip && SDL_PointInRect(&p, &fb)) {
-                    if (g->weights_tab == tab_net(g)) g->weights_tab = g->net_back_tab < vis_count(g) ? g->net_back_tab : 0;
-                    else {
-                        g->net_back_tab = g->weights_tab;
-                        g->weights_tab = tab_net(g);
-                    }
+                    g->conv_result = !g->conv_result;
                     break;
                 }
                 SDL_Rect nb = net_mode_button(content);
